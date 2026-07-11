@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "network": "Gnosis Chain",
   "chainId": 100,
-  "explorer": "https://gnosisscan.io",
+  "explorer": "https://gnosis.blockscout.com",
   "sourceRepository": "https://github.com/futarchy-fi/futarchy-liquidity-manager",
   "sourceCommit": "9d3f9cd",
   "factory": {

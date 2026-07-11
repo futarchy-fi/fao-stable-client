@@ -5,7 +5,15 @@ import test from 'node:test';
 
 const source = await readFile(new URL('./flm.js', import.meta.url), 'utf8');
 const module = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
-const { encodeCreateLiquidityManager, encodeValidationConfig, formatUnits, parseUnits } = module;
+const {
+  SELECTORS, encodeCreateLiquidityManager, encodeValidationConfig, formatUnits, parseUnits
+} = module;
+
+test('manager and proposal-source proposer getters use their distinct selectors', () => {
+  const selector = (signature) => execFileSync('cast', ['sig', signature], { encoding: 'utf8' }).trim();
+  assert.equal(SELECTORS.managerOfficialProposer, selector('OFFICIAL_PROPOSER()'));
+  assert.equal(SELECTORS.sourceOfficialProposer, selector('officialProposer()'));
+});
 
 test('embedded creation code matches every hash pinned by the canonical factory', async () => {
   const manifest = JSON.parse(await readFile(new URL('./flm-deployment.json', import.meta.url), 'utf8'));

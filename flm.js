@@ -3,7 +3,7 @@ const CREATED_TOPIC = '0xc19b778e15f67624783a11665b3962f4251e1e09bc3492d8f8e5eb4
 const GNOSIS_CHAIN_HEX = '0x64';
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
-const SELECTORS = {
+export const SELECTORS = {
   positionManager: '0x1bea83fe',
   algebraFactory: '0x9949da1f',
   conditionalRouter: '0xcd91811e',
@@ -19,7 +19,8 @@ const SELECTORS = {
   emergencyExitArmedAt: '0xd13fac6e',
   owner: '0x8da5cb5b',
   bootstrapRecipient: '0x347d2de2',
-  officialProposer: '0x38056b22',
+  managerOfficialProposer: '0xe19da90b',
+  sourceOfficialProposer: '0x38056b22',
   proposalSource: '0xb1b327ee',
   proposalManager: '0x02f89be2',
   companyToken: '0xca8eb0ba',
@@ -355,7 +356,7 @@ async function requestGnosisChain() {
       chainName: 'Gnosis Chain',
       nativeCurrency: { name: 'xDAI', symbol: 'xDAI', decimals: 18 },
       rpcUrls: ['https://rpc.gnosischain.com'],
-      blockExplorerUrls: ['https://gnosisscan.io']
+      blockExplorerUrls: ['https://gnosis.blockscout.com']
     }]);
   }
 }
@@ -448,12 +449,13 @@ async function readCanary() {
     ethCall(manager, SELECTORS.emergencyExitArmedAt),
     ethCall(manager, SELECTORS.owner),
     ethCall(manager, SELECTORS.bootstrapRecipient),
-    ethCall(manager, SELECTORS.officialProposer),
+    ethCall(manager, SELECTORS.managerOfficialProposer),
     ethCall(manager, SELECTORS.proposalSource),
     ethCall(manager, SELECTORS.companyToken),
     ethCall(manager, SELECTORS.wrappedNative),
     ethCall(source, SELECTORS.owner),
     ethCall(source, SELECTORS.proposalManager),
+    ethCall(source, SELECTORS.sourceOfficialProposer),
     ethCall(manager, callData(SELECTORS.balanceOf, [accountWord])),
     ethCall(manager, SELECTORS.totalSupply),
     ethCall(canary.companyToken, callData(SELECTORS.allowance, allowanceWords)),
@@ -463,8 +465,8 @@ async function readCanary() {
     readTokenMetadata(manager)
   ]);
   const [initialized, conditionalMode, emergencyAt, managerOwner, bootstrap, official, proposalSource,
-    company, collateral, sourceOwner, proposalManager, shares, supply, companyAllowance,
-    collateralAllowance, companyMetadata, collateralMetadata, shareMetadata] = calls;
+    company, collateral, sourceOwner, proposalManager, sourceOfficialProposer, shares, supply,
+    companyAllowance, collateralAllowance, companyMetadata, collateralMetadata, shareMetadata] = calls;
 
   const authorityChecks = [
     [decodeAddress(managerOwner), canary.owner],
@@ -474,7 +476,8 @@ async function readCanary() {
     [decodeAddress(company), canary.companyToken],
     [decodeAddress(collateral), canary.collateralToken],
     [decodeAddress(sourceOwner), canary.owner],
-    [decodeAddress(proposalManager), canary.proposalManager]
+    [decodeAddress(proposalManager), canary.proposalManager],
+    [decodeAddress(sourceOfficialProposer), canary.officialProposer]
   ];
   if (!authorityChecks.every(([actual, expected]) => sameAddress(actual, expected))) {
     throw new Error('Canary authority or immutable wiring no longer matches the reviewed manifest.');

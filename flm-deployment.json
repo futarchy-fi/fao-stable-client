@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "network": "Gnosis Chain",
+  "chainId": 100,
+  "explorer": "https://gnosis.blockscout.com",
+  "sourceRepository": "https://github.com/futarchy-fi/futarchy-liquidity-manager",
+  "sourceCommit": "9d3f9cd",
+  "factory": {
+    "status": "canonical-reviewed",
+    "address": "0x1814aDfEBEBC0C345dBed93DFc54c69738bF7f54",
+    "positionManager": "0x91fD594c46D8B01E62dBDeBed2401dde01817834",
+    "algebraFactory": "0xA0864cCA6E114013AB0e27cbd5B6f4c8947da766",
+    "conditionalRouter": "0x7495a583ba85875d59407781b4958ED6e0E1228f",
+    "poolStabilityGuard": "0xCf2B0311c926fdfB83e5232E85E72c7236dedEC9",
+    "wrappedNative": "0xaf204776c7245bF4147c2612BF6e5972Ee483701",
+    "defaultTickLower": -887220,
+    "defaultTickUpper": 887220,
+    "proposalSourceCreationCodeHash": "0xe541187065605577bac74fe69f1c3449e6371028c93127d3aab622529170cf88",
+    "adapterCreationCodeHash": "0x386c287790289b5055110b855c3a520b49c9b330cd9b8c47e734aa9d6c459f48",
+    "managerCreationCodeHash": "0x97bf8517669822d2c9b1d2cdfa844ed9cfe09950a8e57fb834ba5665c4fcc1f4"
+  },
+  "canary": {
+    "status": "reviewed-limited-funds-canary",
+    "organization": "0x693E3FB46Bb36eE43C702FE94f9463df0691b43d",
+    "owner": "0x693E3FB46Bb36eE43C702FE94f9463df0691b43d",
+    "proposalManager": "0x693E3FB46Bb36eE43C702FE94f9463df0691b43d",
+    "bootstrapRecipient": "0x693E3FB46Bb36eE43C702FE94f9463df0691b43d",
+    "officialProposer": "0x693E3FB46Bb36eE43C702FE94f9463df0691b43d",
+    "companyToken": "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb",
+    "collateralToken": "0xaf204776c7245bF4147c2612BF6e5972Ee483701",
+    "proposalSource": "0xEae82707D329e5b7a086F09e914bD5dC4CAd3086",
+    "spotAdapter": "0xc47Fd01C6Aa0A1e8481bF1B459797E4A85e8Fc79",
+    "conditionalAdapter": "0x968f23FEc037818215Bc0424BD818B71dC7CDd0E",
+    "manager": "0xaECcbAc5D30604D78bb25d5e35ACB07Bbbb1C666",
+    "deploymentTransaction": "0x8069a454c4dab6b9e256ea9b0f107b49cf38a0f37330e855e6ddc03b18feb000"
+  },
+  "validationDefaults": {
+    "expectedCollateralToken": "0xaf204776c7245bF4147c2612BF6e5972Ee483701",
+    "conditionalTokens": "0xCeAfDD6bc0bEF976fdCd1112955828E00543c0Ce",
+    "realitio": "0xE78996A233895bE74a66F451f1019cA9734205cc",
+    "trustedArbitrator": "0x68154EA682f95BF582b80Dd6453FA401737491Dc",
+    "maxOpeningDelay": 604800,
+    "minTimeout": 3600,
+    "maxTimeout": 604800,
+    "maxMinBond": "1000000000000000000",
+    "requirePools": true
+  }
+}

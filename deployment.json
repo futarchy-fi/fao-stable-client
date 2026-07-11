@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "status": "pre-deployment",
+  "network": "Sepolia",
+  "chainId": 11155111,
+  "explorer": "https://sepolia.etherscan.io",
+  "governedSite": "https://testnet.futarchy.ai",
+  "governedRepository": "https://github.com/futarchy-fi/fao-governed-site",
+  "contracts": {}
+}

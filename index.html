@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Stable out-of-band inspector for the FAO testnet deployment.">
+    <title>FAO stable client</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">Out-of-band client</p>
+        <h1>FAO stable client</h1>
+        <p class="lede">
+          A deliberately separate view of the contracts behind the FAO-governed testnet site.
+          FAO proposals cannot modify this client.
+        </p>
+      </header>
+
+      <section aria-labelledby="deployment-heading">
+        <div class="section-heading">
+          <h2 id="deployment-heading">Deployment</h2>
+          <span id="deployment-status" class="status">Loading</span>
+        </div>
+        <dl id="network-details">
+          <div><dt>Network</dt><dd id="network">—</dd></div>
+          <div><dt>Chain ID</dt><dd id="chain-id">—</dd></div>
+          <div><dt>Wallet</dt><dd id="wallet-state">Not connected</dd></div>
+        </dl>
+        <button id="connect" type="button">Connect wallet</button>
+        <p id="wallet-message" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section aria-labelledby="contracts-heading">
+        <h2 id="contracts-heading">Canonical contracts</h2>
+        <p id="contracts-empty" class="message">The fresh deployment has not been published yet.</p>
+        <ul id="contracts" class="contracts" hidden></ul>
+      </section>
+
+      <section aria-labelledby="separation-heading">
+        <h2 id="separation-heading">Separation boundary</h2>
+        <p>
+          The <a id="governed-site" href="https://testnet.futarchy.ai">governed site</a> may be
+          replaced completely by an accepted proposal. This client is maintained and deployed
+          separately so the same contracts remain inspectable if that site is broken or replaced.
+        </p>
+        <p><a id="governed-repository" href="https://github.com/futarchy-fi/fao-governed-site">View the governed repository</a></p>
+      </section>
+    </main>
+    <footer>Stable surface · no legacy contract fallback</footer>
+  </body>
+</html>

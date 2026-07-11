@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Fixed client for the canonical Gnosis FLM factory and canary vault.">
+    <title>Gnosis FLM tools · FAO stable client</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/flm.js"></script>
+  </head>
+  <body>
+    <main class="wide">
+      <header class="compact-header">
+        <p class="eyebrow">Out-of-band client · <a href="/">FAO stable client</a></p>
+        <h1>Gnosis FLM tools</h1>
+        <p class="lede">
+          Create a liquidity-manager bundle through the reviewed hash-pinned factory, or use the
+          limited-funds canary vault. This client remains outside FAO release authority.
+        </p>
+      </header>
+
+      <section aria-labelledby="wallet-heading">
+        <div class="section-heading">
+          <h2 id="wallet-heading">Wallet</h2>
+          <span id="wallet-badge" class="status">Not connected</span>
+        </div>
+        <dl>
+          <div><dt>Required network</dt><dd>Gnosis Chain · 100</dd></div>
+          <div><dt>Account</dt><dd id="wallet-account">—</dd></div>
+          <div><dt>Wallet chain</dt><dd id="wallet-chain">—</dd></div>
+        </dl>
+        <div class="actions">
+          <button id="connect" type="button">Connect on Gnosis</button>
+          <button id="refresh" type="button" disabled>Refresh on-chain state</button>
+        </div>
+        <p id="wallet-message" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section aria-labelledby="factory-heading">
+        <div class="section-heading">
+          <h2 id="factory-heading">Canonical factory</h2>
+          <span id="factory-badge" class="status">Checking</span>
+        </div>
+        <dl>
+          <div><dt>Endorsement</dt><dd class="verified">Canonical reviewed factory</dd></div>
+          <div><dt>Factory</dt><dd><a id="factory-link"><code id="factory-address">—</code></a></dd></div>
+          <div><dt>Source</dt><dd><a id="source-link"><code id="source-commit">—</code></a></dd></div>
+          <div><dt>Immutable checks</dt><dd id="factory-checks">Connect a wallet to verify</dd></div>
+        </dl>
+        <p class="notice">
+          Factory endorsement covers this address, its immutable dependencies, and its three
+          creation-code hashes. Every <code>LiquidityManagerCreated.organization</code> value is
+          supplied by the caller. An event is an <strong>unverified claim</strong>, not organization
+          registration or endorsement.
+        </p>
+        <details class="details">
+          <summary>Show pinned dependencies and hashes</summary>
+          <dl id="factory-details"></dl>
+        </details>
+      </section>
+
+      <section aria-labelledby="create-heading">
+        <h2 id="create-heading">Create a bundle</h2>
+        <p>
+          Anyone may call the factory. It atomically deploys one proposal source, two bound
+          adapters, and one FLM share vault using creation code from commit
+          <code id="form-source-commit">—</code>. The factory rejects any bytecode hash mismatch.
+        </p>
+        <form id="create-form">
+          <fieldset>
+            <legend>Identity and authority</legend>
+            <div class="form-grid">
+              <label>Organization claim
+                <input name="organization" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>Only event metadata; the factory does not verify this claim.</span>
+              </label>
+              <label>Company token
+                <input name="companyToken" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>Token paired with the factory-fixed sDAI collateral.</span>
+              </label>
+              <label>Owner
+                <input name="owner" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>May replace the proposal manager, use every proposal-source power, run the delayed non-custodial emergency exit, and sweep only after all shares burn.</span>
+              </label>
+              <label>Proposal manager
+                <input name="proposalManager" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>Can change the source's official proposer, settlement oracle, validation policy, selected proposal, and manual settlement state.</span>
+              </label>
+              <label>Bootstrap recipient
+                <input name="bootstrapRecipient" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>Only address that can seed the vault; receives residual sweep after all shares burn.</span>
+              </label>
+              <label>Official proposer
+                <input name="officialProposer" inputmode="text" autocomplete="off" required placeholder="0x…">
+                <span>Immutable manager rule: only proposals attributed to this creator can trigger conditional migration.</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Share token</legend>
+            <div class="form-grid">
+              <label>LP token name
+                <input name="lpTokenName" required maxlength="80" placeholder="Example Organization FLM LP">
+              </label>
+              <label>LP token symbol
+                <input name="lpTokenSymbol" required maxlength="24" placeholder="EX-FLM">
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Proposal validation</legend>
+            <label class="inline">
+              <input id="validation-enabled" name="validationEnabled" type="checkbox" checked>
+              Enable constructor validation config
+            </label>
+            <p class="notice">
+              Owner and proposal manager can change or disable this policy later. With validation
+              disabled, those roles may select official proposals without these on-chain bounds.
+            </p>
+            <fieldset id="validation-fields">
+              <div class="form-grid">
+                <label>Expected proposal token
+                  <input name="expectedProposalToken" inputmode="text" autocomplete="off" required placeholder="0x…">
+                </label>
+                <label>Expected collateral token
+                  <input name="expectedCollateralToken" inputmode="text" autocomplete="off" required>
+                </label>
+                <label>Conditional Tokens Framework
+                  <input name="conditionalTokens" inputmode="text" autocomplete="off" required>
+                </label>
+                <label>Trusted oracle
+                  <input name="trustedOracle" inputmode="text" autocomplete="off" required placeholder="0x…">
+                </label>
+                <label>Reality.eth
+                  <input name="realitio" inputmode="text" autocomplete="off" required>
+                </label>
+                <label>Trusted arbitrator
+                  <input name="trustedArbitrator" inputmode="text" autocomplete="off" required>
+                </label>
+                <label>Maximum opening delay (seconds)
+                  <input name="maxOpeningDelay" type="number" min="0" step="1" required>
+                </label>
+                <label>Minimum timeout (seconds)
+                  <input name="minTimeout" type="number" min="0" step="1" required>
+                </label>
+                <label>Maximum timeout (seconds)
+                  <input name="maxTimeout" type="number" min="0" step="1" required>
+                </label>
+                <label>Maximum minimum bond (wei)
+                  <input name="maxMinBond" inputmode="numeric" pattern="[0-9]+" required>
+                </label>
+                <label class="inline full">
+                  <input name="requirePools" type="checkbox" checked>
+                  Require both conditional pools
+                </label>
+              </div>
+            </fieldset>
+          </fieldset>
+
+          <button id="create-submit" type="submit" disabled>Create via canonical factory</button>
+          <p id="create-status" class="message transaction" role="status" aria-live="polite"></p>
+          <div id="bundle-result" class="bundle-result" hidden></div>
+        </form>
+      </section>
+
+      <section aria-labelledby="canary-heading">
+        <div class="section-heading">
+          <h2 id="canary-heading">Existing canary vault</h2>
+          <span class="status">Reviewed limited-funds canary</span>
+        </div>
+        <p>
+          This specific deployment was checked against the reviewed manifest. Its owner, proposal
+          manager, bootstrap recipient, and official proposer are all the disposable
+          <code>0x693…</code> operator. That operator retains the permissions described above.
+        </p>
+        <dl>
+          <div><dt>Manager</dt><dd><a id="canary-manager-link"><code id="canary-manager">—</code></a></dd></div>
+          <div><dt>Proposal source</dt><dd><a id="canary-source-link"><code id="canary-source">—</code></a></dd></div>
+          <div><dt>Owner</dt><dd><code id="canary-owner">—</code></dd></div>
+          <div><dt>Proposal manager</dt><dd><code id="canary-proposal-manager">—</code></dd></div>
+          <div><dt>Bootstrap recipient</dt><dd><code id="canary-bootstrap">—</code></dd></div>
+          <div><dt>Official proposer</dt><dd><code id="canary-official-proposer">—</code></dd></div>
+          <div><dt>Company / collateral</dt><dd id="canary-pair">—</dd></div>
+          <div><dt>Mode</dt><dd id="canary-mode">Connect to read</dd></div>
+          <div><dt>Your shares</dt><dd id="share-balance">—</dd></div>
+          <div><dt>Total shares</dt><dd id="share-supply">—</dd></div>
+          <div><dt>Allowances</dt><dd id="allowances">—</dd></div>
+        </dl>
+        <p class="notice">
+          Spot deposits accept the existing vault ratio and pull no more than the two maxima you
+          enter. A deposit can revert while pool-stability history is unavailable. Redemption is
+          proportional and remains open; in conditional mode the wallet may also receive outcome
+          tokens in kind. Any unused token approval remains visible above until changed on-chain.
+        </p>
+        <div class="vault-grid">
+          <div class="vault-action">
+            <h3>Deposit in spot mode</h3>
+            <label><span id="company-input-label">Company maximum</span>
+              <input id="company-amount" inputmode="decimal" placeholder="0.0">
+            </label>
+            <label><span id="collateral-input-label">Collateral maximum</span>
+              <input id="collateral-amount" inputmode="decimal" placeholder="0.0">
+            </label>
+            <div class="actions">
+              <button id="approve-company" type="button" disabled>Approve company max</button>
+              <button id="approve-collateral" type="button" disabled>Approve collateral max</button>
+              <button id="deposit" type="button" disabled>Deposit</button>
+            </div>
+          </div>
+          <div class="vault-action">
+            <h3>Redeem proportional shares</h3>
+            <label>Shares to burn
+              <input id="redeem-shares" inputmode="decimal" placeholder="0.0">
+            </label>
+            <div class="actions">
+              <button id="use-share-balance" type="button" disabled>Use wallet balance</button>
+              <button id="redeem" type="button" disabled>Redeem to connected wallet</button>
+            </div>
+          </div>
+        </div>
+        <p id="vault-status" class="message transaction" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+    <footer class="wide">Stable surface · canonical factory ≠ unverified organization claims · no private keys</footer>
+  </body>
+</html>

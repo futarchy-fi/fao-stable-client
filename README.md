@@ -9,3 +9,16 @@ are deployed it remains in `pre-deployment` state; the UI refuses to invent or
 reuse legacy addresses.
 
 The site is dependency-free static HTML, CSS, and JavaScript.
+
+`flm.html` is the fixed Gnosis Chain surface for the reviewed permissionless
+FLM factory and the reviewed limited-funds canary. It embeds the exact child
+creation code built from `futarchy-liquidity-manager` commit `9d3f9cd` and
+checks the factory's immutable dependencies and pinned hashes through the
+connected wallet before enabling bundle creation. Factory events remain
+unverified organization claims unless separately endorsed.
+
+Run the ABI encoder and embedded-bytecode checks with Foundry's `cast` available:
+
+```sh
+node --test test-flm.mjs
+```

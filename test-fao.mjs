@@ -81,11 +81,18 @@ test('ragequit normalizes and exposes the exact sorted unique extra-asset list',
   const user = address(9);
   const extra1 = address(1);
   const extra2 = address(2).toUpperCase().replace('0X', '0x');
-  const plan = prepareRagequit(7, user, [extra2, extra1, extra2]);
-  assert.deepEqual(plan.extras, [extra1, address(2)]);
+  const native = address(0);
+  const plan = prepareRagequit(7, user, [extra2, native, extra1, extra2]);
+  assert.deepEqual(plan.extras, [native, extra1, address(2)]);
   assert.equal(
     plan.calldata,
-    cast('calldata', 'ragequit(uint256,address,address[])', '7', user, `[${extra1},${address(2)}]`)
+    cast(
+      'calldata',
+      'ragequit(uint256,address,address[])',
+      '7',
+      user,
+      `[${native},${extra1},${address(2)}]`
+    )
   );
   assert.deepEqual(Object.keys(plan), ['extras', 'calldata']);
 });

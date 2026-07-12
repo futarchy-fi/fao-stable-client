@@ -212,6 +212,7 @@ export async function cidv1RawSha256(value) {
   return `b${base32(Uint8Array.from([1, 0x55, 0x12, 0x20, ...digest]))}`;
 }
 
+// Computes identity only. The exact raw bytes must still be pinned as a raw IPFS block.
 export async function rawIpfsUri(value) {
   return `ipfs://${await cidv1RawSha256(value)}`;
 }

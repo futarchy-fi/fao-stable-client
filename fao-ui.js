@@ -3,8 +3,25 @@ import * as fao from './fao.js';
 
 export const SEPOLIA_CHAIN_ID = 11155111n;
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
+const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
+export const PINNED_DEPENDENCIES = Object.freeze({
+  proxyFactory: Object.freeze({ target: '0x4b4f7f64be813ccc66aefc3bfce2baa01188631c', codehash: '0x9d58d183bb98c199c270f0f2ba7c0abbda1a119caef4c136e137bbacca8c4035' }),
+  spaceImplementation: Object.freeze({ target: '0xc3031a7d3326e47d49bff9d374d74f364b29ce4d', codehash: '0x4f2f90c70374b7dcd468d351747e9c865efc0d47e606eb6fdaeb2a842c148d81' }),
+  proposalValidationStrategy: Object.freeze({ target: '0x9a39194f870c410633c170889e9025fba2113c79', codehash: '0xddd4560ead7f2c3de35f37de8d50c43e57f0173ad3eefd20098c3b6e08cba9d8' }),
+  weth: Object.freeze({ target: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14', codehash: '0xc864e10689f2da18833652a3b075d43106e87f0f90d95ee64f6f0b33bc026083' }),
+  conditionalTokens: Object.freeze({ target: '0x8bdc504dc3a05310059c1c67e0a2667309d27b93', codehash: '0x962883a35da553c2d46562f362ba99f68041dad91de30a143a785b2d169c7e81' }),
+  wrapped1155Factory: Object.freeze({ target: '0xd194319d1804c1051dd21ba1dc931ca72410b79f', codehash: '0x792e0ae192d66bc58541831991b449cd2ba502fe0053507d6c4493d8865371b6' }),
+  uniswapV3Factory: Object.freeze({ target: '0x0227628f3f023bb0b980b67d528571c95c6dac1c', codehash: '0xacb5afea1f8877239fadd30358add13f2f9d4fb80175402c686d392295224fef' }),
+  positionManager: Object.freeze({ target: '0x1238536071e1c677a632429e3655c799b22cda52', codehash: '0x390d49631aefbf890c9415457b4639243ff16092ded43ce8f885fde8a5a34868' })
+});
+const RECEIPT_SELECTORS = Object.freeze({
+  coreHash: '0xb1b4fc36',
+  flmHash: '0x1092769f',
+  coreSealed: '0x73797f98',
+  flmSealed: '0xe05abb68'
+});
 
 function exactRecord(value, keys, label) {
   if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(`${label} must be an object.`);
@@ -102,12 +119,18 @@ export function deriveNetworkGate({
   return Object.freeze({ state: 'ready', canTransact: true, message: 'Sepolia, RPC agreement, and every manifest runtime hash are verified.' });
 }
 
-export async function verifyRuntimeCode(manifest, request) {
+export async function verifyRuntimeCode(manifest, request, pinnedDependencies = PINNED_DEPENDENCIES) {
   if (manifest.status === 'pre-deployment') return Object.freeze({ status: 'unavailable', checked: Object.freeze([]) });
   if (manifest.status !== 'active') throw new Error('Cannot verify a non-active deployment.');
   if (typeof request !== 'function') throw new Error('An RPC request function is required.');
 
-  const records = selfServeRuntimeRecords(manifest);
+  const records = {
+    ...selfServeRuntimeRecords(manifest),
+    ...Object.fromEntries(Object.entries(pinnedDependencies).map(([name, dependency]) => [name, {
+      address: dependency.target,
+      runtimeCodeKeccak256: dependency.codehash
+    }]))
+  };
   const checked = await Promise.all(Object.entries(records).map(async ([name, record]) => {
     const expected = fao.normalizeHex(record.runtimeCodeKeccak256, 32, `${name} runtime hash`);
     const code = fao.normalizeHex(await request('eth_getCode', [record.address, 'latest']), undefined, `${name} runtime code`);
@@ -117,6 +140,58 @@ export async function verifyRuntimeCode(manifest, request) {
     return name;
   }));
   return Object.freeze({ status: 'verified', checked: Object.freeze(checked) });
+}
+
+export function creationInputFromDraft(draft, manifest, currentTimestamp) {
+  if (manifest.status !== 'active') throw new Error('The canonical self-serve registrar is not deployed.');
+  exactRecord(draft, [
+    'tokenName', 'tokenSymbol', 'governedRepository', 'governedSite', 'saleDuration',
+    'bootstrapDuration', 'saleCap', 'initialPrice', 'slope', 'minimumRaise',
+    'tokenMaxSupply', 'bootstrapBps', 'daoURI', 'metadataURI',
+    'votingStrategyMetadataURI', 'proposalValidationStrategyMetadataURI'
+  ], 'Creation draft');
+  const timestamp = BigInt(currentTimestamp);
+  const saleEnd = timestamp + BigInt(draft.saleDuration);
+  const bootstrapDeadline = saleEnd + BigInt(draft.bootstrapDuration);
+  const dependency = (record) => ({ target: record.address, codehash: record.runtimeCodeKeccak256 });
+  return Object.freeze({
+    registrar: manifest.registrar.address,
+    currentTimestamp: timestamp.toString(),
+    coreConfig: Object.freeze({
+      proxyFactory: PINNED_DEPENDENCIES.proxyFactory,
+      spaceImplementation: PINNED_DEPENDENCIES.spaceImplementation,
+      proposalValidationStrategy: PINNED_DEPENDENCIES.proposalValidationStrategy,
+      stackDeployer: dependency(manifest.prerequisites.stackDeployer),
+      proposalImplementation: dependency(manifest.prerequisites.proposalImplementation),
+      weth: PINNED_DEPENDENCIES.weth,
+      conditionalTokens: PINNED_DEPENDENCIES.conditionalTokens,
+      wrapped1155Factory: PINNED_DEPENDENCIES.wrapped1155Factory,
+      uniswapV3Factory: PINNED_DEPENDENCIES.uniswapV3Factory,
+      graduationThreshold: '1000000000000000',
+      arbitrationTimeout: '1800',
+      siteMinActivationBond: '100000000000000',
+      treasuryMinActivationBond: '100000000000000',
+      twapTimeout: '1800',
+      twapWindow: '900',
+      spaceSaltNonce: timestamp.toString(),
+      daoURI: draft.daoURI,
+      metadataURI: draft.metadataURI,
+      votingStrategyMetadataURI: draft.votingStrategyMetadataURI,
+      proposalValidationStrategyMetadataURI: draft.proposalValidationStrategyMetadataURI,
+      tokenName: draft.tokenName,
+      tokenSymbol: draft.tokenSymbol,
+      saleEnd: saleEnd.toString(),
+      bootstrapDeadline: bootstrapDeadline.toString(),
+      saleCap: draft.saleCap,
+      minimumRaise: draft.minimumRaise,
+      tokenMaxSupply: draft.tokenMaxSupply,
+      initialPrice: draft.initialPrice,
+      slope: draft.slope,
+      bootstrapBps: draft.bootstrapBps
+    }),
+    grants: Object.freeze([]),
+    flmConfig: Object.freeze({ positionManager: PINNED_DEPENDENCIES.positionManager })
+  });
 }
 
 function normalizeInstance(instance) {
@@ -170,7 +245,13 @@ let state = {
   codeMessage: 'Not checked',
   creationBundle: null,
   instances: [],
-  ragequitPlan: null
+  ragequitPlan: null,
+  preparedInput: null,
+  creationPlan: null,
+  predictedReceipt: null,
+  receiptExists: false,
+  coreSealed: false,
+  flmSealed: false
 };
 
 function rpc(method, params = []) {
@@ -204,12 +285,15 @@ function renderGate() {
   elements.codeState.textContent = state.codeMessage;
   elements.creationCodeState.textContent = state.creationBundle ? '12 / 12 creation blobs verified' : 'Unavailable';
   elements.refresh.disabled = !window.ethereum;
+  elements.preparePlan.disabled = !gate.canTransact || !state.creationBundle;
   for (const button of document.querySelectorAll('[data-write]')) {
+    if (button.hasAttribute('data-stage')) continue;
     const needsCreationBundle = button.hasAttribute('data-stage');
     button.disabled = !gate.canTransact || (needsCreationBundle && !state.creationBundle)
       || (button === elements.executeRagequit && !state.ragequitPlan);
   }
   setMessage(elements.connectionMessage, gate.message, gate.state.includes('wrong') || gate.state.includes('mismatch') || gate.state.includes('invalid') || gate.state.includes('disagreement'));
+  if (elements.stageButtons) renderStages();
 }
 
 function renderInstances() {
@@ -245,17 +329,25 @@ function renderInstances() {
 }
 
 function renderStages() {
-  const stages = state.manifest?.deploymentStages || {};
-  for (const [name, fallback] of [
-    ['receipt', 'No staged receipt found.'],
-    ['core', 'Waiting for a verified receipt.'],
-    ['flm', 'Waiting for a verified core.']
-  ]) {
-    const value = stages[name];
-    elements.stageDetails[name].textContent = typeof value?.description === 'string'
-      ? value.description.slice(0, 240)
-      : fallback;
+  elements.stageDetails.receipt.textContent = state.creationPlan
+    ? `${state.receiptExists ? 'Staged' : 'Predicted'} ${state.predictedReceipt}`
+    : 'Prepare and review an exact plan first.';
+  elements.stageDetails.core.textContent = state.coreSealed
+    ? 'Core is sealed on-chain.'
+    : state.receiptExists ? 'Receipt verified; core can be deployed by anyone.' : 'Waiting for the staged receipt.';
+  elements.stageDetails.flm.textContent = state.flmSealed
+    ? 'FLM is sealed on-chain.'
+    : state.coreSealed ? 'Core verified; FLM can be deployed by anyone.' : 'Waiting for the sealed core.';
+  elements.planSummary.hidden = !state.creationPlan;
+  if (state.creationPlan) {
+    elements.planReceipt.textContent = state.predictedReceipt;
+    elements.planCoreHash.textContent = state.creationPlan.hashes.core;
+    elements.planFlmHash.textContent = state.creationPlan.hashes.flm;
   }
+  const ready = currentGate().canTransact && state.creationBundle && state.creationPlan;
+  elements.stageButtons.receipt.disabled = !ready || state.receiptExists;
+  elements.stageButtons.core.disabled = !ready || !state.receiptExists || state.coreSealed;
+  elements.stageButtons.flm.disabled = !ready || !state.coreSealed || state.flmSealed;
 }
 
 async function loadManifest() {
@@ -307,6 +399,144 @@ function draftFromForm() {
   return Object.fromEntries(new FormData(elements.createForm).entries());
 }
 
+function parseReturnedAddress(value) {
+  const word = fao.normalizeHex(value, 32, 'predicted receipt');
+  if (word.slice(2, 26) !== '0'.repeat(24)) throw new Error('Registrar returned a malformed address.');
+  return fao.normalizeAddress(`0x${word.slice(-40)}`);
+}
+
+function parseReturnedBool(value, label) {
+  const word = fao.normalizeHex(value, 32, label);
+  if (word === `0x${'0'.repeat(64)}`) return false;
+  if (word === `0x${'0'.repeat(63)}1`) return true;
+  throw new Error(`${label} returned a non-boolean word.`);
+}
+
+async function refreshReceiptState() {
+  if (!state.creationPlan || !state.predictedReceipt) return;
+  const code = fao.normalizeHex(
+    await rpc('eth_getCode', [state.predictedReceipt, 'latest']), undefined, 'receipt runtime code'
+  );
+  state.receiptExists = code !== '0x';
+  state.coreSealed = false;
+  state.flmSealed = false;
+  if (state.receiptExists) {
+    const call = (data) => rpc('eth_call', [{ to: state.predictedReceipt, data }, 'latest']);
+    const [coreHash, flmHash, coreSealed, flmSealed] = await Promise.all([
+      call(RECEIPT_SELECTORS.coreHash), call(RECEIPT_SELECTORS.flmHash),
+      call(RECEIPT_SELECTORS.coreSealed), call(RECEIPT_SELECTORS.flmSealed)
+    ]);
+    if (fao.normalizeHex(coreHash, 32, 'receipt core hash') !== state.creationPlan.hashes.core
+      || fao.normalizeHex(flmHash, 32, 'receipt FLM hash') !== state.creationPlan.hashes.flm) {
+      throw new Error('Predicted receipt code does not bind the prepared configuration.');
+    }
+    state.coreSealed = parseReturnedBool(coreSealed, 'coreSealed');
+    state.flmSealed = parseReturnedBool(flmSealed, 'flmSealed');
+    if (state.flmSealed && !state.coreSealed) throw new Error('Receipt reports FLM sealed before core.');
+  }
+  renderStages();
+}
+
+async function installPreparedInput(input, { persist = true } = {}) {
+  if (!state.creationBundle) throw new Error('Creation bytecode is unavailable.');
+  state.preparedInput = input;
+  state.creationPlan = fao.createPlan({
+    ...input,
+    creationCodes: state.creationBundle.creationCodes
+  });
+  const result = await rpc('eth_call', [{
+    to: state.creationPlan.registrar.target,
+    data: state.creationPlan.registrar.predict
+  }, 'latest']);
+  state.predictedReceipt = parseReturnedAddress(result);
+  if (persist) localStorage.setItem(PREPARED_KEY, JSON.stringify(input));
+  await refreshReceiptState();
+}
+
+function invalidatePreparedPlan(message = '') {
+  localStorage.removeItem(PREPARED_KEY);
+  state.preparedInput = null;
+  state.creationPlan = null;
+  state.predictedReceipt = null;
+  state.receiptExists = false;
+  state.coreSealed = false;
+  state.flmSealed = false;
+  renderStages();
+  if (message) setMessage(elements.stageStatus, message);
+}
+
+async function prepareCreationPlan() {
+  if (!elements.createForm.reportValidity()) return;
+  const gate = currentGate();
+  if (!gate.canTransact) throw new Error(gate.message);
+  const block = await rpc('eth_getBlockByNumber', ['latest', false]);
+  if (!block || typeof block.timestamp !== 'string') throw new Error('RPC returned no latest block timestamp.');
+  const input = creationInputFromDraft(draftFromForm(), state.manifest, BigInt(block.timestamp));
+  await installPreparedInput(input);
+  setMessage(
+    elements.stageStatus,
+    `Exact plan prepared for ${state.predictedReceipt}. Review both configuration hashes before staging.`
+  );
+}
+
+async function restorePreparedPlan() {
+  const raw = localStorage.getItem(PREPARED_KEY);
+  if (!raw || !window.ethereum || state.manifest?.status !== 'active') return;
+  try {
+    await installPreparedInput(JSON.parse(raw), { persist: false });
+    setMessage(elements.stageStatus, `Restored exact plan for ${state.predictedReceipt}. On-chain stages were re-read.`);
+  } catch (error) {
+    invalidatePreparedPlan();
+    setMessage(elements.stageStatus, `Saved plan rejected: ${errorMessage(error)}`, true);
+  }
+}
+
+async function waitForReceipt(hash) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const receipt = await rpc('eth_getTransactionReceipt', [hash]);
+    if (receipt) return receipt;
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+  }
+  throw new Error(`Timed out waiting for ${hash}. The exact plan remains saved for resume.`);
+}
+
+async function sendCreationStage(event) {
+  const stage = event.currentTarget.dataset.stage;
+  if (!state.creationPlan) throw new Error('Prepare and review an exact creation plan first.');
+  await refreshReceiptState();
+  const steps = {
+    receipt: {
+      ready: !state.receiptExists,
+      target: state.creationPlan.registrar.target,
+      data: state.creationPlan.registrar.stage
+    },
+    core: {
+      ready: state.receiptExists && !state.coreSealed,
+      target: state.predictedReceipt,
+      data: state.creationPlan.receipt.deployCore
+    },
+    flm: {
+      ready: state.coreSealed && !state.flmSealed,
+      target: state.predictedReceipt,
+      data: state.creationPlan.receipt.deployFlm
+    }
+  };
+  const step = steps[stage];
+  if (!step?.ready) throw new Error(`${stage} is not the next resumable stage.`);
+  if (stage === 'core') {
+    const block = await rpc('eth_getBlockByNumber', ['latest', false]);
+    if (!block || BigInt(block.timestamp) >= BigInt(state.preparedInput.coreConfig.saleEnd)) {
+      throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
+    }
+  }
+  const hash = await rpc('eth_sendTransaction', [{ from: state.account, to: step.target, data: step.data }]);
+  setMessage(elements.stageStatus, `${stage} submitted: ${hash}. Waiting for confirmation…`);
+  const receipt = await waitForReceipt(hash);
+  if (BigInt(receipt.status) !== 1n) throw new Error(`${stage} transaction reverted: ${hash}`);
+  await refreshReceiptState();
+  setMessage(elements.stageStatus, `${stage} confirmed: ${hash}. Any account may continue the remaining stages.`);
+}
+
 function restoreDraft() {
   let draft;
   try {
@@ -332,6 +562,7 @@ function saveDraft(event) {
 function clearDraft() {
   localStorage.removeItem(DRAFT_KEY);
   elements.createForm.reset();
+  invalidatePreparedPlan();
   setMessage(elements.draftStatus, 'Browser draft cleared.');
 }
 
@@ -376,26 +607,32 @@ function bindElements() {
     connectionBadge: byId('connection-badge'), deploymentState: byId('deployment-state'),
     walletAccount: byId('wallet-account'), walletChain: byId('wallet-chain'), rpcChain: byId('rpc-chain'),
     codeState: byId('code-state'), creationCodeState: byId('creation-code-state'), connect: byId('connect'), refresh: byId('refresh'),
-    connectionMessage: byId('connection-message'), createForm: byId('create-form'), clearDraft: byId('clear-draft'),
+    connectionMessage: byId('connection-message'), createForm: byId('create-form'), preparePlan: byId('prepare-plan'), clearDraft: byId('clear-draft'),
     draftStatus: byId('draft-status'), stageStatus: byId('stage-status'), showUnverified: byId('show-unverified'),
     instanceCount: byId('instance-count'), instancesList: byId('instances-list'), instancesEmpty: byId('instances-empty'),
     ragequitForm: byId('ragequit-form'), executeRagequit: byId('execute-ragequit'),
     ragequitPlan: byId('ragequit-plan'), ragequitEmpty: byId('ragequit-empty'), ragequitAssets: byId('ragequit-assets'),
     ragequitCalldata: byId('ragequit-calldata'), liquidityStatus: byId('liquidity-status'),
-    stageDetails: { receipt: byId('receipt-detail'), core: byId('core-detail'), flm: byId('flm-detail') }
+    stageDetails: { receipt: byId('receipt-detail'), core: byId('core-detail'), flm: byId('flm-detail') },
+    stageButtons: Object.fromEntries(Array.from(document.querySelectorAll('[data-stage]')).map((button) => [button.dataset.stage, button])),
+    planSummary: byId('creation-plan'), planReceipt: byId('plan-receipt'),
+    planCoreHash: byId('plan-core-hash'), planFlmHash: byId('plan-flm-hash')
   };
 }
 
 async function initialize() {
   bindElements();
   elements.createForm.addEventListener('submit', saveDraft);
+  elements.createForm.addEventListener('input', () => invalidatePreparedPlan('Draft changed. Prepare a new exact plan before staging.'));
+  elements.preparePlan.addEventListener('click', () => prepareCreationPlan().catch((error) => setMessage(elements.stageStatus, errorMessage(error), true)));
   elements.clearDraft.addEventListener('click', clearDraft);
   elements.ragequitForm.addEventListener('submit', prepareRagequit);
   elements.showUnverified.addEventListener('change', renderInstances);
   elements.connect.addEventListener('click', () => syncConnection(true).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   elements.refresh.addEventListener('click', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   for (const form of document.querySelectorAll('#buy-form, #deposit-form, #redeem-form')) form.addEventListener('submit', unavailableAction);
-  for (const button of document.querySelectorAll('[data-stage], [data-action], #execute-ragequit')) button.addEventListener('click', unavailableAction);
+  for (const button of document.querySelectorAll('[data-stage]')) button.addEventListener('click', (event) => sendCreationStage(event).catch((error) => setMessage(elements.stageStatus, errorMessage(error), true)));
+  for (const button of document.querySelectorAll('[data-action], #execute-ragequit')) button.addEventListener('click', unavailableAction);
 
   if (window.ethereum?.on) {
     window.ethereum.on('accountsChanged', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
@@ -406,6 +643,7 @@ async function initialize() {
   try {
     await loadManifest();
     await syncConnection(false);
+    await restorePreparedPlan();
   } catch (error) {
     state.manifest = null;
     state.codeState = 'mismatch';

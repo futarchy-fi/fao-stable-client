@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
+  creationInputFromDraft,
   deriveNetworkGate,
   instanceTrustLabel,
   parseExtraAssetInput,
@@ -51,12 +52,38 @@ test('runtime verification requires an exact hash map and matches every contract
     assert.equal(method, 'eth_getCode');
     return codes.get(params[0]);
   };
-  assert.deepEqual((await verifyRuntimeCode(manifest, request)).checked, ['registrar', 'proposalImplementation', 'stackDeployer']);
+  assert.deepEqual((await verifyRuntimeCode(manifest, request, {})).checked, ['registrar', 'proposalImplementation', 'stackDeployer']);
 
   await assert.rejects(
-    verifyRuntimeCode({ ...manifest, registrar: { ...manifest.registrar, runtimeCodeKeccak256: hash('33') } }, request),
+    verifyRuntimeCode({ ...manifest, registrar: { ...manifest.registrar, runtimeCodeKeccak256: hash('33') } }, request, {}),
     /does not match/
   );
+});
+
+test('draft becomes one frozen canonical registrar input', () => {
+  const record = (id) => ({ address: address(id), runtimeCodeKeccak256: hash(id.toString(16).padStart(2, '0')) });
+  const manifest = {
+    status: 'active', registrar: record(1),
+    prerequisites: { proposalImplementation: record(2), stackDeployer: record(3) }
+  };
+  const cid = `ipfs://b${'a'.repeat(58)}`;
+  const draft = {
+    tokenName: 'Example FAO', tokenSymbol: 'EFAO',
+    governedRepository: 'https://github.com/example/fao', governedSite: 'https://example.pages.dev',
+    saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
+    initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
+    tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',
+    daoURI: cid, metadataURI: cid, votingStrategyMetadataURI: cid,
+    proposalValidationStrategyMetadataURI: cid
+  };
+  const input = creationInputFromDraft(draft, manifest, 2_000_000_000n);
+  assert.equal(input.registrar, address(1));
+  assert.equal(input.currentTimestamp, '2000000000');
+  assert.equal(input.coreConfig.saleEnd, '2000003600');
+  assert.equal(input.coreConfig.bootstrapDeadline, '2000090000');
+  assert.equal(input.coreConfig.stackDeployer.target, address(3));
+  assert.equal(input.coreConfig.proposalImplementation.target, address(2));
+  assert.deepEqual(input.grants, []);
 });
 
 test('creation bundle verifies every receipt, core, and FLM blob', () => {

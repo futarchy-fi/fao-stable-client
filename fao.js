@@ -3,7 +3,7 @@ const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
 
 export const SELECTORS = Object.freeze({
   stage: '0xd12d24e8',
-  predict: '0xaab39e22',
+  predict: '0x5421831b',
   claim: '0x1e83409a',
   refund: '0xfa89401a',
   ragequit: '0xb07bf2ad',
@@ -129,11 +129,11 @@ export function stageCalldata(coreConfigHash, flmConfigHash, receiptBaseCode) {
   ]);
 }
 
-export function predictCalldata(receiptBaseCode, coreConfigHash, flmConfigHash) {
+export function predictCalldata(coreConfigHash, flmConfigHash, receiptBaseCode) {
   return encodeCalldata(SELECTORS.predict, [
-    { dynamic: encodeBytes(receiptBaseCode) },
     bytes32Word(coreConfigHash),
-    bytes32Word(flmConfigHash)
+    bytes32Word(flmConfigHash),
+    { dynamic: encodeBytes(receiptBaseCode) }
   ]);
 }
 

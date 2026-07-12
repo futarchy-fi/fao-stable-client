@@ -56,8 +56,8 @@ test('registrar stage and prediction calldata match the settled ABI', () => {
     cast('calldata', 'stage(bytes32,bytes32,bytes)', core, flm, baseCode)
   );
   assert.equal(
-    predictCalldata(baseCode, core, flm),
-    cast('calldata', 'predict(bytes,bytes32,bytes32)', baseCode, core, flm)
+    predictCalldata(core, flm, baseCode),
+    cast('calldata', 'predict(bytes32,bytes32,bytes)', core, flm, baseCode)
   );
 });
 

@@ -120,7 +120,20 @@ export function normalizeAddress(value, { allowZero = false } = {}) {
   if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value)) {
     throw new Error('address must be a 20-byte 0x value.');
   }
-  const address = value.toLowerCase();
+  const body = value.slice(2);
+  const lower = body.toLowerCase();
+  const upper = body.toUpperCase();
+  if (body !== lower && body !== upper) {
+    const checksum = keccak256(lower).slice(2);
+    for (let index = 0; index < body.length; index += 1) {
+      if (!/[a-fA-F]/.test(body[index])) continue;
+      const expectedUpper = Number.parseInt(checksum[index], 16) >= 8;
+      if ((body[index] === body[index].toUpperCase()) !== expectedUpper) {
+        throw new Error('address has an invalid EIP-55 checksum.');
+      }
+    }
+  }
+  const address = `0x${lower}`;
   if (!allowZero && address === ZERO_ADDRESS) throw new Error('zero address is not allowed.');
   return address;
 }

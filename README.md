@@ -4,10 +4,17 @@ Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed
 site.
 
-`deployment.json` is the only FAO/Sepolia deployment manifest. Until the fresh
-FAO contracts are deployed it remains in `pre-deployment` state; the UI refuses
+`deployment.json` is the governed-site FAO/Sepolia deployment manifest. Until
+the fresh FAO contracts are deployed it remains in `pre-deployment` state; the UI refuses
 to invent or reuse legacy addresses. `flm-deployment.json` separately pins the
 reviewed Gnosis factory and limited-funds canary used by `flm.html`.
+
+`selfserve-deployment.json` is a separate trust root for permissionless Sepolia
+FAO creation. Once deployed, it is the exact canonical registrar manifest: the
+ownerless registrar plus the two shared compiler-pinned prerequisites. The FAO
+dashboard never treats governed-site `deployment.json` as registrar authority.
+`fao-creation-codes.json` contains the exact receipt, core, and FLM creation
+blobs; the browser checks all twelve pinned Keccak hashes before using them.
 
 The site is dependency-free static HTML, CSS, and JavaScript.
 

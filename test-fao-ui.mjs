@@ -6,6 +6,7 @@ import {
   deriveNetworkGate,
   instanceTrustLabel,
   parseExtraAssetInput,
+  validateCreationBundle,
   verifyRuntimeCode,
   visibleInstances
 } from './fao-ui.js';
@@ -39,24 +40,50 @@ test('writes fail closed on RPC disagreement, wrong chain, and unverified code',
 test('runtime verification requires an exact hash map and matches every contract', async () => {
   const manifest = {
     status: 'active',
-    contracts: { first: address(1), second: address(2) },
-    runtimeCodeHashes: { first: keccak256('0x6001'), second: keccak256('0x6002') }
+    registrar: { address: address(1), runtimeCodeKeccak256: keccak256('0x6001') },
+    prerequisites: {
+      proposalImplementation: { address: address(2), runtimeCodeKeccak256: keccak256('0x6002') },
+      stackDeployer: { address: address(3), runtimeCodeKeccak256: keccak256('0x6003') }
+    }
   };
-  const codes = new Map([[address(1), '0x6001'], [address(2), '0x6002']]);
+  const codes = new Map([[address(1), '0x6001'], [address(2), '0x6002'], [address(3), '0x6003']]);
   const request = async (method, params) => {
     assert.equal(method, 'eth_getCode');
     return codes.get(params[0]);
   };
-  assert.deepEqual((await verifyRuntimeCode(manifest, request)).checked, ['first', 'second']);
+  assert.deepEqual((await verifyRuntimeCode(manifest, request)).checked, ['registrar', 'proposalImplementation', 'stackDeployer']);
 
   await assert.rejects(
-    verifyRuntimeCode({ ...manifest, runtimeCodeHashes: { first: hash('11') } }, request),
-    /exactly match/
-  );
-  await assert.rejects(
-    verifyRuntimeCode({ ...manifest, runtimeCodeHashes: { ...manifest.runtimeCodeHashes, second: hash('33') } }, request),
+    verifyRuntimeCode({ ...manifest, registrar: { ...manifest.registrar, runtimeCodeKeccak256: hash('33') } }, request),
     /does not match/
   );
+});
+
+test('creation bundle verifies every receipt, core, and FLM blob', () => {
+  const codes = {
+    receipt: '0x6000',
+    core: Object.fromEntries(['ARBITRATION', 'VAULT', 'RELEASE_STRATEGY', 'ZERO_VOTING', 'ECON_GATEWAY', 'ECON_EVALUATOR'].map((key, index) => [key, `0x60${(index + 1).toString(16).padStart(2, '0')}`])),
+    flm: Object.fromEntries(['RELAY', 'ADAPTER', 'GUARD', 'ROUTER', 'MANAGER'].map((key, index) => [key, `0x61${(index + 1).toString(16).padStart(2, '0')}`]))
+  };
+  const hashes = {
+    receipt: keccak256(codes.receipt),
+    core: Object.fromEntries(Object.entries(codes.core).map(([key, code]) => [key, keccak256(code)])),
+    flm: Object.fromEntries(Object.entries(codes.flm).map(([key, code]) => [key, keccak256(code)]))
+  };
+  const bundle = {
+    schemaVersion: 1,
+    evidence: {
+      economicManifestPath: 'metadata/economic-core-code-hashes.json',
+      economicManifestKeccak256: hash('11'),
+      flmManifestPath: 'metadata/sepolia-flm-code-hashes.json',
+      flmManifestKeccak256: hash('22')
+    },
+    codeHashes: hashes,
+    creationCodes: codes
+  };
+  assert.equal(validateCreationBundle(bundle), bundle);
+  bundle.creationCodes.core.VAULT = '0x6009';
+  assert.throws(() => validateCreationBundle(bundle), /pinned hash/);
 });
 
 test('instance browser defaults to curated or code-verified records', () => {

@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Fixed self-serve client for creating and operating Sepolia FAOs.">
+    <title>Self-serve FAO · FAO stable client</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/fao-ui.js"></script>
+  </head>
+  <body>
+    <main class="wide">
+      <header class="compact-header">
+        <p class="eyebrow">Out-of-band client · <a href="/">FAO stable client</a></p>
+        <h1>Self-serve FAO</h1>
+        <p class="lede">
+          Create, resume, and operate a futarchy-controlled organization without relying on its
+          replaceable website. This fixed client verifies the network and deployed code before it
+          enables any transaction.
+        </p>
+        <nav class="page-nav" aria-label="FAO dashboard sections">
+          <a href="#create">Create</a>
+          <a href="#instances">Browse</a>
+          <a href="#sale">Sale</a>
+          <a href="#liquidity">Liquidity</a>
+          <a href="#governance">Release and treasury</a>
+        </nav>
+      </header>
+
+      <section aria-labelledby="connection-heading">
+        <div class="section-heading">
+          <h2 id="connection-heading">Connection and verification</h2>
+          <span id="connection-badge" class="status">Loading manifest</span>
+        </div>
+        <dl>
+          <div><dt>Required network</dt><dd>Sepolia · 11155111</dd></div>
+          <div><dt>Deployment</dt><dd id="deployment-state">Loading</dd></div>
+          <div><dt>Account</dt><dd id="wallet-account">Not connected</dd></div>
+          <div><dt>Wallet chain</dt><dd id="wallet-chain">—</dd></div>
+          <div><dt>RPC chain</dt><dd id="rpc-chain">—</dd></div>
+          <div><dt>Runtime code</dt><dd id="code-state">Not checked</dd></div>
+        </dl>
+        <div class="actions">
+          <button id="connect" type="button">Connect wallet</button>
+          <button id="refresh" type="button" disabled>Verify again</button>
+        </div>
+        <p id="connection-message" class="message" role="status" aria-live="polite">
+          On-chain actions remain unavailable until the deployment manifest is published.
+        </p>
+        <p class="notice">
+          Fail-closed boundary: a wrong chain, disagreement between wallet RPC methods, missing
+          runtime hash, or bytecode mismatch disables every transaction below.
+        </p>
+      </section>
+
+      <section id="create" aria-labelledby="create-heading">
+        <div class="section-heading">
+          <h2 id="create-heading">Create or resume an FAO</h2>
+          <span class="status">Permissionless</span>
+        </div>
+        <p>
+          Saving this draft is local to this browser. It does not register an organization or
+          imply endorsement by Futarchy Labs, this client, or the address named in the form.
+        </p>
+        <form id="create-form">
+          <fieldset>
+            <legend>Identity and governed surface</legend>
+            <div class="form-grid">
+              <label>FAO name
+                <input name="tokenName" autocomplete="organization" required maxlength="80" placeholder="Example FAO">
+              </label>
+              <label>Token symbol
+                <input name="tokenSymbol" autocomplete="off" required maxlength="16" placeholder="EXFAO">
+              </label>
+              <label class="full">Governed repository
+                <input name="governedRepository" type="url" inputmode="url" required placeholder="https://github.com/owner/repository">
+                <span>An accepted proposal may replace everything in this repository and its governed site.</span>
+              </label>
+              <label class="full">Governed site
+                <input name="governedSite" type="url" inputmode="url" required placeholder="https://example.pages.dev">
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Sale and automatic liquidity</legend>
+            <div class="form-grid">
+              <label>Sale duration (seconds)
+                <input name="saleDuration" type="number" min="1" step="1" required value="3600">
+              </label>
+              <label>Bootstrap window (seconds)
+                <input name="bootstrapDuration" type="number" min="1" step="1" required value="86400">
+              </label>
+              <label>Sale token cap (wei)
+                <input name="saleCap" inputmode="numeric" pattern="[0-9]+" required placeholder="100000000000000000000">
+              </label>
+              <label>Starting price (WETH wei per FAO)
+                <input name="initialPrice" inputmode="numeric" pattern="[0-9]+" required placeholder="10000000000000">
+              </label>
+              <label>Price slope
+                <input name="slope" inputmode="numeric" pattern="[0-9]+" required value="0">
+                <span>Zero creates a fixed-price sale; a positive value creates the finite launch curve.</span>
+              </label>
+              <label>Minimum raise (WETH wei)
+                <input name="minimumRaise" inputmode="numeric" pattern="[0-9]+" required placeholder="500000000000000">
+              </label>
+              <label>Maximum token supply (wei)
+                <input name="tokenMaxSupply" inputmode="numeric" pattern="[0-9]+" required placeholder="201000000000000000000">
+              </label>
+              <label>Proceeds to FLM (basis points)
+                <input name="bootstrapBps" type="number" min="1" max="10000" step="1" required value="5000">
+              </label>
+              <label>Sale currency
+                <input value="Sepolia WETH (manifest-pinned)" readonly aria-readonly="true">
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend>Permanent metadata</legend>
+            <div class="form-grid">
+              <label class="full">DAO metadata URI
+                <input name="daoURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+              </label>
+              <label class="full">Space metadata URI
+                <input name="metadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+              </label>
+              <label class="full">No-vote strategy metadata URI
+                <input name="votingStrategyMetadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+                <span>Snapshot X compatibility only: voting power is permanently zero.</span>
+              </label>
+              <label class="full">Proposal validation strategy metadata URI
+                <input name="proposalValidationStrategyMetadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="actions">
+            <button type="submit">Save browser draft</button>
+            <button id="clear-draft" type="button">Clear draft</button>
+          </div>
+          <p id="draft-status" class="message" role="status" aria-live="polite"></p>
+        </form>
+
+        <h3>Staged deployment</h3>
+        <ol class="stage-list" aria-label="FAO deployment stages">
+          <li class="stage-card">
+            <div>
+              <p class="stage-number">Stage 1</p>
+              <h4>Receipt</h4>
+              <p>Commit the exact configuration and deterministic child bytecode.</p>
+              <p class="details" id="receipt-detail">No staged receipt found.</p>
+            </div>
+            <button type="button" data-write data-stage="receipt" disabled>Stage or resume receipt</button>
+          </li>
+          <li class="stage-card">
+            <div>
+              <p class="stage-number">Stage 2</p>
+              <h4>Economic core</h4>
+              <p>Deploy the token, sale vault, and ownerless no-vote execution stack.</p>
+              <p class="details" id="core-detail">Waiting for a verified receipt.</p>
+            </div>
+            <button type="button" data-write data-stage="core" disabled>Deploy or resume core</button>
+          </li>
+          <li class="stage-card">
+            <div>
+              <p class="stage-number">Stage 3</p>
+              <h4>Liquidity manager</h4>
+              <p>Deploy and wire the fixed-parameter, permissionless FLM.</p>
+              <p class="details" id="flm-detail">Waiting for a verified core.</p>
+            </div>
+            <button type="button" data-write data-stage="flm" disabled>Deploy or resume FLM</button>
+          </li>
+        </ol>
+        <p id="stage-status" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="instances" aria-labelledby="instances-heading">
+        <div class="section-heading">
+          <h2 id="instances-heading">FAO browser</h2>
+          <span id="instance-count" class="status">0 shown</span>
+        </div>
+        <label class="inline filter-toggle">
+          <input id="show-unverified" type="checkbox">
+          Show unverified registrar instances
+        </label>
+        <p class="notice">
+          The default list is client-curated or code-verified. Those labels describe software and
+          listing status only; they never endorse the claimed organization or its operators.
+        </p>
+        <p id="instances-empty" class="empty-state">No canonical or code-verified FAO is published yet.</p>
+        <ul id="instances-list" class="instance-list" hidden></ul>
+      </section>
+
+      <section id="sale" aria-labelledby="sale-heading">
+        <div class="section-heading">
+          <h2 id="sale-heading">Launch sale</h2>
+          <span class="status">No live instance selected</span>
+        </div>
+        <div class="dashboard-grid">
+          <article class="metric-card"><h3>Sale phase</h3><p id="sale-phase">Unavailable</p></article>
+          <article class="metric-card"><h3>Raised</h3><p id="sale-raised">— WETH</p></article>
+          <article class="metric-card"><h3>Sold</h3><p id="sale-sold">— FAO</p></article>
+          <article class="metric-card"><h3>Current endpoint price</h3><p id="sale-price">— WETH</p></article>
+        </div>
+        <div class="action-grid">
+          <form id="buy-form" class="action-card">
+            <h3>Buy launch tokens</h3>
+            <label>FAO amount (wei)
+              <input name="amount" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Maximum WETH cost (wei)
+              <input name="maximumCost" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <button type="submit" data-write disabled>Buy</button>
+          </form>
+          <div class="action-card">
+            <h3>Settle sale position</h3>
+            <p>Claim after a successful launch, or receive the exact recorded refund after failure.</p>
+            <div class="actions">
+              <button type="button" data-write data-action="claim" disabled>Claim FAO</button>
+              <button type="button" data-write data-action="refund" disabled>Refund WETH</button>
+              <button type="button" data-write data-action="finalize" disabled>Permissionless finalize</button>
+            </div>
+          </div>
+        </div>
+        <p id="sale-status" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="liquidity" aria-labelledby="liquidity-heading">
+        <div class="section-heading">
+          <h2 id="liquidity-heading">Liquidity and ragequit</h2>
+          <span class="status">Fixed safety parameters</span>
+        </div>
+        <p>
+          Anyone may call sync, but the deployed manager—not the caller—chooses pool ranges,
+          slippage limits, deadlines, and adapter parameters. In spot mode, anyone may deposit and
+          withdraw their pro-rata shares.
+        </p>
+        <div class="action-grid">
+          <form id="deposit-form" class="action-card">
+            <h3>Deposit to spot FLM</h3>
+            <label>Maximum FAO amount (wei)
+              <input name="companyAmount" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Maximum WETH amount (wei)
+              <input name="collateralAmount" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <button type="submit" data-write disabled>Deposit</button>
+          </form>
+          <form id="redeem-form" class="action-card">
+            <h3>Redeem FLM shares</h3>
+            <label>Shares (wei)
+              <input name="shares" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Recipient
+              <input name="recipient" autocomplete="off" required placeholder="0x…">
+            </label>
+            <button type="submit" data-write disabled>Withdraw pro-rata</button>
+          </form>
+          <div class="action-card">
+            <h3>Permissionless sync</h3>
+            <p>Retry after pool arbitrage if the manager's fixed slippage check rejects the current price.</p>
+            <button type="button" data-write data-action="sync" disabled>Sync fixed ranges</button>
+          </div>
+        </div>
+
+        <form id="ragequit-form" class="ragequit-card">
+          <h3>Prepare maximal ragequit</h3>
+          <p>
+            The manager-held FAO remains in the denominator. WETH and FLM shares are implicit;
+            enter every additional token explicitly. The exact sorted, unique list is shown before
+            execution.
+          </p>
+          <div class="form-grid">
+            <label>FAO amount to burn (wei)
+              <input name="amount" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Recipient
+              <input name="recipient" autocomplete="off" required placeholder="0x…">
+            </label>
+            <label class="full">Additional assets, one address per line
+              <textarea name="extras" rows="4" spellcheck="false" placeholder="0x0000000000000000000000000000000000000000"></textarea>
+              <span>The zero address means native ETH. Duplicates are removed before encoding.</span>
+            </label>
+          </div>
+          <div class="actions">
+            <button type="submit">Show exact asset list</button>
+            <button id="execute-ragequit" type="button" data-write disabled>Execute ragequit</button>
+          </div>
+          <div id="ragequit-plan" class="exact-assets" hidden>
+            <h4>Exact additional assets</h4>
+            <p id="ragequit-empty" class="empty-state">No additional assets. WETH and FLM shares remain implicit.</p>
+            <ol id="ragequit-assets"></ol>
+            <details class="details">
+              <summary>Exact transaction calldata</summary>
+              <code id="ragequit-calldata"></code>
+            </details>
+          </div>
+          <p id="liquidity-status" class="message" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <section id="governance" aria-labelledby="governance-heading">
+        <div class="section-heading">
+          <h2 id="governance-heading">Release and treasury dashboard</h2>
+          <span class="status">Awaiting deployment</span>
+        </div>
+        <div class="dashboard-grid">
+          <article class="metric-card">
+            <h3>Current evaluation</h3>
+            <p>None published</p>
+            <p class="details">Futarchy determines the recommended outcome. There is no voting path.</p>
+          </article>
+          <article class="metric-card">
+            <h3>Release action</h3>
+            <p>—</p>
+            <p class="details">Site and repository release authority will appear here.</p>
+          </article>
+          <article class="metric-card">
+            <h3>Treasury NAV</h3>
+            <p>—</p>
+            <p class="details">WETH, FLM shares, and exact extra assets.</p>
+          </article>
+          <article class="metric-card">
+            <h3>Execution window</h3>
+            <p>—</p>
+            <p class="details">Accepted treasury actions use their sovereign on-chain grace and execution windows.</p>
+          </article>
+        </div>
+        <p class="empty-state">
+          No live FAO is selected. Release history, treasury actions, vesting grants, and claimable
+          balances will remain empty rather than falling back to a legacy deployment.
+        </p>
+      </section>
+    </main>
+    <footer class="wide">Stable surface · code verification ≠ organization endorsement · no legacy fallback</footer>
+  </body>
+</html>

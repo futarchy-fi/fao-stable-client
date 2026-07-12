@@ -1,10 +1,48 @@
-import { validateDeploymentManifest } from './deployment-manifest.mjs';
+import { selfServeRuntimeRecords, validateSelfServeManifest } from './selfserve-manifest.mjs';
 import * as fao from './fao.js';
 
 export const SEPOLIA_CHAIN_ID = 11155111n;
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
+
+function exactRecord(value, keys, label) {
+  if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error(`${label} must be an object.`);
+  const actual = Object.keys(value);
+  if (actual.length !== keys.length || keys.some((key) => !actual.includes(key))) {
+    throw new Error(`${label} must contain exactly: ${keys.join(', ')}.`);
+  }
+  return value;
+}
+
+export function validateCreationBundle(value) {
+  exactRecord(value, ['schemaVersion', 'evidence', 'codeHashes', 'creationCodes'], 'Creation bundle');
+  if (value.schemaVersion !== 1) throw new Error('Creation bundle schemaVersion must be 1.');
+  exactRecord(value.evidence, [
+    'economicManifestPath', 'economicManifestKeccak256', 'flmManifestPath', 'flmManifestKeccak256'
+  ], 'Creation bundle evidence');
+  if (value.evidence.economicManifestPath !== 'metadata/economic-core-code-hashes.json'
+    || value.evidence.flmManifestPath !== 'metadata/sepolia-flm-code-hashes.json') {
+    throw new Error('Creation bundle evidence paths are not canonical.');
+  }
+  fao.normalizeHex(value.evidence.economicManifestKeccak256, 32, 'Economic manifest hash');
+  fao.normalizeHex(value.evidence.flmManifestKeccak256, 32, 'FLM manifest hash');
+  for (const section of [value.codeHashes, value.creationCodes]) {
+    exactRecord(section, ['receipt', 'core', 'flm'], 'Creation code section');
+    exactRecord(section.core, fao.CORE_CODE_KEYS, 'Core creation codes');
+    exactRecord(section.flm, fao.FLM_CODE_KEYS, 'FLM creation codes');
+  }
+  const verify = (code, expected, label) => {
+    const normalized = fao.normalizeHex(code, undefined, `${label} creation code`);
+    if (normalized === '0x') throw new Error(`${label} creation code cannot be empty.`);
+    const hash = fao.normalizeHex(expected, 32, `${label} creation-code hash`);
+    if (fao.keccak256(normalized) !== hash) throw new Error(`${label} creation code does not match its pinned hash.`);
+  };
+  verify(value.creationCodes.receipt, value.codeHashes.receipt, 'Receipt');
+  for (const key of fao.CORE_CODE_KEYS) verify(value.creationCodes.core[key], value.codeHashes.core[key], key);
+  for (const key of fao.FLM_CODE_KEYS) verify(value.creationCodes.flm[key], value.codeHashes.flm[key], key);
+  return Object.freeze(value);
+}
 
 function chainId(value, label) {
   if (value == null) return null;
@@ -64,28 +102,15 @@ export function deriveNetworkGate({
   return Object.freeze({ state: 'ready', canTransact: true, message: 'Sepolia, RPC agreement, and every manifest runtime hash are verified.' });
 }
 
-function runtimeHashes(manifest) {
-  const hashes = manifest.runtimeCodeHashes;
-  if (!hashes || Array.isArray(hashes) || typeof hashes !== 'object') {
-    throw new Error('Active deployment manifest has no runtimeCodeHashes map.');
-  }
-  const contractKeys = Object.keys(manifest.contracts);
-  const hashKeys = Object.keys(hashes);
-  if (contractKeys.length !== hashKeys.length || contractKeys.some((key) => !hashKeys.includes(key))) {
-    throw new Error('Runtime hash keys must exactly match deployment contract keys.');
-  }
-  return hashes;
-}
-
 export async function verifyRuntimeCode(manifest, request) {
   if (manifest.status === 'pre-deployment') return Object.freeze({ status: 'unavailable', checked: Object.freeze([]) });
   if (manifest.status !== 'active') throw new Error('Cannot verify a non-active deployment.');
   if (typeof request !== 'function') throw new Error('An RPC request function is required.');
 
-  const hashes = runtimeHashes(manifest);
-  const checked = await Promise.all(Object.entries(manifest.contracts).map(async ([name, address]) => {
-    const expected = fao.normalizeHex(hashes[name], 32, `${name} runtime hash`);
-    const code = fao.normalizeHex(await request('eth_getCode', [address, 'latest']), undefined, `${name} runtime code`);
+  const records = selfServeRuntimeRecords(manifest);
+  const checked = await Promise.all(Object.entries(records).map(async ([name, record]) => {
+    const expected = fao.normalizeHex(record.runtimeCodeKeccak256, 32, `${name} runtime hash`);
+    const code = fao.normalizeHex(await request('eth_getCode', [record.address, 'latest']), undefined, `${name} runtime code`);
     if (code === '0x') throw new Error(`${name} has no runtime code.`);
     const actual = fao.keccak256(code);
     if (actual !== expected) throw new Error(`${name} runtime bytecode does not match the manifest.`);
@@ -143,6 +168,7 @@ let state = {
   rpcChainId: null,
   codeState: 'unchecked',
   codeMessage: 'Not checked',
+  creationBundle: null,
   instances: [],
   ragequitPlan: null
 };
@@ -176,9 +202,12 @@ function renderGate() {
   elements.walletChain.textContent = state.walletChainId == null ? '—' : String(state.walletChainId);
   elements.rpcChain.textContent = state.rpcChainId == null ? '—' : String(state.rpcChainId);
   elements.codeState.textContent = state.codeMessage;
+  elements.creationCodeState.textContent = state.creationBundle ? '12 / 12 creation blobs verified' : 'Unavailable';
   elements.refresh.disabled = !window.ethereum;
   for (const button of document.querySelectorAll('[data-write]')) {
-    button.disabled = !gate.canTransact || (button === elements.executeRagequit && !state.ragequitPlan);
+    const needsCreationBundle = button.hasAttribute('data-stage');
+    button.disabled = !gate.canTransact || (needsCreationBundle && !state.creationBundle)
+      || (button === elements.executeRagequit && !state.ragequitPlan);
   }
   setMessage(elements.connectionMessage, gate.message, gate.state.includes('wrong') || gate.state.includes('mismatch') || gate.state.includes('invalid') || gate.state.includes('disagreement'));
 }
@@ -230,9 +259,14 @@ function renderStages() {
 }
 
 async function loadManifest() {
-  const response = await fetch('/deployment.json', { cache: 'no-store' });
-  if (!response.ok) throw new Error(`Deployment manifest HTTP ${response.status}.`);
-  state.manifest = validateDeploymentManifest(await response.json());
+  const [manifestResponse, codesResponse] = await Promise.all([
+    fetch('/selfserve-deployment.json', { cache: 'no-store' }),
+    fetch('/fao-creation-codes.json', { cache: 'no-store' })
+  ]);
+  if (!manifestResponse.ok) throw new Error(`Self-serve deployment manifest HTTP ${manifestResponse.status}.`);
+  if (!codesResponse.ok) throw new Error(`Creation bundle HTTP ${codesResponse.status}.`);
+  state.manifest = validateSelfServeManifest(await manifestResponse.json());
+  state.creationBundle = validateCreationBundle(await codesResponse.json());
   state.instances = CURATED_INSTANCES;
   renderInstances();
   renderStages();
@@ -341,7 +375,7 @@ function bindElements() {
   elements = {
     connectionBadge: byId('connection-badge'), deploymentState: byId('deployment-state'),
     walletAccount: byId('wallet-account'), walletChain: byId('wallet-chain'), rpcChain: byId('rpc-chain'),
-    codeState: byId('code-state'), connect: byId('connect'), refresh: byId('refresh'),
+    codeState: byId('code-state'), creationCodeState: byId('creation-code-state'), connect: byId('connect'), refresh: byId('refresh'),
     connectionMessage: byId('connection-message'), createForm: byId('create-form'), clearDraft: byId('clear-draft'),
     draftStatus: byId('draft-status'), stageStatus: byId('stage-status'), showUnverified: byId('show-unverified'),
     instanceCount: byId('instance-count'), instancesList: byId('instances-list'), instancesEmpty: byId('instances-empty'),

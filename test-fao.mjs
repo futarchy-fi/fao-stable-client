@@ -339,10 +339,18 @@ test('permissionless no-argument lifecycle calls use exact selectors', () => {
 test('chain, address, and hex validation fail closed', () => {
   assert.equal(assertChainId('0xaa36a7', 11155111), 11155111n);
   assert.equal(normalizeAddress(address(10).toUpperCase().replace('0X', '0x')), address(10));
+  assert.equal(
+    normalizeAddress('0x52908400098527886E0F7030069857D2E4169EE7'),
+    '0x52908400098527886e0f7030069857d2e4169ee7'
+  );
   assert.equal(normalizeHex('0xABCD', 2), '0xabcd');
   assert.throws(() => assertChainId(0), /positive/);
   assert.throws(() => assertChainId(1, 11155111), /wrong chain/);
   assert.throws(() => normalizeAddress(address(0)), /zero address/);
+  assert.throws(
+    () => normalizeAddress('0x52908400098527886E0F7030069857D2E4169Ee7'),
+    /EIP-55/
+  );
   assert.throws(() => normalizeHex('abcd'), /0x-prefixed/);
   assert.throws(() => normalizeHex('0xabc'), /even-length/);
 });

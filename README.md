@@ -18,8 +18,8 @@ checks the factory's immutable dependencies and pinned hashes through the
 connected wallet before enabling bundle creation. Factory events remain
 unverified organization claims unless separately endorsed.
 
-Run the ABI encoder and embedded-bytecode checks with Foundry's `cast` available:
+Run the manifest, ABI encoder, and embedded-bytecode checks with Foundry's `cast` available:
 
 ```sh
-node --test test-flm.mjs
+node --test test-*.mjs
 ```

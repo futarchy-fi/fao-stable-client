@@ -121,27 +121,38 @@
             <legend>Permanent metadata</legend>
             <div class="form-grid">
               <label class="full">DAO metadata URI
-                <input name="daoURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+                <input name="daoURI" required pattern="ipfs://b[a-z2-7]{58}" placeholder="ipfs://b…">
               </label>
               <label class="full">Space metadata URI
-                <input name="metadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+                <input name="metadataURI" required pattern="ipfs://b[a-z2-7]{58}" placeholder="ipfs://b…">
               </label>
               <label class="full">No-vote strategy metadata URI
-                <input name="votingStrategyMetadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+                <input name="votingStrategyMetadataURI" required pattern="ipfs://b[a-z2-7]{58}" placeholder="ipfs://b…">
                 <span>Snapshot X compatibility only: voting power is permanently zero.</span>
               </label>
               <label class="full">Proposal validation strategy metadata URI
-                <input name="proposalValidationStrategyMetadataURI" required pattern="ipfs://.+" placeholder="ipfs://…">
+                <input name="proposalValidationStrategyMetadataURI" required pattern="ipfs://b[a-z2-7]{58}" placeholder="ipfs://b…">
               </label>
             </div>
           </fieldset>
 
           <div class="actions">
             <button type="submit">Save browser draft</button>
+            <button id="prepare-plan" type="button">Prepare exact plan</button>
             <button id="clear-draft" type="button">Clear draft</button>
           </div>
           <p id="draft-status" class="message" role="status" aria-live="polite"></p>
         </form>
+
+        <div id="creation-plan" class="exact-assets" hidden>
+          <h3>Exact deployment commitment</h3>
+          <p>Review these values before the first wallet prompt. The saved plan is reused by every resumable stage.</p>
+          <dl>
+            <div><dt>Predicted receipt</dt><dd><code id="plan-receipt"></code></dd></div>
+            <div><dt>Core configuration hash</dt><dd><code id="plan-core-hash"></code></dd></div>
+            <div><dt>FLM configuration hash</dt><dd><code id="plan-flm-hash"></code></dd></div>
+          </dl>
+        </div>
 
         <h3>Staged deployment</h3>
         <ol class="stage-list" aria-label="FAO deployment stages">

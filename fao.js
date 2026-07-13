@@ -27,8 +27,35 @@ export const SELECTORS = Object.freeze({
   stageCriticalAction: '0x96ff22f3',
   queueCriticalAction: '0x6ffabdf2',
   executeCriticalAction: '0x5400e73a',
-  expireQueuedAction: '0xf0f9a6d7'
+  expireQueuedAction: '0xf0f9a6d7',
+  buyback: '0xf8ec6911'
 });
+
+export const BUYBACK_SELECTORS = Object.freeze({
+  weth: '0xad5c4648',
+  phase: '0xb1c9fe6e',
+  effectiveSupply: '0x8fc47093',
+  window: '0xed1ecc63',
+  dailyCap: '0x8e53aafa',
+  dailyBps: '0x1d9ca3d6',
+  navBps: '0x78f61c55',
+  twapWindow: '0xb43c9fbf',
+  maxTickDeviation: '0x031c7e38',
+  windowStart: '0x58ea7322',
+  wethSpent: '0x006ecaee',
+  balanceOf: '0x70a08231'
+});
+
+export const BUYBACK_EVENT_TOPIC =
+  '0x2dcc2439519c7d06fca9f8ae01e07f4f3c6ca21b5cdf8eff42cb75cf34d223c9';
+export const BUYBACK_CHAIN_ID = 11155111n;
+export const BUYBACK_INTENT =
+  'Calling buyback controls timing only. The contract fixes the amount, recipient, TWAP, guard, price clamp, and literal burn. Accepted queued WETH payments are not reserved against buyback.';
+export const BUYBACK_MARKET_CHECKS = Object.freeze([
+  'The canonical guard must accept the pool and its current stability.',
+  'The 30-minute TWAP must be strictly below 95% of WETH-only NAV.',
+  'The spot price must leave room to trade inside the mean ± 50-tick clamp, and the swap must fill.'
+]);
 
 export const CORE_CODE_KEYS = Object.freeze([
   'ARBITRATION',
@@ -487,7 +514,7 @@ export async function verifyAssetPolicyContracts(coreConfig, request) {
 
 export function normalizeGrants(value) {
   if (!Array.isArray(value)) throw new Error('GrantConfig[] must be an array.');
-  if (value.length > 32) throw new Error('GrantConfig[] cannot contain more than 32 grants.');
+  if (value.length > 16) throw new Error('GrantConfig[] cannot contain more than 16 grants.');
   return Object.freeze(Array.from(value, (raw, index) => {
     const grant = requireRecord(raw, GRANT_KEYS, `GrantConfig[${index}]`);
     const normalized = {
@@ -905,6 +932,129 @@ export const executeCriticalActionCalldata = (action) => (
 export const expireQueuedActionCalldata = (actionHash) => (
   encodeCalldata(SELECTORS.expireQueuedAction, [bytes32Word(actionHash)])
 );
+
+export const buybackCalldata = () => SELECTORS.buyback;
+
+export function prepareBuyback(value) {
+  const input = requireRecord(value, ['chainId', 'vault'], 'Buyback plan input');
+  const chainId = assertChainId(input.chainId, BUYBACK_CHAIN_ID);
+  return Object.freeze({
+    chainId,
+    target: normalizeAddress(input.vault),
+    data: buybackCalldata(),
+    label: 'Permissionless fixed-policy buyback',
+    intent: BUYBACK_INTENT
+  });
+}
+
+export function deriveBuybackModel(value) {
+  const input = requireRecord(value, [
+    'timestamp', 'phase', 'executorWeth', 'effectiveSupply', 'buybackWindowStart',
+    'buybackWethSpent', 'buybackWindow', 'buybackDailyCap', 'buybackDailyBps',
+    'buybackNavBps', 'buybackTwapWindow', 'buybackMaxTickDeviation'
+  ], 'Buyback state');
+  const timestamp = unsigned(input.timestamp, 64, 'Buyback timestamp');
+  const phase = unsigned(input.phase, 8, 'Buyback phase');
+  const executorWeth = unsigned(input.executorWeth, 256, 'Buyback executor WETH');
+  const effectiveSupply = unsigned(input.effectiveSupply, 256, 'Buyback effective supply');
+  const storedWindowStart = unsigned(input.buybackWindowStart, 64, 'Buyback window start');
+  const storedWethSpent = unsigned(input.buybackWethSpent, 192, 'Buyback WETH spent');
+  const window = unsigned(input.buybackWindow, 256, 'Buyback window');
+  const rawCap = unsigned(input.buybackDailyCap, 256, 'Buyback daily cap');
+  const dailyBps = unsigned(input.buybackDailyBps, 256, 'Buyback daily BPS');
+  const navBps = unsigned(input.buybackNavBps, 256, 'Buyback NAV BPS');
+  const twapWindow = unsigned(input.buybackTwapWindow, 32, 'Buyback TWAP window');
+  const maxTickDeviation = unsigned(
+    input.buybackMaxTickDeviation, 23, 'Buyback maximum tick deviation'
+  );
+  if (window === 0n || rawCap === 0n || twapWindow === 0n) {
+    throw new Error('Buyback windows and raw cap must be positive.');
+  }
+  if (dailyBps > 10_000n || navBps > 10_000n) {
+    throw new Error('Buyback basis points cannot exceed 10000.');
+  }
+
+  const windowActive = storedWindowStart !== 0n && timestamp < storedWindowStart + window;
+  const actualSpent = windowActive ? storedWethSpent : 0n;
+  const percentCap = executorWeth * dailyBps / 10_000n;
+  const liveCap = rawCap < percentCap ? rawCap : percentCap;
+  const available = liveCap > actualSpent ? liveCap - actualSpent : 0n;
+  const navWethPerTokenWad = effectiveSupply === 0n
+    ? null
+    : executorWeth * WAD / effectiveSupply;
+  const triggerWethPerTokenWad = navWethPerTokenWad == null
+    ? null
+    : navWethPerTokenWad * navBps / 10_000n;
+  const reasons = [];
+  if (phase !== 2n) reasons.push('The FAO is not LIVE.');
+  if (effectiveSupply === 0n) reasons.push('Effective supply is zero.');
+  if (executorWeth === 0n) reasons.push('Executor WETH is zero.');
+  if (executorWeth !== 0n && available === 0n) {
+    reasons.push('The current anchored-window allowance is exhausted.');
+  }
+
+  return Object.freeze({
+    timestamp,
+    phase,
+    isLive: phase === 2n,
+    executorWeth,
+    effectiveSupply,
+    navWethPerTokenWad,
+    triggerWethPerTokenWad,
+    window,
+    windowActive,
+    windowStart: windowActive ? storedWindowStart : null,
+    windowEndsAt: windowActive ? storedWindowStart + window : null,
+    actualSpent,
+    rawCap,
+    percentCap,
+    liveCap,
+    available,
+    dailyBps,
+    navBps,
+    twapWindow,
+    maxTickDeviation,
+    canSubmit: reasons.length === 0,
+    deterministicReasons: Object.freeze(reasons),
+    marketChecks: BUYBACK_MARKET_CHECKS,
+    intent: BUYBACK_INTENT
+  });
+}
+
+export function decodeBuybackLog(log, expectedVault) {
+  if (!log || Array.isArray(log) || typeof log !== 'object') {
+    throw new Error('Buyback log must be an object.');
+  }
+  const vault = normalizeAddress(log.address);
+  if (expectedVault !== undefined && vault !== normalizeAddress(expectedVault)) {
+    throw new Error('Buyback log address does not match the verified vault.');
+  }
+  if (!Array.isArray(log.topics) || log.topics.length !== 2) {
+    throw new Error('Buyback log must contain exactly two topics.');
+  }
+  if (normalizeHex(log.topics[0], 32, 'Buyback event topic') !== BUYBACK_EVENT_TOPIC) {
+    throw new Error('Buyback log has the wrong event topic.');
+  }
+  const callerWord = normalizeHex(log.topics[1], 32, 'Buyback caller topic');
+  if (callerWord.slice(2, 26) !== '0'.repeat(24)) {
+    throw new Error('Buyback caller topic is not an ABI address.');
+  }
+  const data = normalizeHex(log.data, 64, 'Buyback event data').slice(2);
+  return Object.freeze({
+    vault,
+    caller: normalizeAddress(`0x${callerWord.slice(-40)}`),
+    wethSpent: BigInt(`0x${data.slice(0, 64)}`),
+    companyBurned: BigInt(`0x${data.slice(64)}`),
+    transactionHash: log.transactionHash == null
+      ? null
+      : normalizeHex(log.transactionHash, 32, 'Buyback transaction hash')
+  });
+}
+
+export function decodeBuybackHistory(logs, expectedVault) {
+  if (!Array.isArray(logs)) throw new Error('Buyback history must be an array of logs.');
+  return Object.freeze(logs.map((log) => decodeBuybackLog(log, expectedVault)));
+}
 
 function transaction(target, data, label) {
   return Object.freeze({ target: normalizeAddress(target), data, label });

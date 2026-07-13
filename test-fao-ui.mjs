@@ -3,16 +3,20 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
+  BUYBACK_ACTION_STATES,
+  buybackActionStateAfterRefresh,
   creationInputFromDraft,
   deriveNetworkGate,
   instanceTrustLabel,
   parseExtraAssetInput,
+  readBuybackModel,
+  submitBuybackOnce,
   validateCreationBundle,
   verifyTreasuryManifest,
   verifyRuntimeCode,
   visibleInstances
 } from './fao-ui.js';
-import { keccak256 } from './fao.js';
+import { BUYBACK_SELECTORS, addressWord, encodeCalldata, keccak256, uintWord } from './fao.js';
 import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
 
 const address = (value) => `0x${value.toString(16).padStart(40, '0')}`;
@@ -102,6 +106,130 @@ test('schema-v3 treasury manifest verifies executor runtime and four-way wiring'
       ...manifest, runtimeCodeHashes: { treasuryExecutor: hash('11') }
     }, request),
     /runtime bytecode/
+  );
+});
+
+test('buyback read is one-block, chain/address-bound, and rejects malformed ABI words', async () => {
+  const vault = address(2);
+  const executor = address(3);
+  const weth = address(4);
+  const values = new Map([
+    [BUYBACK_SELECTORS.weth, word(weth)],
+    [BUYBACK_SELECTORS.phase, `0x${uintWord(2)}`],
+    [BUYBACK_SELECTORS.effectiveSupply, `0x${uintWord(100n * 10n ** 18n)}`],
+    [BUYBACK_SELECTORS.window, `0x${uintWord(86_400)}`],
+    [BUYBACK_SELECTORS.dailyCap, `0x${uintWord(10n ** 16n)}`],
+    [BUYBACK_SELECTORS.dailyBps, `0x${uintWord(100)}`],
+    [BUYBACK_SELECTORS.navBps, `0x${uintWord(9_500)}`],
+    [BUYBACK_SELECTORS.twapWindow, `0x${uintWord(1_800)}`],
+    [BUYBACK_SELECTORS.maxTickDeviation, `0x${uintWord(50)}`],
+    [BUYBACK_SELECTORS.windowStart, `0x${uintWord(1_000)}`],
+    [BUYBACK_SELECTORS.wethSpent, `0x${uintWord(2n * 10n ** 15n)}`]
+  ]);
+  const balanceData = encodeCalldata(BUYBACK_SELECTORS.balanceOf, [addressWord(executor)]);
+  const request = async (method, params) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', timestamp: '0x7d0' };
+    assert.equal(method, 'eth_call');
+    const [{ to, data }, blockTag] = params;
+    assert.equal(blockTag, '0x10');
+    if (to === weth && data === balanceData) return `0x${uintWord(5n * 10n ** 17n)}`;
+    assert.ok(to === vault || to === executor);
+    if (!values.has(data)) throw new Error(`unexpected selector ${data}`);
+    return values.get(data);
+  };
+  const model = await readBuybackModel({
+    chainId: 11155111, vault, executor, request
+  });
+  assert.equal(model.executorWeth, 5n * 10n ** 17n);
+  assert.equal(model.effectiveSupply, 100n * 10n ** 18n);
+  assert.equal(model.available, 3n * 10n ** 15n);
+  assert.equal(model.isLive, true);
+
+  await assert.rejects(
+    readBuybackModel({ chainId: 1, vault, executor, request }),
+    /wrong chain/
+  );
+  await assert.rejects(
+    readBuybackModel({ chainId: 11155111, vault: '0x1234', executor, request }),
+    /address/
+  );
+  await assert.rejects(
+    readBuybackModel({
+      chainId: 11155111,
+      vault,
+      executor,
+      request: async (method, params) => {
+        if (method === 'eth_getBlockByNumber') return { number: '0x10', timestamp: '0x7d0' };
+        if (params[0].data === BUYBACK_SELECTORS.phase) return '0x01';
+        return request(method, params);
+      }
+    }),
+    /exactly 32 bytes/
+  );
+});
+
+test('buyback double-click keeps one transaction in flight and sends only once', async () => {
+  let actionState = BUYBACK_ACTION_STATES.ready;
+  let sends = 0;
+  let releasePreflight;
+  const preflight = new Promise((resolve) => { releasePreflight = resolve; });
+  const operations = {
+    getActionState: () => actionState,
+    setActionState: (next) => { actionState = next; },
+    refreshBeforeSend: () => preflight,
+    send: async () => { sends += 1; return hash('11'); },
+    wait: async () => ({ status: '0x1' }),
+    decode: () => ({ companyBurned: 1n }),
+    onConfirmed: () => {},
+    refreshAfterConfirmed: async () => {}
+  };
+
+  const first = submitBuybackOnce(operations);
+  assert.equal(actionState, BUYBACK_ACTION_STATES.inFlight);
+  await assert.rejects(submitBuybackOnce(operations), /disabled until.*refreshed/);
+  assert.equal(sends, 0);
+  releasePreflight({ canSubmit: true, deterministicReasons: [] });
+  const result = await first;
+  assert.equal(result.hash, hash('11'));
+  assert.equal(sends, 1);
+  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
+});
+
+test('confirmed buyback stays disabled through refresh failure and recovers only after a later refresh', async () => {
+  let actionState = BUYBACK_ACTION_STATES.ready;
+  let sends = 0;
+  const order = [];
+  const operations = {
+    getActionState: () => actionState,
+    setActionState: (next) => { actionState = next; order.push(next); },
+    refreshBeforeSend: async () => ({ canSubmit: true, deterministicReasons: [] }),
+    send: async () => { sends += 1; return hash('22'); },
+    wait: async () => ({ status: '0x1' }),
+    decode: () => ({ companyBurned: 2n }),
+    onConfirmed: () => {
+      assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
+      order.push('confirmed-rendered');
+    },
+    refreshAfterConfirmed: async () => {
+      assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
+      order.push('post-confirmation-refresh');
+      throw new Error('RPC unavailable after confirmation');
+    }
+  };
+
+  const result = await submitBuybackOnce(operations);
+  assert.match(result.refreshError.message, /RPC unavailable/);
+  assert.equal(result.decodeError, null);
+  assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
+  assert.ok(order.indexOf('confirmed-rendered') < order.indexOf('post-confirmation-refresh'));
+  await assert.rejects(submitBuybackOnce(operations), /disabled until.*refreshed/);
+  assert.equal(sends, 1);
+
+  actionState = buybackActionStateAfterRefresh(actionState);
+  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
+  assert.throws(
+    () => buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.inFlight),
+    /cannot be cleared/
   );
 });
 
@@ -201,7 +329,12 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'Low transfer · unchallenged YES',
     'Bounded parameter',
     'Round 1 evaluated YES',
-    'Exact treasury transaction flow'
+    'Exact treasury transaction flow',
+    'Fixed-policy buyback',
+    'controls timing only',
+    'Accepted queued WETH payments are not reserved',
+    'Transaction state',
+    'Call buyback'
   ]) assert.match(html, new RegExp(text));
   assert.match(html, /role="status" aria-live="polite"/);
   assert.match(html, /data-write[^>]*disabled/);

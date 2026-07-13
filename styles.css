@@ -80,7 +80,7 @@ legend { padding: 0 8px; color: var(--accent); }
 label { display: grid; gap: 6px; color: var(--muted); font-size: .84rem; }
 label span { color: var(--text); font-size: .76rem; }
 label.inline { display: flex; align-items: center; gap: 10px; }
-input {
+input, select {
   width: 100%;
   min-width: 0;
   border: 1px solid var(--line);
@@ -101,7 +101,7 @@ textarea {
   padding: 10px;
   font: inherit;
 }
-input:focus-visible { border-color: var(--accent); outline: 1px solid var(--accent); }
+input:focus-visible, select:focus-visible { border-color: var(--accent); outline: 1px solid var(--accent); }
 textarea:focus-visible { border-color: var(--accent); outline: 1px solid var(--accent); }
 input[type="checkbox"] { width: auto; }
 input[readonly] { color: var(--muted); }

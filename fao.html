@@ -340,10 +340,89 @@
             <p class="details">Accepted treasury actions use their sovereign on-chain grace and execution windows.</p>
           </article>
         </div>
-        <p class="empty-state">
-          No live FAO is selected. Release history, treasury actions, vesting grants, and claimable
-          balances will remain empty rather than falling back to a legacy deployment.
-        </p>
+
+        <form id="treasury-manifest-form" class="ragequit-card">
+          <h3>Verify one active FAO treasury</h3>
+          <p>
+            Paste the schema-v3 economic deployment manifest. The client checks the executor's
+            runtime hash and the vault ↔ executor ↔ gateway ↔ arbitration wiring before enabling a
+            planned transaction. This per-instance proof is separate from the shared registrar.
+          </p>
+          <label class="full">Economic deployment manifest JSON
+            <textarea name="manifest" rows="6" spellcheck="false" required placeholder="{&quot;schemaVersion&quot;:3,…}"></textarea>
+          </label>
+          <button type="submit">Verify treasury custody</button>
+          <dl>
+            <div><dt>Executor custody</dt><dd><code id="treasury-executor">Not verified</code></dd></div>
+            <div><dt>Vault</dt><dd><code id="treasury-vault">Not verified</code></dd></div>
+          </dl>
+          <p id="treasury-status" class="message" role="status" aria-live="polite"></p>
+        </form>
+
+        <div class="action-grid">
+          <form id="treasury-transfer-form" class="action-card">
+            <h3>Transfer</h3>
+            <label>Route
+              <select name="route">
+                <option value="timeout">Low transfer · unchallenged YES</option>
+                <option value="evaluated">Evaluated YES</option>
+              </select>
+            </label>
+            <label>Asset (zero address for native ETH)
+              <input name="asset" autocomplete="off" required placeholder="0x…">
+            </label>
+            <label>Recipient
+              <input name="recipient" autocomplete="off" required placeholder="0x…">
+            </label>
+            <label>Amount (raw units)
+              <input name="amount" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Unique salt (bytes32)
+              <input name="salt" autocomplete="off" required placeholder="0x…">
+            </label>
+            <button type="submit">Prepare transfer flow</button>
+          </form>
+
+          <form id="treasury-param-form" class="action-card">
+            <h3>Bounded parameter</h3>
+            <p>Evaluated YES can update only the selected asset's tap budget, never above its genesis cap.</p>
+            <label>Asset
+              <input name="asset" autocomplete="off" required placeholder="0x…">
+            </label>
+            <label>New tap budget (raw units)
+              <input name="value" inputmode="numeric" pattern="[0-9]+" required>
+            </label>
+            <label>Unique salt (bytes32)
+              <input name="salt" autocomplete="off" required placeholder="0x…">
+            </label>
+            <button type="submit">Prepare parameter flow</button>
+          </form>
+
+          <form id="treasury-critical-form" class="action-card">
+            <h3>Critical action</h3>
+            <p>Round 1 evaluated YES → stage → wait 30 days → round 2 → queue → wait 7 days → execute.</p>
+            <label>Target
+              <input name="target" autocomplete="off" required placeholder="0x…">
+            </label>
+            <label>Native value (wei)
+              <input name="value" inputmode="numeric" pattern="[0-9]+" required value="0">
+            </label>
+            <label>Calldata
+              <textarea name="data" rows="3" spellcheck="false" required placeholder="0x"></textarea>
+            </label>
+            <label>Unique salt (bytes32)
+              <input name="salt" autocomplete="off" required placeholder="0x…">
+            </label>
+            <button type="submit">Prepare two-round flow</button>
+          </form>
+        </div>
+
+        <div id="treasury-plan" class="exact-assets" hidden>
+          <h3>Exact treasury transaction flow</h3>
+          <p id="treasury-acceptance"></p>
+          <p>Assets stay in the verified executor; callers submit policy-bound actions to the gateway and vault.</p>
+          <ol id="treasury-steps" class="stage-list"></ol>
+        </div>
       </section>
     </main>
     <footer class="wide">Stable surface · code verification ≠ organization endorsement · no legacy fallback</footer>

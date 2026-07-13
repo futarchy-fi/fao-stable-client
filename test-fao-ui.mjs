@@ -8,13 +8,34 @@ import {
   instanceTrustLabel,
   parseExtraAssetInput,
   validateCreationBundle,
+  verifyTreasuryManifest,
   verifyRuntimeCode,
   visibleInstances
 } from './fao-ui.js';
 import { keccak256 } from './fao.js';
+import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
 
 const address = (value) => `0x${value.toString(16).padStart(40, '0')}`;
 const hash = (byte) => `0x${byte.repeat(32)}`;
+const word = (value) => `0x${'0'.repeat(24)}${value.slice(2)}`;
+
+function treasuryManifest() {
+  const contractNames = [
+    'space', 'arbitration', 'vault', 'treasuryExecutor', 'companyToken', 'proposalGateway',
+    'releaseStrategy', 'votingStrategy', 'evaluator', 'orchestrator', 'resolver',
+    'futarchyFactory', 'spotPool', 'relay', 'spotAdapter', 'conditionalAdapter', 'guard',
+    'router', 'manager'
+  ];
+  const contracts = Object.fromEntries(contractNames.map((name, index) => [name, address(index + 1)]));
+  contracts.vestingWallets = [];
+  return {
+    schemaVersion: 3, creationRoute: 'registrar', status: 'live', network: 'sepolia',
+    chainId: 11155111, transactions: {}, receipt: {}, prerequisites: {}, coreConfig: {},
+    grants: [], flmConfig: {}, feeTier: 500, poolInitCodeHash: hash('aa'),
+    observationCardinality: 120, contracts, codeBlobs: {},
+    runtimeCodeHashes: { treasuryExecutor: keccak256('0x6001') }, finalization: {}
+  };
+}
 
 test('pre-deployment is a deliberate read-only state', async () => {
   const gate = deriveNetworkGate({ deploymentStatus: 'pre-deployment' });
@@ -60,6 +81,30 @@ test('runtime verification requires an exact hash map and matches every contract
   );
 });
 
+test('schema-v3 treasury manifest verifies executor runtime and four-way wiring', async () => {
+  const manifest = treasuryManifest();
+  const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
+  const request = async (method, params) => {
+    if (method === 'eth_getCode') return '0x6001';
+    assert.equal(method, 'eth_call');
+    const [{ to, data }] = params;
+    if (to === records.vault && data === '0x0d618c81') return word(records.executor);
+    if (to === records.executor && data === '0x411557d1') return word(records.vault);
+    if (to === records.gateway && data === '0xfbfa77cf') return word(records.vault);
+    if (to === records.gateway && data === '0x9b732350') return word(records.arbitration);
+    throw new Error('unexpected call');
+  };
+  assert.deepEqual(await verifyTreasuryManifest(manifest, request), {
+    status: 'verified', ...records
+  });
+  await assert.rejects(
+    verifyTreasuryManifest({
+      ...manifest, runtimeCodeHashes: { treasuryExecutor: hash('11') }
+    }, request),
+    /runtime bytecode/
+  );
+});
+
 test('draft becomes one frozen canonical registrar input', () => {
   const record = (id) => ({ address: address(id), runtimeCodeKeccak256: hash(id.toString(16).padStart(2, '0')) });
   const manifest = {
@@ -83,6 +128,11 @@ test('draft becomes one frozen canonical registrar input', () => {
   assert.equal(input.coreConfig.bootstrapDeadline, '2000090000');
   assert.equal(input.coreConfig.stackDeployer.target, address(3));
   assert.equal(input.coreConfig.proposalImplementation.target, address(2));
+  assert.deepEqual(input.coreConfig.assetPolicies, [{
+    asset: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
+    c1: '10000000000000000', c2: '100000000000000000',
+    tapBudget: '10000000000000000', tapBudgetMax: '100000000000000000'
+  }]);
   assert.deepEqual(input.grants, []);
 });
 
@@ -145,7 +195,13 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'Deposit to spot FLM',
     'Permissionless sync',
     'Exact additional assets',
-    'Release and treasury dashboard'
+    'Release and treasury dashboard',
+    'Verify one active FAO treasury',
+    'Executor custody',
+    'Low transfer · unchallenged YES',
+    'Bounded parameter',
+    'Round 1 evaluated YES',
+    'Exact treasury transaction flow'
   ]) assert.match(html, new RegExp(text));
   assert.match(html, /role="status" aria-live="polite"/);
   assert.match(html, /data-write[^>]*disabled/);

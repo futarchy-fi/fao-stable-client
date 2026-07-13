@@ -1922,12 +1922,17 @@ function decodeTransferQueued(log, vault) {
   const event = normalizeEventLog(
     log, vault, AGENT_WORK_EVENTS.transferQueued, 3, 2, 'TreasuryTransferQueued log'
   );
+  const executeAfter = BigInt(event.words[0]);
+  const expiresAt = BigInt(event.words[1]);
+  if (executeAfter === 0n || expiresAt <= executeAfter) {
+    throw new Error('TreasuryTransferQueued window is invalid.');
+  }
   return Object.freeze({
     ...event,
     actionHash: event.topics[1],
     proposalId: BigInt(event.topics[2]),
-    executeAfter: BigInt(event.words[0]),
-    expiresAt: BigInt(event.words[1])
+    executeAfter,
+    expiresAt
   });
 }
 
@@ -1948,21 +1953,34 @@ function decodeProposalView(value) {
   const words = abiWords(value, 11, 'Arbitration proposal view');
   const state = BigInt(words[5]);
   if (state > 5n) throw new Error('Arbitration proposal state is invalid.');
+  const settled = abiBool(words[7], 'Proposal settled');
+  const accepted = abiBool(words[8], 'Proposal accepted');
+  const exists = abiBool(words[10], 'Proposal exists');
+  if ((state === 5n) !== settled || (!settled && accepted)
+    || (!exists && (state !== 0n || settled || accepted))) {
+    throw new Error('Arbitration proposal state flags are incoherent.');
+  }
   return Object.freeze({
     state,
     lastStateChangeAt: BigInt(words[6]),
-    settled: abiBool(words[7], 'Proposal settled'),
-    accepted: abiBool(words[8], 'Proposal accepted'),
+    settled,
+    accepted,
     queuePosition: BigInt(words[9]),
-    exists: abiBool(words[10], 'Proposal exists')
+    exists
   });
 }
 
 function decodeQueueView(value) {
   const words = abiWords(value, 4, 'Queued transfer view');
+  const executeAfter = BigInt(words[0]);
+  const expiresAt = BigInt(words[1]);
+  if ((executeAfter === 0n) !== (expiresAt === 0n)
+    || (executeAfter !== 0n && expiresAt <= executeAfter)) {
+    throw new Error('Queued transfer window is invalid.');
+  }
   return Object.freeze({
-    executeAfter: BigInt(words[0]),
-    expiresAt: BigInt(words[1]),
+    executeAfter,
+    expiresAt,
     executed: abiBool(words[2], 'Queued transfer executed'),
     expired: abiBool(words[3], 'Queued transfer expired')
   });
@@ -2172,6 +2190,16 @@ export function prepareAgentPaymentTransactions(value) {
   const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
   const state = input.state;
   if (!state || typeof state !== 'object') throw new Error('Agent payment state is required.');
+  const stateBinding = validateAgentPaymentBinding(state.payment, {
+    chainId: input.chainId, vault, action: state.action
+  });
+  if (stateBinding.documentDigest !== binding.documentDigest
+    || stateBinding.actionHash !== binding.actionHash
+    || stateBinding.proposalId !== binding.proposalId
+    || normalizeHex(state.actionHash, 32, 'Agent payment state action hash') !== binding.actionHash
+    || unsigned(state.proposalId, 256, 'Agent payment state proposal ID') !== BigInt(binding.proposalId)) {
+    throw new Error('Agent payment state does not bind the planned payment identity.');
+  }
   const notPaid = state.paymentState?.state === 'not-paid'
     && state.paymentState.paid === false;
   const pendingAcceptance = state.acceptance?.state === 'pending'
@@ -2187,7 +2215,7 @@ export function prepareAgentPaymentTransactions(value) {
   const queueOpen = typeof state.queue?.executeAfter === 'bigint'
     && typeof state.queue.expiresAt === 'bigint'
     && state.queue.executeAfter > 0n
-    && state.queue.expiresAt >= state.queue.executeAfter
+    && state.queue.expiresAt > state.queue.executeAfter
     && state.queue.executed === false
     && state.queue.expired === false;
   const proposalAvailable = state.proposed === false

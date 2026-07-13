@@ -34,6 +34,25 @@ export function latestRequestGate() {
     }
   });
 }
+
+export function singleFlightGate() {
+  let active = null;
+  return Object.freeze({
+    begin() {
+      if (active) return null;
+      active = Object.freeze({});
+      return active;
+    },
+    current(operation) {
+      return operation === active;
+    },
+    finish(operation) {
+      if (operation !== active) return false;
+      active = null;
+      return true;
+    }
+  });
+}
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 const MAX_AGENT_PAYMENT_VIEWS = 100;
@@ -702,16 +721,24 @@ let state = {
   treasuryManifest: null,
   treasuryRecords: null,
   treasuryFlow: null,
+  treasuryFlowForm: null,
+  treasuryFlowRequest: null,
   buybackModel: null,
   buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded,
+  buybackOperation: null,
+  buybackTransactionHash: null,
   agentWork: null
 };
 const agentWorkRequests = latestRequestGate();
 const buybackRequests = latestRequestGate();
+const buybackSends = singleFlightGate();
 const connectionRequests = latestRequestGate();
 const creationPlanRequests = latestRequestGate();
+const creationStageSends = singleFlightGate();
 const receiptStateRequests = latestRequestGate();
+const treasuryFlowRequests = latestRequestGate();
 const treasuryManifestRequests = latestRequestGate();
+const treasuryStepSends = singleFlightGate();
 
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
@@ -749,6 +776,16 @@ function treasuryManifestInputSnapshot() {
     state.walletChainId?.toString() || null,
     state.rpcChainId?.toString() || null,
     elements.treasuryManifestForm.elements.manifest.value
+  ]);
+}
+
+function treasuryFlowInputSnapshot(form) {
+  return JSON.stringify([
+    form.id,
+    state.treasuryRecords?.vault || null,
+    state.treasuryRecords?.gateway || null,
+    state.treasuryRecords?.executor || null,
+    [...new FormData(form).entries()]
   ]);
 }
 
@@ -808,9 +845,23 @@ function renderTreasuryGate() {
   for (const form of elements.treasuryForms) form.querySelector('button[type="submit"]').disabled = !enabled;
   for (const button of elements.treasurySteps.querySelectorAll('button')) button.disabled = !enabled;
   elements.refreshBuyback.disabled = !enabled
+    || Boolean(state.buybackOperation)
     || state.buybackActionState === BUYBACK_ACTION_STATES.inFlight;
   elements.executeBuyback.disabled = !enabled || !state.buybackModel?.canSubmit
+    || Boolean(state.buybackOperation)
     || state.buybackActionState !== BUYBACK_ACTION_STATES.ready;
+}
+
+function invalidateTreasuryFlow(message = '') {
+  treasuryFlowRequests.invalidate();
+  state.treasuryFlow = null;
+  state.treasuryFlowForm = null;
+  state.treasuryFlowRequest = null;
+  elements.treasuryPlan.hidden = true;
+  elements.treasuryAcceptance.textContent = '';
+  elements.treasurySteps.replaceChildren();
+  renderTreasuryGate();
+  if (message) setMessage(elements.treasuryStatus, message);
 }
 
 function setBuybackActionState(next) {
@@ -1057,6 +1108,7 @@ async function syncConnection(requestAccounts = false) {
   buybackRequests.invalidate();
   creationPlanRequests.invalidate();
   receiptStateRequests.invalidate();
+  invalidateTreasuryFlow();
   treasuryManifestRequests.invalidate();
   state.walletChainId = null;
   state.rpcChainId = null;
@@ -1235,56 +1287,69 @@ async function waitForReceipt(hash) {
 }
 
 async function sendCreationStage(event) {
+  const operation = creationStageSends.begin();
+  if (!operation) return;
   const stage = event.currentTarget.dataset.stage;
   const plan = state.creationPlan;
   const predictedReceipt = state.predictedReceipt;
   const preparedInput = state.preparedInput;
   const account = state.account;
-  if (!plan || !predictedReceipt || !preparedInput) {
-    throw new Error('Prepare and review an exact creation plan first.');
-  }
-  if (!await refreshReceiptState()
-    || state.creationPlan !== plan
-    || state.predictedReceipt !== predictedReceipt
-    || state.preparedInput !== preparedInput
-    || state.account !== account
-    || !currentGate().canTransact) {
-    throw new Error('Creation plan or wallet state changed during stage verification.');
-  }
-  const steps = {
-    receipt: {
-      ready: !state.receiptExists,
-      target: plan.registrar.target,
-      data: plan.registrar.stage
-    },
-    core: {
-      ready: state.receiptExists && !state.coreSealed,
-      target: predictedReceipt,
-      data: plan.receipt.deployCore
-    },
-    flm: {
-      ready: state.coreSealed && !state.flmSealed,
-      target: predictedReceipt,
-      data: plan.receipt.deployFlm
+  const ownsStatus = () => creationStageSends.current(operation)
+    && state.creationPlan === plan
+    && state.predictedReceipt === predictedReceipt
+    && state.preparedInput === preparedInput
+    && state.account === account;
+  try {
+    if (!plan || !predictedReceipt || !preparedInput) {
+      throw new Error('Prepare and review an exact creation plan first.');
     }
-  };
-  const step = steps[stage];
-  if (!step?.ready) throw new Error(`${stage} is not the next resumable stage.`);
-  if (stage === 'core') {
-    const block = await rpc('eth_getBlockByNumber', ['latest', false]);
-    if (!block || BigInt(block.timestamp) >= BigInt(preparedInput.coreConfig.saleEnd)) {
-      throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
+    if (!await refreshReceiptState() || !ownsStatus() || !currentGate().canTransact) {
+      throw new Error('Creation plan or wallet state changed during stage verification.');
     }
-    if (state.creationPlan !== plan || state.account !== account || !currentGate().canTransact) {
-      throw new Error('Creation plan or wallet state changed during sale-end verification.');
+    const steps = {
+      receipt: {
+        ready: !state.receiptExists,
+        target: plan.registrar.target,
+        data: plan.registrar.stage
+      },
+      core: {
+        ready: state.receiptExists && !state.coreSealed,
+        target: predictedReceipt,
+        data: plan.receipt.deployCore
+      },
+      flm: {
+        ready: state.coreSealed && !state.flmSealed,
+        target: predictedReceipt,
+        data: plan.receipt.deployFlm
+      }
+    };
+    const step = steps[stage];
+    if (!step?.ready) throw new Error(`${stage} is not the next resumable stage.`);
+    if (stage === 'core') {
+      const block = await rpc('eth_getBlockByNumber', ['latest', false]);
+      if (!block || BigInt(block.timestamp) >= BigInt(preparedInput.coreConfig.saleEnd)) {
+        throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
+      }
+      if (!ownsStatus() || !currentGate().canTransact) {
+        throw new Error('Creation plan or wallet state changed during sale-end verification.');
+      }
     }
+    const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
+    if (ownsStatus()) setMessage(elements.stageStatus, `${stage} submitted: ${hash}. Waiting for confirmation…`);
+    const receipt = await waitForReceipt(hash);
+    if (BigInt(receipt.status) !== 1n) throw new Error(`${stage} transaction reverted: ${hash}`);
+    if (ownsStatus()) {
+      await refreshReceiptState();
+      if (ownsStatus()) {
+        setMessage(elements.stageStatus, `${stage} confirmed: ${hash}. Any account may continue the remaining stages.`);
+      }
+    }
+  } catch (error) {
+    if (ownsStatus()) setMessage(elements.stageStatus, errorMessage(error), true);
+  } finally {
+    creationStageSends.finish(operation);
+    renderStages();
   }
-  const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
-  setMessage(elements.stageStatus, `${stage} submitted: ${hash}. Waiting for confirmation…`);
-  const receipt = await waitForReceipt(hash);
-  if (BigInt(receipt.status) !== 1n) throw new Error(`${stage} transaction reverted: ${hash}`);
-  await refreshReceiptState();
-  setMessage(elements.stageStatus, `${stage} confirmed: ${hash}. Any account may continue the remaining stages.`);
 }
 
 function restoreDraft() {
@@ -1349,12 +1414,12 @@ async function loadTreasuryManifest(form, request) {
   }
   state.treasuryManifest = null;
   state.treasuryRecords = null;
-  state.treasuryFlow = null;
+  invalidateTreasuryFlow();
   state.buybackModel = null;
   state.agentWork = null;
   agentWorkRequests.invalidate();
   buybackRequests.invalidate();
-  setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+  if (!state.buybackOperation) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   renderBuybackModel();
   renderAgentWork();
   const manifest = JSON.parse(form.elements.manifest.value);
@@ -1369,11 +1434,12 @@ async function loadTreasuryManifest(form, request) {
   state.treasuryManifest = manifest;
   state.treasuryRecords = records;
   state.buybackModel = buybackModel;
-  elements.treasuryPlan.hidden = true;
   elements.treasuryExecutor.textContent = records.executor;
   elements.treasuryVault.textContent = records.vault;
   renderBuybackModel();
-  setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+  if (!state.buybackOperation) {
+    setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+  }
   setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
   renderTreasuryGate();
 }
@@ -1517,91 +1583,117 @@ async function refreshBuybackForUser() {
 }
 
 async function sendBuyback() {
+  const operation = buybackSends.begin();
+  if (!operation) return null;
+  state.buybackOperation = operation;
+  state.buybackTransactionHash = null;
+  renderTreasuryGate();
   const manifest = state.treasuryManifest;
   const records = state.treasuryRecords;
   const account = state.account;
-  if (!manifest || !records || !account) throw new Error('Verify treasury custody and connect a wallet first.');
-  const plan = fao.prepareBuyback({
-    chainId: SEPOLIA_CHAIN_ID,
-    vault: records.vault
-  });
-  const result = await submitBuybackOnce({
-    getActionState: () => state.buybackActionState,
-    setActionState: setBuybackActionState,
-    refreshBeforeSend: async () => {
-      const model = await refreshBuybackState(true);
-      if (!model || state.treasuryManifest !== manifest || state.treasuryRecords !== records
-        || state.account !== account || !treasuryNetworkReady()) {
-        throw new Error('Treasury configuration or wallet state changed during buyback verification.');
-      }
-      return model;
-    },
-    send: async () => {
-      const hash = await rpc('eth_sendTransaction', [{
-        from: account,
-        to: plan.target,
-        data: plan.data
-      }]);
-      setMessage(elements.buybackStatus, `${plan.label} submitted: ${hash}. Waiting for confirmation…`);
-      return hash;
-    },
-    wait: waitForReceipt,
-    decode: (receipt) => {
-      const log = receipt.logs?.find((entry) => (
-        typeof entry?.address === 'string'
-        && entry.address.toLowerCase() === plan.target
-        && entry.topics?.[0]?.toLowerCase() === fao.BUYBACK_EVENT_TOPIC
-      ));
-      if (!log) throw new Error('Confirmed transaction did not emit the expected Buyback event.');
-      return fao.decodeBuybackLog(log, plan.target);
-    },
-    onConfirmed: ({ hash, event }) => {
-      elements.buybackLatest.textContent =
-        `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
-      setMessage(elements.buybackStatus, `${plan.label} confirmed: ${hash}. Refreshing state…`);
-    },
-    refreshAfterConfirmed: async () => {
-      const model = await refreshBuybackState(false);
-      if (!model) throw new Error('Treasury configuration changed during the confirmed-state refresh.');
-      return model;
+  const ownsStatus = () => buybackSends.current(operation)
+    && state.buybackOperation === operation
+    && state.treasuryManifest === manifest
+    && state.treasuryRecords === records
+    && state.account === account;
+  try {
+    if (!manifest || !records || !account) {
+      throw new Error('Verify treasury custody and connect a wallet first.');
     }
-  });
-  if (result.decodeError) {
-    setMessage(
-      elements.buybackStatus,
-      `Transaction ${result.hash} confirmed, but its Buyback event could not be decoded. Do not submit again; refresh state before any further call. ${errorMessage(result.decodeError)}`,
-      true
-    );
+    const plan = fao.prepareBuyback({ chainId: SEPOLIA_CHAIN_ID, vault: records.vault });
+    const result = await submitBuybackOnce({
+      getActionState: () => state.buybackActionState,
+      setActionState: setBuybackActionState,
+      refreshBeforeSend: async () => {
+        const model = await refreshBuybackState(true);
+        if (!model || state.treasuryManifest !== manifest || state.treasuryRecords !== records
+          || state.account !== account || !treasuryNetworkReady()) {
+          throw new Error('Treasury configuration or wallet state changed during buyback verification.');
+        }
+        return model;
+      },
+      send: async () => {
+        const hash = await rpc('eth_sendTransaction', [{ from: account, to: plan.target, data: plan.data }]);
+        if (buybackSends.current(operation) && state.buybackOperation === operation) {
+          state.buybackTransactionHash = hash;
+        }
+        if (ownsStatus()) {
+          setMessage(elements.buybackStatus, `${plan.label} submitted: ${hash}. Waiting for confirmation…`);
+        }
+        return hash;
+      },
+      wait: waitForReceipt,
+      decode: (receipt) => {
+        const log = receipt.logs?.find((entry) => (
+          typeof entry?.address === 'string'
+          && entry.address.toLowerCase() === plan.target
+          && entry.topics?.[0]?.toLowerCase() === fao.BUYBACK_EVENT_TOPIC
+        ));
+        if (!log) throw new Error('Confirmed transaction did not emit the expected Buyback event.');
+        return fao.decodeBuybackLog(log, plan.target);
+      },
+      onConfirmed: ({ hash, event }) => {
+        if (!ownsStatus()) return;
+        elements.buybackLatest.textContent =
+          `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
+        setMessage(elements.buybackStatus, `${plan.label} confirmed: ${hash}. Refreshing state…`);
+      },
+      refreshAfterConfirmed: async () => {
+        const model = await refreshBuybackState(false);
+        if (!model) throw new Error('Treasury configuration changed during the confirmed-state refresh.');
+        return model;
+      }
+    });
+    if (!ownsStatus()) return result;
+    if (result.decodeError) {
+      setMessage(
+        elements.buybackStatus,
+        `Transaction ${result.hash} confirmed, but its Buyback event could not be decoded. Do not submit again; refresh state before any further call. ${errorMessage(result.decodeError)}`,
+        true
+      );
+    } else if (result.refreshError) {
+      setMessage(
+        elements.buybackStatus,
+        `${plan.label} confirmed: ${result.hash}. The transaction succeeded, but the later state refresh failed. Do not submit again; use Refresh buyback state. ${errorMessage(result.refreshError)}`,
+        true
+      );
+    } else {
+      setMessage(
+        elements.buybackStatus,
+        `${plan.label} confirmed: ${result.hash}. ${format18(result.event.companyBurned)} FAO was literally burned; state refreshed.`
+      );
+    }
     return result;
+  } catch (error) {
+    if (state.buybackTransactionHash && state.buybackOperation === operation
+      && state.buybackActionState === BUYBACK_ACTION_STATES.ready) {
+      setBuybackActionState(BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
+    }
+    if (ownsStatus()) setMessage(elements.buybackStatus, errorMessage(error), true);
+    return null;
+  } finally {
+    if (state.buybackOperation === operation) state.buybackOperation = null;
+    buybackSends.finish(operation);
+    renderTreasuryGate();
   }
-  if (result.refreshError) {
-    setMessage(
-      elements.buybackStatus,
-      `${plan.label} confirmed: ${result.hash}. The transaction succeeded, but the later state refresh failed. Do not submit again; use Refresh buyback state. ${errorMessage(result.refreshError)}`,
-      true
-    );
-    return result;
-  }
-  setMessage(
-    elements.buybackStatus,
-    `${plan.label} confirmed: ${result.hash}. ${format18(result.event.companyBurned)} FAO was literally burned; state refreshed.`
-  );
-  return result;
 }
 
 function prepareTreasury(event) {
   event.preventDefault();
   if (!event.currentTarget.reportValidity()) return;
   if (!state.treasuryRecords) throw new Error('Verify an active economic deployment manifest first.');
-  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const form = event.currentTarget;
+  invalidateTreasuryFlow();
+  const request = treasuryFlowRequests.begin(treasuryFlowInputSnapshot(form));
+  const values = Object.fromEntries(new FormData(form).entries());
   let type;
   let route;
   let action;
-  if (event.currentTarget === elements.treasuryTransferForm) {
+  if (form === elements.treasuryTransferForm) {
     ({ route } = values);
     type = 'transfer';
     action = { asset: values.asset, recipient: values.recipient, amount: values.amount, salt: values.salt };
-  } else if (event.currentTarget === elements.treasuryParamForm) {
+  } else if (form === elements.treasuryParamForm) {
     type = 'param';
     route = 'evaluated';
     action = {
@@ -1614,7 +1706,7 @@ function prepareTreasury(event) {
     action = { target: values.target, value: values.value, data: values.data, salt: values.salt };
   }
   const records = state.treasuryRecords;
-  state.treasuryFlow = fao.prepareTreasuryFlow({
+  const flow = fao.prepareTreasuryFlow({
     chainId: SEPOLIA_CHAIN_ID,
     vault: records.vault,
     gateway: records.gateway,
@@ -1623,9 +1715,11 @@ function prepareTreasury(event) {
     route,
     action
   });
-  elements.treasuryAcceptance.textContent = state.treasuryFlow.acceptance;
-  elements.treasurySteps.replaceChildren();
-  state.treasuryFlow.steps.forEach((step, index) => {
+  state.treasuryFlow = flow;
+  state.treasuryFlowForm = form;
+  state.treasuryFlowRequest = request;
+  elements.treasuryAcceptance.textContent = flow.acceptance;
+  flow.steps.forEach((step, index) => {
     const item = document.createElement('li');
     item.className = 'stage-card';
     const detail = document.createElement('div');
@@ -1643,46 +1737,64 @@ function prepareTreasury(event) {
     detail.append(title, target, calldata);
     button.type = 'button';
     button.textContent = 'Send this step';
-    button.addEventListener('click', () => sendTreasuryStep(index).catch((error) => (
-      setMessage(elements.treasuryStatus, errorMessage(error), true)
-    )));
+    button.addEventListener('click', () => sendTreasuryStep(index, flow, form, request));
     item.append(detail, button);
     elements.treasurySteps.append(item);
   });
   elements.treasuryPlan.hidden = false;
   setMessage(
     elements.treasuryStatus,
-    `Prepared ${state.treasuryFlow.steps.length} exact ${type} steps. Send only the next on-chain-ready step.`
+    `Prepared ${flow.steps.length} exact ${type} steps. Send only the next on-chain-ready step.`
   );
   renderTreasuryGate();
 }
 
-async function sendTreasuryStep(index) {
+async function sendTreasuryStep(index, flow, form, request) {
+  if (state.treasuryFlow !== flow || state.treasuryFlowForm !== form
+    || state.treasuryFlowRequest !== request
+    || !treasuryFlowRequests.current(request, treasuryFlowInputSnapshot(form))) return;
+  const operation = treasuryStepSends.begin();
+  if (!operation) return;
   const manifest = state.treasuryManifest;
   const records = state.treasuryRecords;
-  const flow = state.treasuryFlow;
   const account = state.account;
-  if (!treasuryNetworkReady() || !flow || !manifest || !records || !account) {
-    throw new Error('Reconnect and verify the treasury manifest before sending.');
+  const ownsStatus = () => treasuryStepSends.current(operation)
+    && state.treasuryManifest === manifest
+    && state.treasuryRecords === records
+    && state.treasuryFlow === flow
+    && state.treasuryFlowForm === form
+    && state.treasuryFlowRequest === request
+    && state.account === account
+    && treasuryFlowRequests.current(request, treasuryFlowInputSnapshot(form));
+  try {
+    if (!treasuryNetworkReady() || !manifest || !records || !account) {
+      throw new Error('Reconnect and verify the treasury manifest before sending.');
+    }
+    const fresh = await verifyTreasuryManifest(manifest, rpc);
+    if (!ownsStatus()) return;
+    if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
+      throw new Error('Treasury manifest wiring changed.');
+    }
+    const step = flow.steps[index];
+    if (!step) throw new Error('Unknown treasury step.');
+    const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
+    if (ownsStatus()) {
+      setMessage(elements.treasuryStatus, `${step.label} submitted: ${hash}. Waiting for confirmation…`);
+    }
+    const receipt = await waitForReceipt(hash);
+    if (BigInt(receipt.status) !== 1n) throw new Error(`${step.label} reverted: ${hash}`);
+    if (ownsStatus()) {
+      setMessage(
+        elements.treasuryStatus,
+        `${step.label} confirmed: ${hash}. Re-check acceptance and timing before sending the next step.`
+      );
+    }
+  } catch (error) {
+    if (ownsStatus()) setMessage(elements.treasuryStatus, errorMessage(error), true);
+  } finally {
+    treasuryStepSends.finish(operation);
+    renderTreasuryGate();
   }
-  const fresh = await verifyTreasuryManifest(manifest, rpc);
-  if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
-    throw new Error('Treasury manifest wiring changed.');
-  }
-  if (state.treasuryManifest !== manifest || state.treasuryRecords !== records
-    || state.treasuryFlow !== flow || state.account !== account || !treasuryNetworkReady()) {
-    throw new Error('Treasury plan or wallet state changed during send verification.');
-  }
-  const step = flow.steps[index];
-  if (!step) throw new Error('Unknown treasury step.');
-  const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
-  setMessage(elements.treasuryStatus, `${step.label} submitted: ${hash}. Waiting for confirmation…`);
-  const receipt = await waitForReceipt(hash);
-  if (BigInt(receipt.status) !== 1n) throw new Error(`${step.label} reverted: ${hash}`);
-  setMessage(
-    elements.treasuryStatus,
-    `${step.label} confirmed: ${hash}. Re-check acceptance and timing before sending the next step.`
-  );
 }
 
 function unavailableAction(event) {
@@ -1769,11 +1881,10 @@ async function initialize() {
     buybackRequests.invalidate();
     state.treasuryManifest = null;
     state.treasuryRecords = null;
-    state.treasuryFlow = null;
+    invalidateTreasuryFlow();
     state.buybackModel = null;
     state.agentWork = null;
-    setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
-    elements.treasuryPlan.hidden = true;
+    if (!state.buybackOperation) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
     elements.treasuryExecutor.textContent = 'Not verified';
     elements.treasuryVault.textContent = 'Not verified';
     renderBuybackModel();
@@ -1803,15 +1914,19 @@ async function initialize() {
       setMessage(elements.treasuryStatus, errorMessage(error), true);
     }
   });
+  for (const form of elements.treasuryForms) form.addEventListener('input', () => {
+    invalidateTreasuryFlow('Treasury action changed. Prepare and review a new exact flow before sending.');
+  });
   elements.refreshBuyback.addEventListener('click', () => refreshBuybackForUser()
     .catch((error) => setMessage(elements.buybackStatus, errorMessage(error), true)));
-  elements.executeBuyback.addEventListener('click', () => sendBuyback()
-    .catch((error) => setMessage(elements.buybackStatus, errorMessage(error), true)));
+  elements.executeBuyback.addEventListener('click', sendBuyback);
   elements.showUnverified.addEventListener('change', renderInstances);
   elements.connect.addEventListener('click', () => syncConnection(true).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   elements.refresh.addEventListener('click', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   for (const form of document.querySelectorAll('#buy-form, #deposit-form, #redeem-form')) form.addEventListener('submit', unavailableAction);
-  for (const button of document.querySelectorAll('[data-stage]')) button.addEventListener('click', (event) => sendCreationStage(event).catch((error) => setMessage(elements.stageStatus, errorMessage(error), true)));
+  for (const button of document.querySelectorAll('[data-stage]')) {
+    button.addEventListener('click', sendCreationStage);
+  }
   for (const button of document.querySelectorAll('[data-action], #execute-ragequit')) button.addEventListener('click', unavailableAction);
 
   if (window.ethereum?.on) {

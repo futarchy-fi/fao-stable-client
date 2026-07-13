@@ -11,6 +11,7 @@ import {
   latestRequestGate,
   parseExtraAssetInput,
   readBuybackModel,
+  singleFlightGate,
   submitBuybackOnce,
   validateCreationBundle,
   verifyAgentWorkProvenance,
@@ -19,7 +20,8 @@ import {
   visibleInstances
 } from './fao-ui.js';
 import {
-  BUYBACK_SELECTORS, addressWord, economicCommitmentHashes, encodeCalldata, keccak256, uintWord
+  BUYBACK_SELECTORS, addressWord, economicCommitmentHashes, encodeCalldata, keccak256,
+  prepareTreasuryFlow, uintWord
 } from './fao.js';
 import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
 
@@ -114,7 +116,7 @@ test('every async positive-state writer is generation-gated against stale succes
   const source = await readFile(new URL('./fao-ui.js', import.meta.url), 'utf8');
   for (const name of [
     'agentWorkRequests', 'buybackRequests', 'connectionRequests', 'creationPlanRequests',
-    'receiptStateRequests', 'treasuryManifestRequests'
+    'receiptStateRequests', 'treasuryFlowRequests', 'treasuryManifestRequests'
   ]) {
     assert.match(source, new RegExp(`const ${name} = latestRequestGate\\(\\);`));
     assert.match(source, new RegExp(`${name}\\.current\\(`));
@@ -147,6 +149,149 @@ test('every async positive-state writer is generation-gated against stale succes
     fail(new Error('obsolete failure'));
     await errorRun;
     assert.deepEqual({ positive, errors }, { positive: [], errors: [] }, label);
+  }
+});
+
+test('typed treasury edits revoke the exact prepared flow before any send', async () => {
+  for (const [field, next] of [
+    ['recipient', address(8)], ['amount', '2'], ['route', 'evaluated'], ['type', 'param']
+  ]) {
+    const input = {
+      type: 'transfer', route: 'timeout', asset: address(4), recipient: address(5),
+      amount: '1', salt: hash('11')
+    };
+    const snapshot = () => JSON.stringify(input);
+    const generations = latestRequestGate();
+    const sends = singleFlightGate();
+    const request = generations.begin(snapshot());
+    const flow = prepareTreasuryFlow({
+      chainId: 11155111, vault: address(1), gateway: address(2), executor: address(3),
+      type: 'transfer', route: input.route,
+      action: {
+        asset: input.asset, recipient: input.recipient, amount: input.amount, salt: input.salt
+      }
+    });
+    let finishVerification;
+    const verified = new Promise((resolve) => { finishVerification = resolve; });
+    let broadcasts = 0;
+    const send = async () => {
+      if (!generations.current(request, snapshot())) return;
+      const operation = sends.begin();
+      if (!operation) return;
+      try {
+        await verified;
+        if (!generations.current(request, snapshot())) return;
+        assert.ok(flow.steps[0].data.startsWith('0x'));
+        broadcasts += 1;
+      } finally {
+        sends.finish(operation);
+      }
+    };
+    const pending = send();
+    input[field] = next;
+    generations.invalidate();
+    finishVerification();
+    await pending;
+    assert.equal(broadcasts, 0, field);
+  }
+});
+
+test('operation locks survive configuration changes and own completion status', async () => {
+  const lock = singleFlightGate();
+  let active = null;
+  let actionState = BUYBACK_ACTION_STATES.ready;
+  let sends = 0;
+  let transactionHash = null;
+  let completedBy = null;
+  let manifest = 'manifest-a';
+  let status = 'submitted-a';
+  let finishReceipt;
+  const receipt = new Promise((resolve) => { finishReceipt = resolve; });
+  const call = async () => {
+    const operation = lock.begin();
+    if (!operation) return null;
+    active = operation;
+    const capturedManifest = manifest;
+    try {
+      return await submitBuybackOnce({
+        getActionState: () => actionState,
+        setActionState: (next) => { actionState = next; },
+        refreshBeforeSend: async () => ({ canSubmit: true, deterministicReasons: [] }),
+        send: async () => {
+          sends += 1;
+          transactionHash = hash('77');
+          return transactionHash;
+        },
+        wait: async () => receipt,
+        decode: () => ({ companyBurned: 1n }),
+        onConfirmed: () => {
+          if (!lock.current(operation)) return;
+          completedBy = operation;
+          if (manifest === capturedManifest) status = 'old confirmed';
+        },
+        refreshAfterConfirmed: async () => ({ canSubmit: false })
+      });
+    } finally {
+      if (active === operation) active = null;
+      lock.finish(operation);
+    }
+  };
+
+  const first = call();
+  await Promise.resolve();
+  assert.equal(sends, 1);
+  // Manifest edit/reload must not reset action state while the independent operation exists.
+  manifest = 'manifest-b';
+  status = 'new manifest';
+  if (!active) actionState = BUYBACK_ACTION_STATES.refreshNeeded;
+  if (!active) actionState = buybackActionStateAfterRefresh(actionState);
+  const second = await call();
+  assert.equal(second, null);
+  assert.equal(sends, 1);
+  assert.equal(transactionHash, hash('77'));
+  assert.equal(actionState, BUYBACK_ACTION_STATES.inFlight);
+  finishReceipt({ status: '0x1' });
+  await first;
+  assert.ok(completedBy);
+  assert.equal(status, 'new manifest');
+  assert.equal(active, null);
+  assert.equal(transactionHash, hash('77'));
+  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
+});
+
+test('single-flight stage sends and generation ownership suppress duplicate and stale status', async () => {
+  for (const label of ['creation', 'treasury']) {
+    const lock = singleFlightGate();
+    const generations = latestRequestGate();
+    let snapshot = `${label}-plan-a`;
+    const request = generations.begin(snapshot);
+    let finish;
+    const receipt = new Promise((resolve) => { finish = resolve; });
+    let sends = 0;
+    let status = 'submitted-a';
+    const run = async (fail = false) => {
+      const operation = lock.begin();
+      if (!operation) return;
+      try {
+        sends += 1;
+        await receipt;
+        if (fail) throw new Error('old failure');
+        if (lock.current(operation) && generations.current(request, snapshot)) status = 'old success';
+      } catch (error) {
+        if (lock.current(operation) && generations.current(request, snapshot)) status = error.message;
+      } finally {
+        lock.finish(operation);
+      }
+    };
+    const first = run(label === 'treasury');
+    await run();
+    assert.equal(sends, 1, label);
+    snapshot = `${label}-plan-b`;
+    generations.invalidate();
+    status = 'new plan';
+    finish();
+    await first;
+    assert.equal(status, 'new plan', label);
   }
 });
 

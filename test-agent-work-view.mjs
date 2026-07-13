@@ -42,6 +42,16 @@ const BLOCK_HASH = digest('55');
 const INDEX_RUNTIME = '0x608060408181526004361015610013575f80fd5b5f91823560e01c6352bf8ff214610028575f80fd5b3461013c57606036600319011261013c5760443567ffffffffffffffff80821161013857366023830112156101385781600401359281841161013457602483019260248536920101116101345783156101255750601f1980601f85011691855191603f840116820190828210908211176101115785528381526020956060959493929187810190858583378289878301015251902095848795875195338752888b880152818988015283870137840101527f9b8065b31fd378509bae92224c8f432ce836e42765fe48ed19a4c94713cc24a460243592606081600435948101030190a451908152f35b634e487b7160e01b87526041600452602487fd5b6362c3368960e01b8152600490fd5b8580fd5b8480fd5b8280fdfea2646970667358221220ff7c280a44e3bacfe8b95363943ae27fea7bf6fa1781cf7c6c3369397ab20d3164736f6c63430008140033';
 assert.equal(keccak256(INDEX_RUNTIME), AGENT_WORK_INDEX.runtimeCodeKeccak256);
 
+function boundPaymentState(state, payment = fixture.payment.canonicalHex) {
+  const action = agentPaymentTransferAction(payment);
+  const binding = validateAgentPaymentBinding(payment, {
+    chainId: 11155111, vault: VAULT, action
+  });
+  return {
+    payment, action, actionHash: binding.actionHash, proposalId: binding.proposalId, ...state
+  };
+}
+
 function publishedLog(type, document, parentDigest, blockNumber, logIndex = 0n) {
   const kind = AGENT_WORK_KINDS[type];
   const documentDigest = agentDocumentDigest(document);
@@ -208,12 +218,17 @@ function lifecycleFixture({ accepted = true, queue = 'none', paid = false } = {}
 }
 
 function lifecycleRequest(scenario, {
-  proposalAccepted = true, timestamp = 150n, staticError = null, balanceMismatch = false
+  proposalAccepted = true, proposalSettled = true, proposalState = 5n,
+  queueExpiresAt = scenario.expiresAt, timestamp = 150n, staticError = null,
+  balanceMismatch = false
 } = {}) {
-  const proposalWords = [0n, 0n, 0n, 0n, 0n, 5n, 3n, 1n, proposalAccepted ? 1n : 0n, 0n, 1n];
+  const proposalWords = [
+    0n, 0n, 0n, 0n, 0n, proposalState, 3n,
+    proposalSettled ? 1n : 0n, proposalAccepted ? 1n : 0n, 0n, 1n
+  ];
   const hasQueue = scenario.queued.length === 1;
   const queueWords = hasQueue
-    ? [scenario.executeAfter, scenario.expiresAt, scenario.executed.length ? 1n : 0n, 0n]
+    ? [scenario.executeAfter, queueExpiresAt, scenario.executed.length ? 1n : 0n, 0n]
     : [0n, 0n, 0n, 0n];
   return async (method, params) => {
     if (method === 'eth_getLogs') {
@@ -284,6 +299,28 @@ test('expiry and view/log disagreement both fail closed', async () => {
   assert.equal(disagreement.execution.executableNow, false);
 });
 
+test('proposal flags and queue widths must match canonical lifecycle states', async () => {
+  const scenario = lifecycleFixture({ queue: 'active' });
+  await assert.rejects(
+    readLifecycle(scenario, { proposalState: 4n, proposalSettled: true }),
+    /state flags are incoherent/
+  );
+  await assert.rejects(
+    readLifecycle(scenario, { proposalState: 5n, proposalSettled: false }),
+    /state flags are incoherent/
+  );
+  await assert.rejects(
+    readLifecycle(scenario, {
+      proposalState: 1n, proposalSettled: false, proposalAccepted: true
+    }),
+    /state flags are incoherent/
+  );
+  await assert.rejects(
+    readLifecycle(scenario, { queueExpiresAt: scenario.executeAfter }),
+    /window is invalid/
+  );
+});
+
 test('paid requires exact execution proof and block-delta-consistent aggregate balances', async () => {
   const state = await readLifecycle(lifecycleFixture({ queue: 'active', paid: true }));
   assert.equal(state.acceptance.state, 'accepted');
@@ -306,13 +343,13 @@ test('payment planner exposes exact calldata only and binds every step to one pr
     vault: VAULT,
     chainId: 11155111,
     payment: fixture.payment.canonicalHex,
-    state: {
+    state: boundPaymentState({
       proposed: true,
       acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
       queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
       execution: { state: 'not-queued', executableNow: false },
       paymentState: { state: 'not-paid', paid: false }
-    }
+    })
   });
   assert.equal(plan.actionHash, fixture.payment.actionHash);
   assert.equal(plan.proposalId, fixture.payment.proposalId);
@@ -325,7 +362,7 @@ test('payment planner exposes exact calldata only and binds every step to one pr
 test('payment planner fails closed on lifecycle disagreement or unverified evidence', () => {
   const plan = (state) => prepareAgentPaymentTransactions({
     index: INDEX, gateway: GATEWAY, vault: VAULT, chainId: 11155111,
-    payment: fixture.payment.canonicalHex, state
+    payment: fixture.payment.canonicalHex, state: boundPaymentState(state)
   });
   const pending = plan({
     proposed: false,
@@ -383,6 +420,13 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
     execution: { state: 'executable-now', executableNow: true },
     paymentState: { state: 'not-paid', paid: false }
   });
+  const zeroWidthQueue = plan({
+    proposed: true,
+    acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
+    queue: { executeAfter: 10n, expiresAt: 10n, executed: false, expired: false },
+    execution: { state: 'executable-now', executableNow: true },
+    paymentState: { state: 'not-paid', paid: false }
+  });
   assert.equal(pending.steps[1].available, true);
   assert.equal(proposalDisagreement.steps[1].available, false);
   assert.equal(queueDisagreement.steps[2].available, false);
@@ -391,6 +435,28 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
   assert.equal(executable.steps[3].available, true);
   assert.equal(falseExecutable.steps[3].available, false);
   assert.equal(stringQueue.steps[3].available, false);
+  assert.equal(zeroWidthQueue.steps[3].available, false);
+
+  const identity = boundPaymentState({
+    proposed: false,
+    acceptance: { state: 'pending', accepted: false, route: null },
+    queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
+    execution: { state: 'not-accepted', executableNow: false },
+    paymentState: { state: 'not-paid', paid: false }
+  });
+  const prepare = (state) => prepareAgentPaymentTransactions({
+    index: INDEX, gateway: GATEWAY, vault: VAULT, chainId: 11155111,
+    payment: fixture.payment.canonicalHex, state
+  });
+  assert.throws(() => prepare({ ...identity, actionHash: digest('99') }), /does not bind/);
+  assert.throws(
+    () => prepare({ ...identity, proposalId: (BigInt(identity.proposalId) + 1n).toString() }),
+    /does not bind/
+  );
+  assert.throws(() => prepare({
+    ...identity,
+    payment: { ...fixture.payment.input, recipient: address('ab') }
+  }), /does not bind/);
 });
 
 test('payment selection keeps exact older digests and bounded inspection isolates failures', async () => {

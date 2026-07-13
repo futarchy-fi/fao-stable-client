@@ -1,5 +1,10 @@
 # FAO stable client
 
+`fao.js` includes dependency-free canonical agent task, receipt, and payment builders, exact payment
+binding to `TransferAction`, plus `AgentWorkIndex` publish calldata and log decoding. Accepted agent
+payments are authorized, executable only while funded, and never partial; the index provides no
+escrow or payment authority. Golden bytes live in `agent-document-golden.json`.
+
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed
 site.

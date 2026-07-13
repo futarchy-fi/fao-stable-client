@@ -152,6 +152,17 @@ export const TREASURY_KINDS = Object.freeze({
   critical: keccak256('FAO_ECON_TREASURY_CRITICAL_V2')
 });
 
+export const AGENT_WORK_KINDS = Object.freeze({
+  task: keccak256('FAO_AGENT_TASK_V1'),
+  receipt: keccak256('FAO_AGENT_RECEIPT_V1'),
+  payment: keccak256('FAO_AGENT_PAYMENT_V1')
+});
+
+export const AGENT_WORK_INDEX = Object.freeze({
+  publishSelector: '0x52bf8ff2',
+  publishedTopic: keccak256('Published(bytes32,bytes32,bytes32,address,bytes)')
+});
+
 export function normalizeHex(value, bytes, label = 'hex value') {
   if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value)) {
     throw new Error(`${label} must be 0x-prefixed, even-length hex.`);
@@ -1203,4 +1214,350 @@ export async function cidv1RawSha256(value) {
 // Computes identity only. The exact raw bytes must still be pinned as a raw IPFS block.
 export async function rawIpfsUri(value) {
   return `ipfs://${await cidv1RawSha256(value)}`;
+}
+
+function codePointCompare(left, right) {
+  const a = Array.from(left, (character) => character.codePointAt(0));
+  const b = Array.from(right, (character) => character.codePointAt(0));
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return a.length - b.length;
+}
+
+function escapeAgentString(value) {
+  let output = '"';
+  for (const character of value) {
+    const codepoint = character.codePointAt(0);
+    if (codepoint >= 0xd800 && codepoint <= 0xdfff) {
+      throw new Error('agent document must not contain unpaired Unicode surrogates.');
+    }
+    if (character === '"') output += '\\"';
+    else if (character === '\\') output += '\\\\';
+    else if (codepoint < 0x20) output += `\\u${codepoint.toString(16).padStart(4, '0')}`;
+    else output += character;
+  }
+  return `${output}"`;
+}
+
+function canonicalAgentText(value) {
+  if (typeof value === 'string') return escapeAgentString(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalAgentText).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort(codePointCompare).map((key) => (
+      `${escapeAgentString(key)}:${canonicalAgentText(value[key])}`
+    )).join(',')}}`;
+  }
+  throw new Error('every agent-document scalar leaf must be a JSON string.');
+}
+
+export function canonicalAgentDocument(value) {
+  if (!value || Array.isArray(value) || typeof value !== 'object') {
+    throw new Error('agent document must be a top-level object.');
+  }
+  return new TextEncoder().encode(canonicalAgentText(value));
+}
+
+function equalBytes(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function agentBytes(value, label = 'agent document') {
+  try {
+    return bytes(value, label);
+  } catch (error) {
+    throw new Error(`${label} must be UTF-8 text, bytes, or even-length 0x hex.`, { cause: error });
+  }
+}
+
+export function parseCanonicalAgentDocument(value) {
+  const raw = agentBytes(value);
+  let document;
+  try {
+    document = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+  } catch (error) {
+    throw new Error('agent document is not valid UTF-8 JSON.', { cause: error });
+  }
+  if (!document || Array.isArray(document) || typeof document !== 'object'
+    || !equalBytes(canonicalAgentDocument(document), raw)) {
+    throw new Error('agent document bytes are not canonical.');
+  }
+  return document;
+}
+
+export const agentDocumentDigest = (value) => keccak256(agentBytes(value));
+
+function agentInput(value) {
+  return typeof value === 'string' || value instanceof Uint8Array || value instanceof ArrayBuffer
+    ? parseCanonicalAgentDocument(value)
+    : value;
+}
+
+function agentRecord(value, required, optional, label) {
+  if (!value || Array.isArray(value) || typeof value !== 'object') {
+    throw new Error(`${label} must be an object.`);
+  }
+  const keys = Object.keys(value);
+  if (required.some((key) => !keys.includes(key))
+    || keys.some((key) => !required.includes(key) && !optional.includes(key))) {
+    throw new Error(`${label} has invalid fields.`);
+  }
+  return value;
+}
+
+function agentText(value, label, { nonempty = false, maxBytes } = {}) {
+  if (typeof value !== 'string') throw new Error(`${label} must be a string.`);
+  for (const character of value) {
+    const codepoint = character.codePointAt(0);
+    if (codepoint >= 0xd800 && codepoint <= 0xdfff) {
+      throw new Error(`${label} must not contain unpaired Unicode surrogates.`);
+    }
+  }
+  const size = new TextEncoder().encode(value).length;
+  if (nonempty && size === 0) throw new Error(`${label} cannot be empty.`);
+  if (maxBytes !== undefined && size > maxBytes) {
+    throw new Error(`${label} exceeds ${maxBytes} UTF-8 bytes.`);
+  }
+  return value;
+}
+
+function agentDecimal(value, label, { positive = false } = {}) {
+  if (typeof value !== 'string' || !/^(?:0|[1-9][0-9]*)$/.test(value)) {
+    throw new Error(`${label} must be an unsigned canonical decimal string.`);
+  }
+  const number = BigInt(value);
+  if (number > UINT256_MAX || (positive && number === 0n)) {
+    throw new Error(`${label} must fit uint256${positive ? ' and be positive' : ''}.`);
+  }
+  return value;
+}
+
+function agentDigest(value, label) {
+  return normalizeHex(value, 32, label);
+}
+
+function finishAgentValidation(original, normalized) {
+  if ((typeof original === 'string' || original instanceof Uint8Array || original instanceof ArrayBuffer)
+    && !equalBytes(canonicalAgentDocument(normalized), agentBytes(original))) {
+    throw new Error('agent document values are not in canonical schema form.');
+  }
+  return Object.freeze(normalized);
+}
+
+export function validateAgentTask(value) {
+  const raw = agentRecord(
+    agentInput(value),
+    ['v', 'kind', 'chainId', 'vault', 'title', 'salt'],
+    ['spec', 'specDigest', 'specUri', 'deadline', 'reward'],
+    'agent task'
+  );
+  const inline = Object.hasOwn(raw, 'spec');
+  const external = Object.hasOwn(raw, 'specDigest') || Object.hasOwn(raw, 'specUri');
+  if (inline === external || (external && !(Object.hasOwn(raw, 'specDigest') && Object.hasOwn(raw, 'specUri')))) {
+    throw new Error('agent task requires exactly spec or specDigest plus specUri.');
+  }
+  if (raw.v !== '1' || raw.kind !== 'fao.task') throw new Error('agent task version or kind is invalid.');
+  const task = {
+    v: '1',
+    kind: 'fao.task',
+    chainId: agentDecimal(raw.chainId, 'agent task.chainId', { positive: true }),
+    vault: normalizeAddress(raw.vault),
+    title: agentText(raw.title, 'agent task.title', { nonempty: true }),
+    salt: agentDigest(raw.salt, 'agent task.salt')
+  };
+  if (inline) task.spec = agentText(raw.spec, 'agent task.spec', { nonempty: true });
+  else {
+    task.specDigest = agentDigest(raw.specDigest, 'agent task.specDigest');
+    task.specUri = agentText(raw.specUri, 'agent task.specUri', { nonempty: true, maxBytes: 256 });
+  }
+  if (Object.hasOwn(raw, 'deadline')) task.deadline = agentDecimal(raw.deadline, 'agent task.deadline');
+  if (Object.hasOwn(raw, 'reward')) {
+    const reward = agentRecord(raw.reward, ['asset', 'amount'], [], 'agent task.reward');
+    task.reward = Object.freeze({
+      asset: normalizeAddress(reward.asset, { allowZero: true }),
+      amount: agentDecimal(reward.amount, 'agent task.reward.amount', { positive: true })
+    });
+  }
+  return finishAgentValidation(value, task);
+}
+
+export function validateAgentReceipt(value) {
+  const raw = agentRecord(
+    agentInput(value),
+    ['v', 'kind', 'chainId', 'vault', 'task', 'worker', 'artifacts', 'summary', 'salt'],
+    [],
+    'agent receipt'
+  );
+  if (raw.v !== '1' || raw.kind !== 'fao.receipt') {
+    throw new Error('agent receipt version or kind is invalid.');
+  }
+  if (!Array.isArray(raw.artifacts) || raw.artifacts.length === 0) {
+    throw new Error('agent receipt.artifacts must be a nonempty array.');
+  }
+  const artifacts = Object.freeze(raw.artifacts.map((value_, index) => {
+    const artifact = agentRecord(
+      value_, ['digest', 'uri'], ['note'], `agent receipt.artifacts[${index}]`
+    );
+    const normalized = {
+      digest: agentDigest(artifact.digest, `agent receipt.artifacts[${index}].digest`),
+      uri: agentText(artifact.uri, `agent receipt.artifacts[${index}].uri`, {
+        nonempty: true, maxBytes: 256
+      })
+    };
+    if (Object.hasOwn(artifact, 'note')) {
+      normalized.note = agentText(artifact.note, `agent receipt.artifacts[${index}].note`);
+    }
+    return Object.freeze(normalized);
+  }));
+  return finishAgentValidation(value, {
+    v: '1',
+    kind: 'fao.receipt',
+    chainId: agentDecimal(raw.chainId, 'agent receipt.chainId', { positive: true }),
+    vault: normalizeAddress(raw.vault),
+    task: agentDigest(raw.task, 'agent receipt.task'),
+    worker: normalizeAddress(raw.worker),
+    artifacts,
+    summary: agentText(raw.summary, 'agent receipt.summary', { nonempty: true }),
+    salt: agentDigest(raw.salt, 'agent receipt.salt')
+  });
+}
+
+export function validateAgentPayment(value) {
+  const raw = agentRecord(
+    agentInput(value),
+    ['v', 'kind', 'chainId', 'vault', 'asset', 'recipient', 'amount', 'task', 'receipt', 'salt'],
+    ['note'],
+    'agent payment'
+  );
+  if (raw.v !== '1' || raw.kind !== 'fao.payment') {
+    throw new Error('agent payment version or kind is invalid.');
+  }
+  const payment = {
+    v: '1',
+    kind: 'fao.payment',
+    chainId: agentDecimal(raw.chainId, 'agent payment.chainId', { positive: true }),
+    vault: normalizeAddress(raw.vault),
+    asset: normalizeAddress(raw.asset, { allowZero: true }),
+    recipient: normalizeAddress(raw.recipient),
+    amount: agentDecimal(raw.amount, 'agent payment.amount', { positive: true }),
+    task: agentDigest(raw.task, 'agent payment.task'),
+    receipt: agentDigest(raw.receipt, 'agent payment.receipt'),
+    salt: agentDigest(raw.salt, 'agent payment.salt')
+  };
+  if (Object.hasOwn(raw, 'note')) payment.note = agentText(raw.note, 'agent payment.note');
+  return finishAgentValidation(value, payment);
+}
+
+export const buildAgentTask = (value) => canonicalAgentDocument(validateAgentTask(value));
+export const buildAgentReceipt = (value) => canonicalAgentDocument(validateAgentReceipt(value));
+export const buildAgentPayment = (value) => canonicalAgentDocument(validateAgentPayment(value));
+
+export function agentPaymentTransferAction(value) {
+  const payment = validateAgentPayment(value);
+  return Object.freeze({
+    asset: payment.asset,
+    recipient: payment.recipient,
+    amount: BigInt(payment.amount),
+    salt: agentDocumentDigest(buildAgentPayment(payment))
+  });
+}
+
+export function validateAgentPaymentBinding(value, { chainId, vault, action }) {
+  const payment = validateAgentPayment(value);
+  const expectedChain = assertChainId(chainId).toString();
+  const expectedVault = normalizeAddress(vault);
+  const normalizedAction = normalizeTransferAction(action);
+  const expectedAction = agentPaymentTransferAction(payment);
+  if (payment.chainId !== expectedChain) throw new Error('agent payment chainId does not match.');
+  if (payment.vault !== expectedVault) throw new Error('agent payment vault does not match.');
+  if (normalizedAction.asset !== expectedAction.asset
+    || normalizedAction.recipient !== expectedAction.recipient
+    || normalizedAction.amount !== expectedAction.amount
+    || normalizedAction.salt !== expectedAction.salt) {
+    throw new Error('agent payment does not bind the exact TransferAction.');
+  }
+  const actionHash = transferActionHash(chainId, expectedVault, normalizedAction);
+  return Object.freeze({
+    documentDigest: expectedAction.salt,
+    action: normalizedAction,
+    actionHash,
+    proposalId: BigInt(actionHash).toString()
+  });
+}
+
+function bytesHex(value) {
+  return `0x${Array.from(value, (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+export function publishAgentDocumentCalldata(kind, parentDigest, document) {
+  const raw = agentBytes(document);
+  if (raw.length === 0) throw new Error('agent document cannot be empty.');
+  return encodeCalldata(AGENT_WORK_INDEX.publishSelector, [
+    bytes32Word(kind), bytes32Word(parentDigest), { dynamic: encodeBytes(bytesHex(raw)) }
+  ]);
+}
+
+export function prepareAgentDocumentPublication(type, value) {
+  const profile = {
+    task: [validateAgentTask, buildAgentTask, AGENT_WORK_KINDS.task],
+    receipt: [validateAgentReceipt, buildAgentReceipt, AGENT_WORK_KINDS.receipt],
+    payment: [validateAgentPayment, buildAgentPayment, AGENT_WORK_KINDS.payment]
+  }[type];
+  if (!profile) throw new Error('agent document type must be task, receipt, or payment.');
+  const [validate, build, kind] = profile;
+  const normalized = validate(value);
+  const document = build(normalized);
+  const parentDigest = type === 'task'
+    ? `0x${'00'.repeat(32)}`
+    : normalized[type === 'receipt' ? 'task' : 'receipt'];
+  const documentDigest = agentDocumentDigest(document);
+  return Object.freeze({
+    kind,
+    parentDigest,
+    documentDigest,
+    document: bytesHex(document),
+    calldata: publishAgentDocumentCalldata(kind, parentDigest, document)
+  });
+}
+
+function wordBigInt(value, offset) {
+  return BigInt(`0x${Array.from(value.slice(offset, offset + 32), (byte) => (
+    byte.toString(16).padStart(2, '0')
+  )).join('')}`);
+}
+
+export function decodeAgentDocumentPublishedLog(log) {
+  if (!log || !Array.isArray(log.topics) || log.topics.length !== 4) {
+    throw new Error('Published log topics are invalid.');
+  }
+  const topics = log.topics.map((topic, index) => normalizeHex(topic, 32, `Published topic ${index}`));
+  if (topics[0] !== AGENT_WORK_INDEX.publishedTopic) {
+    throw new Error('Published log signature is invalid.');
+  }
+  const data = agentBytes(normalizeHex(log.data, undefined, 'Published log data'));
+  const zeroAddressPadding = data.slice(0, 12).every((byte) => byte === 0);
+  if (data.length < 96 || data.length % 32 !== 0 || !zeroAddressPadding
+    || wordBigInt(data, 32) !== 64n) {
+    throw new Error('Published log data are invalid.');
+  }
+  const size = wordBigInt(data, 64);
+  if (size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Published document is too large.');
+  const length = Number(size);
+  const padded = Math.ceil(length / 32) * 32;
+  if (data.length !== 96 + padded || !data.slice(96 + length).every((byte) => byte === 0)) {
+    throw new Error('Published log document encoding is invalid.');
+  }
+  const document = data.slice(96, 96 + length);
+  if (document.length === 0 || agentDocumentDigest(document) !== topics[3]) {
+    throw new Error('Published log document digest is invalid.');
+  }
+  return Object.freeze({
+    kind: topics[1],
+    parentDigest: topics[2],
+    documentDigest: topics[3],
+    publisher: normalizeAddress(`0x${Array.from(data.slice(12, 32), (byte) => (
+      byte.toString(16).padStart(2, '0')
+    )).join('')}`, { allowZero: true }),
+    document: bytesHex(document)
+  });
 }

@@ -19,6 +19,21 @@ export function buybackActionStateAfterRefresh(current) {
   }
   return BUYBACK_ACTION_STATES.ready;
 }
+
+export function latestRequestGate() {
+  let generation = 0;
+  return Object.freeze({
+    begin(snapshot) {
+      return Object.freeze({ generation: ++generation, snapshot });
+    },
+    invalidate() {
+      generation += 1;
+    },
+    current(request, snapshot) {
+      return request?.generation === generation && request.snapshot === snapshot;
+    }
+  });
+}
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 const MAX_AGENT_PAYMENT_VIEWS = 100;
@@ -691,6 +706,7 @@ let state = {
   buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded,
   agentWork: null
 };
+const agentWorkRequests = latestRequestGate();
 
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
@@ -710,6 +726,16 @@ function currentGate() {
 function setMessage(element, message, isError = false) {
   element.textContent = message;
   element.classList.toggle('error', isError);
+}
+
+function agentWorkInputSnapshot() {
+  return JSON.stringify([
+    state.account,
+    state.walletChainId?.toString() || null,
+    state.rpcChainId?.toString() || null,
+    elements.treasuryManifestForm.elements.manifest.value,
+    [...new FormData(elements.agentWorkForm).entries()]
+  ]);
 }
 
 function renderGate() {
@@ -1226,6 +1252,7 @@ async function loadTreasuryManifest(event) {
   state.treasuryFlow = null;
   state.buybackModel = null;
   state.agentWork = null;
+  agentWorkRequests.invalidate();
   setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   renderBuybackModel();
   renderAgentWork();
@@ -1242,15 +1269,13 @@ async function loadTreasuryManifest(event) {
   renderTreasuryGate();
 }
 
-async function loadAgentWork(event) {
-  event.preventDefault();
-  if (!event.currentTarget.reportValidity()) return;
+async function loadAgentWork(form, request) {
   if (!treasuryNetworkReady() || !state.treasuryManifest) {
     throw new Error('Verify an active FAO treasury on matching Sepolia first.');
   }
   state.agentWork = null;
   renderAgentWork();
-  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const values = Object.fromEntries(new FormData(form).entries());
   const manifest = validateTreasuryManifest(state.treasuryManifest);
   const view = await fao.readAgentWorkIndex({
     request: rpc,
@@ -1314,6 +1339,7 @@ async function loadAgentWork(event) {
     return Object.freeze(selected);
   };
   const omittedPayments = view.payments.length - inspectedPayments.length;
+  if (!agentWorkRequests.current(request, agentWorkInputSnapshot())) return;
   state.agentWork = Object.freeze({
     ...view,
     paymentViews,
@@ -1578,6 +1604,7 @@ async function initialize() {
     loadTreasuryManifest(event).catch((error) => setMessage(elements.treasuryStatus, errorMessage(error), true))
   ));
   elements.treasuryManifestForm.addEventListener('input', () => {
+    agentWorkRequests.invalidate();
     state.treasuryManifest = null;
     state.treasuryRecords = null;
     state.treasuryFlow = null;
@@ -1590,14 +1617,19 @@ async function initialize() {
     renderBuybackModel();
     renderAgentWork();
   });
-  elements.agentWorkForm.addEventListener('submit', (event) => (
-    loadAgentWork(event).catch((error) => {
+  elements.agentWorkForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!event.currentTarget.reportValidity()) return;
+    const request = agentWorkRequests.begin(agentWorkInputSnapshot());
+    loadAgentWork(event.currentTarget, request).catch((error) => {
+      if (!agentWorkRequests.current(request, agentWorkInputSnapshot())) return;
       state.agentWork = null;
       renderAgentWork();
       setMessage(elements.agentWorkStatus, errorMessage(error), true);
-    })
-  ));
+    });
+  });
   elements.agentWorkForm.addEventListener('input', () => {
+    agentWorkRequests.invalidate();
     state.agentWork = null;
     renderAgentWork();
     setMessage(elements.agentWorkStatus, 'Configuration changed. Verify the deployed index again.');

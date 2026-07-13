@@ -8,6 +8,7 @@ import {
   creationInputFromDraft,
   deriveNetworkGate,
   instanceTrustLabel,
+  latestRequestGate,
   parseExtraAssetInput,
   readBuybackModel,
   submitBuybackOnce,
@@ -56,6 +57,32 @@ test('pre-deployment is a deliberate read-only state', async () => {
   const result = await verifyRuntimeCode({ status: 'pre-deployment' }, async () => { calls += 1; });
   assert.equal(result.status, 'unavailable');
   assert.equal(calls, 0);
+});
+
+test('latest request gate discards overlapping and input-stale completions', async () => {
+  const gate = latestRequestGate();
+  const committed = [];
+  let finishOld;
+  let finishNew;
+  const run = (request, promise, snapshot) => promise.then((value) => {
+    if (gate.current(request, snapshot)) committed.push(value);
+  });
+  const oldPromise = new Promise((resolve) => { finishOld = resolve; });
+  const oldRequest = gate.begin('same-input');
+  const oldRun = run(oldRequest, oldPromise, 'same-input');
+  const newPromise = new Promise((resolve) => { finishNew = resolve; });
+  const newRequest = gate.begin('same-input');
+  const newRun = run(newRequest, newPromise, 'same-input');
+  finishNew('new');
+  await newRun;
+  finishOld('old');
+  await oldRun;
+  assert.deepEqual(committed, ['new']);
+
+  const changed = gate.begin('before-input');
+  assert.equal(gate.current(changed, 'after-input'), false);
+  gate.invalidate();
+  assert.equal(gate.current(changed, 'before-input'), false);
 });
 
 test('writes fail closed on RPC disagreement, wrong chain, and unverified code', () => {
@@ -584,6 +611,8 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'Accepted is authorization, not payment',
     'unverified—not paid'
   ]) assert.match(html, new RegExp(text));
+  assert.match(html, /schemaVersion&quot;:4/);
+  assert.doesNotMatch(html, /schemaVersion&quot;:3/);
   assert.match(html, /role="status" aria-live="polite"/);
   assert.match(html, /data-write[^>]*disabled/);
 });

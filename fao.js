@@ -2172,6 +2172,21 @@ export function prepareAgentPaymentTransactions(value) {
   const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
   const state = input.state;
   if (!state || typeof state !== 'object') throw new Error('Agent payment state is required.');
+  const queueEmpty = state.queue?.executeAfter === 0n
+    && state.queue.expiresAt === 0n
+    && state.queue.executed === false
+    && state.queue.expired === false;
+  const proposalAvailable = state.proposed === false
+    && state.acceptance?.state === 'pending'
+    && state.execution?.state === 'not-accepted'
+    && state.paymentState?.state === 'not-paid'
+    && queueEmpty;
+  const queueAvailable = state.proposed === true
+    && state.acceptance?.state === 'accepted'
+    && state.acceptance.accepted === true
+    && state.execution?.state === 'not-queued'
+    && state.paymentState?.state === 'not-paid'
+    && queueEmpty;
   return Object.freeze({
     actionHash: binding.actionHash,
     proposalId: binding.proposalId,
@@ -2183,14 +2198,18 @@ export function prepareAgentPaymentTransactions(value) {
       }),
       Object.freeze({
         ...transaction(gateway, proposeTransferCalldata(action), 'Payment transfer proposal reference'),
-        available: !state.proposed,
-        gate: state.proposed ? 'Exact proposal already observed.' : 'Available; ordinary bond activation still follows.'
+        available: proposalAvailable,
+        gate: state.proposed === true
+          ? 'Exact proposal already observed.'
+          : proposalAvailable
+            ? 'Available; ordinary bond activation still follows.'
+            : 'Unavailable because proposal lifecycle evidence is not an exact pending state.'
       }),
       Object.freeze({
         ...transaction(vault, queueTreasuryTransferCalldata(action), 'Accepted transfer queue reference'),
-        available: state.acceptance?.accepted === true && state.queue?.executeAfter === 0n,
-        gate: state.acceptance?.accepted === true
-          ? state.queue?.executeAfter === 0n ? 'Accepted and not queued.' : 'Queue already exists.'
+        available: queueAvailable,
+        gate: state.acceptance?.state === 'accepted' && state.acceptance.accepted === true
+          ? queueAvailable ? 'Accepted and not queued.' : 'Queue exists or its lifecycle evidence is not exact.'
           : 'Unavailable until exact acceptance.'
       }),
       Object.freeze({

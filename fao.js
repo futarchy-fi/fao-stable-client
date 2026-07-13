@@ -4,7 +4,7 @@ const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567';
 export const SELECTORS = Object.freeze({
   stage: '0xd12d24e8',
   predict: '0x5421831b',
-  deployCore: '0x67658a72',
+  deployCore: '0xc9b544c1',
   deployFlm: '0x88b5e784',
   claim: '0x1e83409a',
   refund: '0xfa89401a',
@@ -16,7 +16,18 @@ export const SELECTORS = Object.freeze({
   finalize: '0x4bb278f3',
   fail: '0xa9cc4718',
   startNextEvaluation: '0xd2b8360a',
-  bootstrap: '0xfb969b0a'
+  bootstrap: '0xfb969b0a',
+  proposeTransfer: '0xb03e8d3a',
+  proposeParam: '0xc03dd3be',
+  proposeCriticalRound: '0x395459cc',
+  queueTreasuryTransfer: '0xad1d0ccb',
+  executeTreasuryTransfer: '0xc28a1e7b',
+  queueTreasuryParam: '0x10694f44',
+  executeTreasuryParam: '0x165edcdb',
+  stageCriticalAction: '0x96ff22f3',
+  queueCriticalAction: '0x6ffabdf2',
+  executeCriticalAction: '0x5400e73a',
+  expireQueuedAction: '0xf0f9a6d7'
 });
 
 export const CORE_CODE_KEYS = Object.freeze([
@@ -71,6 +82,7 @@ const CORE_CONFIG_KEYS = Object.freeze([
   'arbitrationTimeout',
   'siteMinActivationBond',
   'treasuryMinActivationBond',
+  'assetPolicies',
   'twapTimeout',
   'twapWindow',
   'spaceSaltNonce',
@@ -84,6 +96,7 @@ const CORE_CONFIG_KEYS = Object.freeze([
   'slope',
   'bootstrapBps'
 ]);
+const ASSET_POLICY_KEYS = Object.freeze(['asset', 'c1', 'c2', 'tapBudget', 'tapBudgetMax']);
 const GRANT_KEYS = Object.freeze(['beneficiary', 'start', 'duration', 'amount']);
 const WAD = 10n ** 18n;
 const UINT256_MAX = (1n << 256n) - 1n;
@@ -105,6 +118,12 @@ const KECCAK_ROUND_CONSTANTS = Object.freeze([
   0x000000000000800an, 0x800000008000000an, 0x8000000080008081n,
   0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n
 ]);
+
+export const TREASURY_KINDS = Object.freeze({
+  transfer: keccak256('FAO_ECON_TREASURY_TRANSFER_V1'),
+  param: keccak256('FAO_ECON_TREASURY_PARAM_V1'),
+  critical: keccak256('FAO_ECON_TREASURY_CRITICAL_V2')
+});
 
 export function normalizeHex(value, bytes, label = 'hex value') {
   if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value)) {
@@ -388,6 +407,7 @@ export function normalizeCoreConfig(value) {
     'twapWindow',
     'spaceSaltNonce'
   ]) normalized[key] = unsigned(input[key], CORE_INTEGER_BITS[key], `CoreConfig.${key}`);
+  normalized.assetPolicies = normalizeAssetPolicies(input.assetPolicies);
   for (const key of CORE_STRING_KEYS) {
     normalized[key] = normalizeString(input[key], `CoreConfig.${key}`, {
       nonempty: key === 'tokenName' || key === 'tokenSymbol'
@@ -424,6 +444,45 @@ export function normalizeCoreConfig(value) {
     throw new Error('CoreConfig.bootstrapDeadline must be after saleEnd.');
   }
   return Object.freeze(normalized);
+}
+
+export function normalizeAssetPolicies(value) {
+  if (!Array.isArray(value)) throw new Error('AssetPolicyConfig[] must be an array.');
+  if (value.length > 8) throw new Error('AssetPolicyConfig[] cannot contain more than 8 policies.');
+  const assets = new Set();
+  return Object.freeze(Array.from(value, (raw, index) => {
+    const policy = requireRecord(raw, ASSET_POLICY_KEYS, `AssetPolicyConfig[${index}]`);
+    const normalized = Object.freeze({
+      asset: normalizeAddress(policy.asset, { allowZero: true }),
+      c1: unsigned(policy.c1, 128, `AssetPolicyConfig[${index}].c1`),
+      c2: unsigned(policy.c2, 128, `AssetPolicyConfig[${index}].c2`),
+      tapBudget: unsigned(policy.tapBudget, 128, `AssetPolicyConfig[${index}].tapBudget`),
+      tapBudgetMax: unsigned(policy.tapBudgetMax, 128, `AssetPolicyConfig[${index}].tapBudgetMax`)
+    });
+    if (assets.has(normalized.asset)) throw new Error('AssetPolicyConfig assets must be unique.');
+    assets.add(normalized.asset);
+    if (normalized.c1 > normalized.c2) throw new Error(`AssetPolicyConfig[${index}] requires c1 <= c2.`);
+    if (normalized.tapBudget > normalized.tapBudgetMax) {
+      throw new Error(`AssetPolicyConfig[${index}] requires tapBudget <= tapBudgetMax.`);
+    }
+    return normalized;
+  }));
+}
+
+export async function verifyAssetPolicyContracts(coreConfig, request) {
+  if (typeof request !== 'function') throw new Error('An RPC request function is required.');
+  const policies = normalizeCoreConfig(coreConfig).assetPolicies;
+  const checked = [];
+  for (const policy of policies) {
+    if (policy.asset === ZERO_ADDRESS) continue;
+    const code = normalizeHex(
+      await request('eth_getCode', [policy.asset, 'latest']), undefined,
+      `Asset policy ${policy.asset} runtime code`
+    );
+    if (code === '0x') throw new Error(`Asset policy ${policy.asset} is not a contract.`);
+    checked.push(policy.asset);
+  }
+  return Object.freeze(checked);
 }
 
 export function normalizeGrants(value) {
@@ -506,7 +565,10 @@ function encodeNormalizedCoreConfig(core) {
     'graduationThreshold',
     'arbitrationTimeout',
     'siteMinActivationBond',
-    'treasuryMinActivationBond',
+    'treasuryMinActivationBond'
+  ]) fields.push(uintWord(core[key], CORE_INTEGER_BITS[key]));
+  fields.push({ dynamic: encodeNormalizedAssetPolicies(core.assetPolicies) });
+  for (const key of [
     'twapTimeout',
     'twapWindow',
     'spaceSaltNonce'
@@ -523,6 +585,16 @@ function encodeNormalizedCoreConfig(core) {
     'bootstrapBps'
   ]) fields.push(uintWord(core[key], CORE_INTEGER_BITS[key]));
   return encodeTuple(fields);
+}
+
+function encodeNormalizedAssetPolicies(policies) {
+  return uintWord(policies.length) + policies.map((policy) => (
+    addressWord(policy.asset, { allowZero: true })
+    + uintWord(policy.c1, 128)
+    + uintWord(policy.c2, 128)
+    + uintWord(policy.tapBudget, 128)
+    + uintWord(policy.tapBudgetMax, 128)
+  )).join('');
 }
 
 function encodeNormalizedGrants(grants) {
@@ -665,6 +737,242 @@ export function createPlan(value) {
     }),
     receipt: Object.freeze({ deployCore, deployFlm })
   });
+}
+
+function normalizeSalt(value, label) {
+  return normalizeHex(value, 32, `${label}.salt`);
+}
+
+export function normalizeTransferAction(value) {
+  const action = requireRecord(value, ['asset', 'recipient', 'amount', 'salt'], 'TransferAction');
+  const amount = unsigned(action.amount, 256, 'TransferAction.amount');
+  if (amount === 0n) throw new Error('TransferAction.amount must be positive.');
+  return Object.freeze({
+    asset: normalizeAddress(action.asset, { allowZero: true }),
+    recipient: normalizeAddress(action.recipient),
+    amount,
+    salt: normalizeSalt(action.salt, 'TransferAction')
+  });
+}
+
+export function normalizeParamAction(value) {
+  const action = requireRecord(value, ['key', 'asset', 'value', 'salt'], 'ParamAction');
+  const key = normalizeHex(action.key, 32, 'ParamAction.key');
+  if (key === `0x${'0'.repeat(64)}`) throw new Error('ParamAction.key cannot be zero.');
+  return Object.freeze({
+    key,
+    asset: normalizeAddress(action.asset, { allowZero: true }),
+    value: unsigned(action.value, 128, 'ParamAction.value'),
+    salt: normalizeSalt(action.salt, 'ParamAction')
+  });
+}
+
+export function normalizeCriticalAction(value) {
+  const action = requireRecord(value, ['target', 'value', 'data', 'salt'], 'CriticalAction');
+  return Object.freeze({
+    target: normalizeAddress(action.target),
+    value: unsigned(action.value, 256, 'CriticalAction.value'),
+    data: normalizeHex(action.data, undefined, 'CriticalAction.data'),
+    salt: normalizeSalt(action.salt, 'CriticalAction')
+  });
+}
+
+function treasuryDomain(chainId, vault) {
+  return [uintWord(assertChainId(chainId)), addressWord(vault)];
+}
+
+export function transferEvaluationPayload(chainId, vault, value) {
+  const action = normalizeTransferAction(value);
+  return `0x${[
+    bytes32Word(TREASURY_KINDS.transfer),
+    ...treasuryDomain(chainId, vault),
+    addressWord(action.asset, { allowZero: true }),
+    addressWord(action.recipient),
+    uintWord(action.amount),
+    bytes32Word(action.salt)
+  ].join('')}`;
+}
+
+export function transferActionHash(chainId, vault, action) {
+  return keccak256(transferEvaluationPayload(chainId, vault, action));
+}
+
+export function paramEvaluationPayload(chainId, vault, value) {
+  const action = normalizeParamAction(value);
+  return `0x${[
+    bytes32Word(TREASURY_KINDS.param),
+    ...treasuryDomain(chainId, vault),
+    bytes32Word(action.key),
+    addressWord(action.asset, { allowZero: true }),
+    uintWord(action.value),
+    bytes32Word(action.salt)
+  ].join('')}`;
+}
+
+export function paramActionHash(chainId, vault, action) {
+  return keccak256(paramEvaluationPayload(chainId, vault, action));
+}
+
+export function criticalBasePayload(chainId, vault, value) {
+  const action = normalizeCriticalAction(value);
+  return `0x${[
+    bytes32Word(TREASURY_KINDS.critical),
+    ...treasuryDomain(chainId, vault),
+    addressWord(action.target),
+    uintWord(action.value),
+    bytes32Word(keccak256(action.data)),
+    bytes32Word(action.salt)
+  ].join('')}`;
+}
+
+export function criticalBaseHash(chainId, vault, action) {
+  return keccak256(criticalBasePayload(chainId, vault, action));
+}
+
+export function criticalEvaluationPayload(chainId, vault, value, round) {
+  const normalizedRound = unsigned(round, 256, 'critical round');
+  if (normalizedRound !== 1n && normalizedRound !== 2n) {
+    throw new Error('critical round must be 1 or 2.');
+  }
+  return `${criticalBasePayload(chainId, vault, value)}${uintWord(normalizedRound)}`;
+}
+
+export function criticalActionHash(chainId, vault, action, round) {
+  return keccak256(criticalEvaluationPayload(chainId, vault, action, round));
+}
+
+function transferTuple(value) {
+  const action = normalizeTransferAction(value);
+  return [
+    addressWord(action.asset, { allowZero: true }), addressWord(action.recipient),
+    uintWord(action.amount), bytes32Word(action.salt)
+  ];
+}
+
+function paramTuple(value) {
+  const action = normalizeParamAction(value);
+  return [
+    bytes32Word(action.key), addressWord(action.asset, { allowZero: true }),
+    uintWord(action.value), bytes32Word(action.salt)
+  ];
+}
+
+function criticalTuple(value) {
+  const action = normalizeCriticalAction(value);
+  return encodeTuple([
+    addressWord(action.target), uintWord(action.value),
+    { dynamic: encodeBytes(action.data) }, bytes32Word(action.salt)
+  ]);
+}
+
+export const proposeTransferCalldata = (action) => (
+  encodeCalldata(SELECTORS.proposeTransfer, transferTuple(action))
+);
+export const proposeParamCalldata = (action) => (
+  encodeCalldata(SELECTORS.proposeParam, paramTuple(action))
+);
+export function proposeCriticalRoundCalldata(action, round) {
+  const normalizedRound = unsigned(round, 256, 'critical round');
+  if (normalizedRound !== 1n && normalizedRound !== 2n) {
+    throw new Error('critical round must be 1 or 2.');
+  }
+  return encodeCalldata(SELECTORS.proposeCriticalRound, [
+    { dynamic: criticalTuple(action) }, uintWord(normalizedRound)
+  ]);
+}
+
+export const queueTreasuryTransferCalldata = (action) => (
+  encodeCalldata(SELECTORS.queueTreasuryTransfer, transferTuple(action))
+);
+export const executeTreasuryTransferCalldata = (action) => (
+  encodeCalldata(SELECTORS.executeTreasuryTransfer, transferTuple(action))
+);
+export const queueTreasuryParamCalldata = (action) => (
+  encodeCalldata(SELECTORS.queueTreasuryParam, paramTuple(action))
+);
+export const executeTreasuryParamCalldata = (action) => (
+  encodeCalldata(SELECTORS.executeTreasuryParam, paramTuple(action))
+);
+export const stageCriticalActionCalldata = (action) => (
+  encodeCalldata(SELECTORS.stageCriticalAction, [{ dynamic: criticalTuple(action) }])
+);
+export const queueCriticalActionCalldata = (action) => (
+  encodeCalldata(SELECTORS.queueCriticalAction, [{ dynamic: criticalTuple(action) }])
+);
+export const executeCriticalActionCalldata = (action) => (
+  encodeCalldata(SELECTORS.executeCriticalAction, [{ dynamic: criticalTuple(action) }])
+);
+export const expireQueuedActionCalldata = (actionHash) => (
+  encodeCalldata(SELECTORS.expireQueuedAction, [bytes32Word(actionHash)])
+);
+
+function transaction(target, data, label) {
+  return Object.freeze({ target: normalizeAddress(target), data, label });
+}
+
+export function prepareTreasuryFlow(value) {
+  const input = requireRecord(
+    value, ['chainId', 'vault', 'gateway', 'executor', 'type', 'route', 'action'],
+    'Treasury flow input'
+  );
+  const chainId = assertChainId(input.chainId);
+  const vault = normalizeAddress(input.vault);
+  const gateway = normalizeAddress(input.gateway);
+  const executor = normalizeAddress(input.executor);
+  if (input.type === 'transfer') {
+    if (input.route !== 'timeout' && input.route !== 'evaluated') {
+      throw new Error('Transfer route must be timeout or evaluated.');
+    }
+    const action = normalizeTransferAction(input.action);
+    const actionHash = transferActionHash(chainId, vault, action);
+    return Object.freeze({
+      type: input.type, route: input.route, actionHash, proposalId: BigInt(actionHash).toString(),
+      custody: executor,
+      acceptance: 'Queue uses arbitration lastStateChangeAt; execution re-checks accepted state and the live asset policy.',
+      steps: Object.freeze([
+        transaction(gateway, proposeTransferCalldata(action), 'Propose transfer'),
+        transaction(vault, queueTreasuryTransferCalldata(action), 'Queue after acceptance'),
+        transaction(vault, executeTreasuryTransferCalldata(action), 'Execute during the acceptance-derived window')
+      ])
+    });
+  }
+  if (input.type === 'param') {
+    if (input.route !== 'evaluated') throw new Error('Parameter actions require the evaluated route.');
+    const action = normalizeParamAction(input.action);
+    const actionHash = paramActionHash(chainId, vault, action);
+    return Object.freeze({
+      type: input.type, route: input.route, actionHash, proposalId: BigInt(actionHash).toString(),
+      custody: executor,
+      acceptance: 'Evaluated YES is required; queue timing derives from arbitration lastStateChangeAt.',
+      steps: Object.freeze([
+        transaction(gateway, proposeParamCalldata(action), 'Propose bounded tap-budget update'),
+        transaction(vault, queueTreasuryParamCalldata(action), 'Queue after evaluated YES'),
+        transaction(vault, executeTreasuryParamCalldata(action), 'Execute during the acceptance-derived window')
+      ])
+    });
+  }
+  if (input.type === 'critical') {
+    if (input.route !== 'evaluated') throw new Error('Critical actions require the evaluated route.');
+    const action = normalizeCriticalAction(input.action);
+    const baseHash = criticalBaseHash(chainId, vault, action);
+    return Object.freeze({
+      type: input.type, route: input.route, actionHash: baseHash,
+      proposalIds: Object.freeze([
+        BigInt(criticalActionHash(chainId, vault, action, 1)).toString(),
+        BigInt(criticalActionHash(chainId, vault, action, 2)).toString()
+      ]),
+      custody: executor,
+      acceptance: 'Both rounds require evaluated YES; round 2 opens 30 days after staging and closes after 90 days.',
+      steps: Object.freeze([
+        transaction(gateway, proposeCriticalRoundCalldata(action, 1), 'Propose critical round 1'),
+        transaction(vault, stageCriticalActionCalldata(action), 'Stage after round-1 evaluated YES'),
+        transaction(gateway, proposeCriticalRoundCalldata(action, 2), 'After 30 days, propose round 2'),
+        transaction(vault, queueCriticalActionCalldata(action), 'Queue after round-2 evaluated YES'),
+        transaction(vault, executeCriticalActionCalldata(action), 'After 7-day grace, execute within 7 days')
+      ])
+    });
+  }
+  throw new Error('Treasury flow type must be transfer, param, or critical.');
 }
 
 export const claimCalldata = (account) => oneAddress(SELECTORS.claim, account);

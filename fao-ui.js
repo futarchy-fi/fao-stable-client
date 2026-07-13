@@ -1,4 +1,5 @@
 import { selfServeRuntimeRecords, validateSelfServeManifest } from './selfserve-manifest.mjs';
+import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
 import * as fao from './fao.js';
 
 export const SEPOLIA_CHAIN_ID = 11155111n;
@@ -21,6 +22,12 @@ const RECEIPT_SELECTORS = Object.freeze({
   flmHash: '0x1092769f',
   coreSealed: '0x73797f98',
   flmSealed: '0xe05abb68'
+});
+const TREASURY_VIEW_SELECTORS = Object.freeze({
+  executorFromVault: '0x0d618c81',
+  vaultFromExecutor: '0x411557d1',
+  vaultFromGateway: '0xfbfa77cf',
+  arbitrationFromGateway: '0x9b732350'
 });
 
 function exactRecord(value, keys, label) {
@@ -142,6 +149,37 @@ export async function verifyRuntimeCode(manifest, request, pinnedDependencies = 
   return Object.freeze({ status: 'verified', checked: Object.freeze(checked) });
 }
 
+function addressFromWord(value, label) {
+  const word = fao.normalizeHex(value, 32, label);
+  if (word.slice(2, 26) !== '0'.repeat(24)) throw new Error(`${label} returned a malformed address.`);
+  return fao.normalizeAddress(`0x${word.slice(-40)}`);
+}
+
+export async function verifyTreasuryManifest(manifest, request) {
+  if (typeof request !== 'function') throw new Error('An RPC request function is required.');
+  const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
+  const call = (to, data) => request('eth_call', [{ to, data }, 'latest']);
+  const [executorCode, executorFromVault, vaultFromExecutor, vaultFromGateway, arbitrationFromGateway] =
+    await Promise.all([
+      request('eth_getCode', [records.executor, 'latest']),
+      call(records.vault, TREASURY_VIEW_SELECTORS.executorFromVault),
+      call(records.executor, TREASURY_VIEW_SELECTORS.vaultFromExecutor),
+      call(records.gateway, TREASURY_VIEW_SELECTORS.vaultFromGateway),
+      call(records.gateway, TREASURY_VIEW_SELECTORS.arbitrationFromGateway)
+    ]);
+  const code = fao.normalizeHex(executorCode, undefined, 'Treasury executor runtime code');
+  if (code === '0x' || fao.keccak256(code) !== records.executorRuntimeCodeKeccak256) {
+    throw new Error('Treasury executor runtime bytecode does not match the economic manifest.');
+  }
+  if (addressFromWord(executorFromVault, 'vault.TREASURY_EXECUTOR') !== records.executor
+    || addressFromWord(vaultFromExecutor, 'executor.VAULT') !== records.vault
+    || addressFromWord(vaultFromGateway, 'gateway.vault') !== records.vault
+    || addressFromWord(arbitrationFromGateway, 'gateway.arbitration') !== records.arbitration) {
+    throw new Error('Treasury vault, executor, gateway, and arbitration wiring does not match the manifest.');
+  }
+  return Object.freeze({ status: 'verified', ...records });
+}
+
 export function creationInputFromDraft(draft, manifest, currentTimestamp) {
   if (manifest.status !== 'active') throw new Error('The canonical self-serve registrar is not deployed.');
   exactRecord(draft, [
@@ -171,6 +209,13 @@ export function creationInputFromDraft(draft, manifest, currentTimestamp) {
       arbitrationTimeout: '1800',
       siteMinActivationBond: '100000000000000',
       treasuryMinActivationBond: '100000000000000',
+      assetPolicies: Object.freeze([Object.freeze({
+        asset: PINNED_DEPENDENCIES.weth.target,
+        c1: '10000000000000000',
+        c2: '100000000000000000',
+        tapBudget: '10000000000000000',
+        tapBudgetMax: '100000000000000000'
+      })]),
       twapTimeout: '1800',
       twapWindow: '900',
       spaceSaltNonce: timestamp.toString(),
@@ -251,7 +296,10 @@ let state = {
   predictedReceipt: null,
   receiptExists: false,
   coreSealed: false,
-  flmSealed: false
+  flmSealed: false,
+  treasuryManifest: null,
+  treasuryRecords: null,
+  treasuryFlow: null
 };
 
 function rpc(method, params = []) {
@@ -294,6 +342,18 @@ function renderGate() {
   }
   setMessage(elements.connectionMessage, gate.message, gate.state.includes('wrong') || gate.state.includes('mismatch') || gate.state.includes('invalid') || gate.state.includes('disagreement'));
   if (elements.stageButtons) renderStages();
+  if (elements.treasuryForms) renderTreasuryGate();
+}
+
+function treasuryNetworkReady() {
+  return state.account && state.walletChainId === SEPOLIA_CHAIN_ID
+    && state.rpcChainId === SEPOLIA_CHAIN_ID && state.treasuryRecords;
+}
+
+function renderTreasuryGate() {
+  const enabled = Boolean(treasuryNetworkReady());
+  for (const form of elements.treasuryForms) form.querySelector('button[type="submit"]').disabled = !enabled;
+  for (const button of elements.treasurySteps.querySelectorAll('button')) button.disabled = !enabled;
 }
 
 function renderInstances() {
@@ -400,9 +460,7 @@ function draftFromForm() {
 }
 
 function parseReturnedAddress(value) {
-  const word = fao.normalizeHex(value, 32, 'predicted receipt');
-  if (word.slice(2, 26) !== '0'.repeat(24)) throw new Error('Registrar returned a malformed address.');
-  return fao.normalizeAddress(`0x${word.slice(-40)}`);
+  return addressFromWord(value, 'predicted receipt');
 }
 
 function parseReturnedBool(value, label) {
@@ -472,6 +530,7 @@ async function prepareCreationPlan() {
   const block = await rpc('eth_getBlockByNumber', ['latest', false]);
   if (!block || typeof block.timestamp !== 'string') throw new Error('RPC returned no latest block timestamp.');
   const input = creationInputFromDraft(draftFromForm(), state.manifest, BigInt(block.timestamp));
+  await fao.verifyAssetPolicyContracts(input.coreConfig, rpc);
   await installPreparedInput(input);
   setMessage(
     elements.stageStatus,
@@ -593,6 +652,115 @@ function prepareRagequit(event) {
   renderGate();
 }
 
+async function loadTreasuryManifest(event) {
+  event.preventDefault();
+  if (!elements.treasuryManifestForm.reportValidity()) return;
+  if (!state.account || state.walletChainId !== SEPOLIA_CHAIN_ID || state.rpcChainId !== SEPOLIA_CHAIN_ID) {
+    throw new Error('Connect a wallet with matching Sepolia wallet and RPC chain IDs first.');
+  }
+  const manifest = JSON.parse(elements.treasuryManifestForm.elements.manifest.value);
+  const records = await verifyTreasuryManifest(manifest, rpc);
+  state.treasuryManifest = manifest;
+  state.treasuryRecords = records;
+  state.treasuryFlow = null;
+  elements.treasuryPlan.hidden = true;
+  elements.treasuryExecutor.textContent = records.executor;
+  elements.treasuryVault.textContent = records.vault;
+  setMessage(
+    elements.treasuryStatus,
+    'Executor runtime and vault ↔ executor ↔ gateway ↔ arbitration wiring verified on Sepolia.'
+  );
+  renderTreasuryGate();
+}
+
+function prepareTreasury(event) {
+  event.preventDefault();
+  if (!event.currentTarget.reportValidity()) return;
+  if (!state.treasuryRecords) throw new Error('Verify an active economic deployment manifest first.');
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  let type;
+  let route;
+  let action;
+  if (event.currentTarget === elements.treasuryTransferForm) {
+    ({ route } = values);
+    type = 'transfer';
+    action = { asset: values.asset, recipient: values.recipient, amount: values.amount, salt: values.salt };
+  } else if (event.currentTarget === elements.treasuryParamForm) {
+    type = 'param';
+    route = 'evaluated';
+    action = {
+      key: fao.keccak256('FAO_ECON_TAP_BUDGET_V1'), asset: values.asset,
+      value: values.value, salt: values.salt
+    };
+  } else {
+    type = 'critical';
+    route = 'evaluated';
+    action = { target: values.target, value: values.value, data: values.data, salt: values.salt };
+  }
+  const records = state.treasuryRecords;
+  state.treasuryFlow = fao.prepareTreasuryFlow({
+    chainId: SEPOLIA_CHAIN_ID,
+    vault: records.vault,
+    gateway: records.gateway,
+    executor: records.executor,
+    type,
+    route,
+    action
+  });
+  elements.treasuryAcceptance.textContent = state.treasuryFlow.acceptance;
+  elements.treasurySteps.replaceChildren();
+  state.treasuryFlow.steps.forEach((step, index) => {
+    const item = document.createElement('li');
+    item.className = 'stage-card';
+    const detail = document.createElement('div');
+    const title = document.createElement('h4');
+    const target = document.createElement('code');
+    const calldata = document.createElement('details');
+    const summary = document.createElement('summary');
+    const data = document.createElement('code');
+    const button = document.createElement('button');
+    title.textContent = `${index + 1}. ${step.label}`;
+    target.textContent = step.target;
+    summary.textContent = 'Exact calldata';
+    data.textContent = step.data;
+    calldata.append(summary, data);
+    detail.append(title, target, calldata);
+    button.type = 'button';
+    button.textContent = 'Send this step';
+    button.addEventListener('click', () => sendTreasuryStep(index).catch((error) => (
+      setMessage(elements.treasuryStatus, errorMessage(error), true)
+    )));
+    item.append(detail, button);
+    elements.treasurySteps.append(item);
+  });
+  elements.treasuryPlan.hidden = false;
+  setMessage(
+    elements.treasuryStatus,
+    `Prepared ${state.treasuryFlow.steps.length} exact ${type} steps. Send only the next on-chain-ready step.`
+  );
+  renderTreasuryGate();
+}
+
+async function sendTreasuryStep(index) {
+  if (!treasuryNetworkReady() || !state.treasuryFlow || !state.treasuryManifest) {
+    throw new Error('Reconnect and verify the treasury manifest before sending.');
+  }
+  const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
+  if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
+    throw new Error('Treasury manifest wiring changed.');
+  }
+  const step = state.treasuryFlow.steps[index];
+  if (!step) throw new Error('Unknown treasury step.');
+  const hash = await rpc('eth_sendTransaction', [{ from: state.account, to: step.target, data: step.data }]);
+  setMessage(elements.treasuryStatus, `${step.label} submitted: ${hash}. Waiting for confirmation…`);
+  const receipt = await waitForReceipt(hash);
+  if (BigInt(receipt.status) !== 1n) throw new Error(`${step.label} reverted: ${hash}`);
+  setMessage(
+    elements.treasuryStatus,
+    `${step.label} confirmed: ${hash}. Re-check acceptance and timing before sending the next step.`
+  );
+}
+
 function unavailableAction(event) {
   event.preventDefault();
   const target = event.currentTarget;
@@ -616,8 +784,18 @@ function bindElements() {
     stageDetails: { receipt: byId('receipt-detail'), core: byId('core-detail'), flm: byId('flm-detail') },
     stageButtons: Object.fromEntries(Array.from(document.querySelectorAll('[data-stage]')).map((button) => [button.dataset.stage, button])),
     planSummary: byId('creation-plan'), planReceipt: byId('plan-receipt'),
-    planCoreHash: byId('plan-core-hash'), planFlmHash: byId('plan-flm-hash')
+    planCoreHash: byId('plan-core-hash'), planFlmHash: byId('plan-flm-hash'),
+    treasuryManifestForm: byId('treasury-manifest-form'),
+    treasuryExecutor: byId('treasury-executor'), treasuryVault: byId('treasury-vault'),
+    treasuryStatus: byId('treasury-status'), treasuryPlan: byId('treasury-plan'),
+    treasuryAcceptance: byId('treasury-acceptance'), treasurySteps: byId('treasury-steps'),
+    treasuryTransferForm: byId('treasury-transfer-form'),
+    treasuryParamForm: byId('treasury-param-form'),
+    treasuryCriticalForm: byId('treasury-critical-form')
   };
+  elements.treasuryForms = Object.freeze([
+    elements.treasuryTransferForm, elements.treasuryParamForm, elements.treasuryCriticalForm
+  ]);
 }
 
 async function initialize() {
@@ -627,6 +805,25 @@ async function initialize() {
   elements.preparePlan.addEventListener('click', () => prepareCreationPlan().catch((error) => setMessage(elements.stageStatus, errorMessage(error), true)));
   elements.clearDraft.addEventListener('click', clearDraft);
   elements.ragequitForm.addEventListener('submit', prepareRagequit);
+  elements.treasuryManifestForm.addEventListener('submit', (event) => (
+    loadTreasuryManifest(event).catch((error) => setMessage(elements.treasuryStatus, errorMessage(error), true))
+  ));
+  elements.treasuryManifestForm.addEventListener('input', () => {
+    state.treasuryManifest = null;
+    state.treasuryRecords = null;
+    state.treasuryFlow = null;
+    elements.treasuryPlan.hidden = true;
+    elements.treasuryExecutor.textContent = 'Not verified';
+    elements.treasuryVault.textContent = 'Not verified';
+    renderTreasuryGate();
+  });
+  for (const form of elements.treasuryForms) form.addEventListener('submit', (event) => {
+    try {
+      prepareTreasury(event);
+    } catch (error) {
+      setMessage(elements.treasuryStatus, errorMessage(error), true);
+    }
+  });
   elements.showUnverified.addEventListener('change', renderInstances);
   elements.connect.addEventListener('click', () => syncConnection(true).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   elements.refresh.addEventListener('click', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));

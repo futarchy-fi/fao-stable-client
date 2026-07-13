@@ -6,11 +6,16 @@ import {
   CORE_CODE_KEYS,
   FLM_CODE_KEYS,
   SELECTORS,
+  TREASURY_KINDS,
   approveCalldata,
   assertChainId,
   boolWord,
   claimCalldata,
   createPlan,
+  criticalActionHash,
+  criticalBaseHash,
+  criticalBasePayload,
+  criticalEvaluationPayload,
   depositToSpotCalldata,
   encodeBytes,
   encodeCoreCommitment,
@@ -19,6 +24,10 @@ import {
   encodeGrantConfigs,
   encodeString,
   encodeTuple,
+  executeCriticalActionCalldata,
+  executeTreasuryParamCalldata,
+  executeTreasuryTransferCalldata,
+  expireQueuedActionCalldata,
   hashCoreConfig,
   hashFlmConfig,
   keccak256,
@@ -26,11 +35,24 @@ import {
   normalizeAddress,
   normalizeHex,
   predictCalldata,
+  prepareTreasuryFlow,
   prepareRagequit,
+  proposeCriticalRoundCalldata,
+  proposeParamCalldata,
+  proposeTransferCalldata,
+  queueCriticalActionCalldata,
+  queueTreasuryParamCalldata,
+  queueTreasuryTransferCalldata,
   rawIpfsUri,
   redeemCalldata,
   refundCalldata,
   stageCalldata,
+  stageCriticalActionCalldata,
+  transferActionHash,
+  transferEvaluationPayload,
+  paramActionHash,
+  paramEvaluationPayload,
+  verifyAssetPolicyContracts,
   uintWord
 } from './fao.js';
 
@@ -39,7 +61,8 @@ const hash = (byte) => `0x${byte.repeat(32)}`;
 const cast = (...args) => execFileSync('cast', args, { encoding: 'utf8' }).trim();
 
 const DEPENDENCY_TYPE = '(address,bytes32)';
-const CORE_TYPE = `(${Array(9).fill(DEPENDENCY_TYPE).join(',')},uint256,uint256,uint256,uint256,uint32,uint32,uint256,string,string,string,string,string,string,uint64,uint64,uint256,uint256,uint256,uint256,uint256,uint16)`;
+const ASSET_POLICY_TYPE = '(address,uint128,uint128,uint128,uint128)';
+const CORE_TYPE = `(${Array(9).fill(DEPENDENCY_TYPE).join(',')},uint256,uint256,uint256,uint256,${ASSET_POLICY_TYPE}[],uint32,uint32,uint256,string,string,string,string,string,string,uint64,uint64,uint256,uint256,uint256,uint256,uint256,uint16)`;
 const GRANT_TYPE = '(address,uint64,uint64,uint256)';
 
 function creationInput() {
@@ -59,6 +82,13 @@ function creationInput() {
     arbitrationTimeout: 2n,
     siteMinActivationBond: 3n,
     treasuryMinActivationBond: 4n,
+    assetPolicies: [{
+      asset: dependencies[5].target,
+      c1: 10n,
+      c2: 20n,
+      tapBudget: 5n,
+      tapBudgetMax: 25n
+    }],
     twapTimeout: 1_800n,
     twapWindow: 900n,
     spaceSaltNonce: 5n,
@@ -105,6 +135,7 @@ function coreCastArgument(core) {
     core.arbitrationTimeout,
     core.siteMinActivationBond,
     core.treasuryMinActivationBond,
+    `[${core.assetPolicies.map((policy) => `(${policy.asset},${policy.c1},${policy.c2},${policy.tapBudget},${policy.tapBudgetMax})`).join(',')}]`,
     core.twapTimeout,
     core.twapWindow,
     core.spaceSaltNonce,
@@ -259,6 +290,47 @@ test('self-serve creation rejects malformed economic and bytecode inputs', () =>
     }, input.grants),
     /codehash cannot be zero/
   );
+  assert.throws(
+    () => hashCoreConfig({
+      ...input.coreConfig,
+      assetPolicies: [input.coreConfig.assetPolicies[0], input.coreConfig.assetPolicies[0]]
+    }, input.grants),
+    /must be unique/
+  );
+  assert.throws(
+    () => hashCoreConfig({
+      ...input.coreConfig,
+      assetPolicies: [{ ...input.coreConfig.assetPolicies[0], c1: 21n }]
+    }, input.grants),
+    /c1 <= c2/
+  );
+  assert.throws(
+    () => hashCoreConfig({
+      ...input.coreConfig,
+      assetPolicies: [{ ...input.coreConfig.assetPolicies[0], tapBudget: 26n }]
+    }, input.grants),
+    /tapBudget <= tapBudgetMax/
+  );
+});
+
+test('live asset-policy verification rejects non-contract assets but permits native ETH', async () => {
+  const { coreConfig } = creationInput();
+  const calls = [];
+  const checked = await verifyAssetPolicyContracts({
+    ...coreConfig,
+    assetPolicies: [coreConfig.assetPolicies[0], {
+      asset: address(0), c1: 0, c2: 1, tapBudget: 0, tapBudgetMax: 1
+    }]
+  }, async (method, params) => {
+    calls.push([method, params]);
+    return '0x6001';
+  });
+  assert.deepEqual(checked, [coreConfig.weth.target]);
+  assert.equal(calls.length, 1);
+  await assert.rejects(
+    verifyAssetPolicyContracts(coreConfig, async () => '0x'),
+    /is not a contract/
+  );
 });
 
 test('core ABI words and dynamic tails match cast', () => {
@@ -300,6 +372,85 @@ test('economic and FLM action calldata match cast', () => {
     cast('calldata', 'redeem(uint256,address,bool)', '5', user, 'true')
   );
   assert.equal(approveCalldata(spender, 6), cast('calldata', 'approve(address,uint256)', spender, '6'));
+});
+
+test('typed treasury payloads, hashes, and every transaction calldata match Solidity ABI', () => {
+  const chainId = 11155111;
+  const vault = address(20);
+  const gateway = address(21);
+  const executor = address(22);
+  const transfer = { asset: address(0), recipient: address(23), amount: 7n, salt: hash('11') };
+  const param = {
+    key: keccak256('FAO_ECON_TAP_BUDGET_V1'), asset: address(24), value: 8n, salt: hash('22')
+  };
+  const critical = { target: address(25), value: 9n, data: '0x1234', salt: hash('33') };
+  const transferArgument = `(${transfer.asset},${transfer.recipient},${transfer.amount},${transfer.salt})`;
+  const paramArgument = `(${param.key},${param.asset},${param.value},${param.salt})`;
+  const criticalArgument = `(${critical.target},${critical.value},${critical.data},${critical.salt})`;
+
+  const transferPayload = cast(
+    'abi-encode', 'f(bytes32,uint256,address,address,address,uint256,bytes32)',
+    TREASURY_KINDS.transfer, String(chainId), vault, transfer.asset, transfer.recipient,
+    String(transfer.amount), transfer.salt
+  );
+  const paramPayload = cast(
+    'abi-encode', 'f(bytes32,uint256,address,bytes32,address,uint256,bytes32)',
+    TREASURY_KINDS.param, String(chainId), vault, param.key, param.asset,
+    String(param.value), param.salt
+  );
+  const criticalBase = cast(
+    'abi-encode', 'f(bytes32,uint256,address,address,uint256,bytes32,bytes32)',
+    TREASURY_KINDS.critical, String(chainId), vault, critical.target,
+    String(critical.value), cast('keccak', critical.data), critical.salt
+  );
+  const criticalRound = cast(
+    'abi-encode', 'f(bytes32,uint256,address,address,uint256,bytes32,bytes32,uint256)',
+    TREASURY_KINDS.critical, String(chainId), vault, critical.target,
+    String(critical.value), cast('keccak', critical.data), critical.salt, '2'
+  );
+
+  assert.equal(transferEvaluationPayload(chainId, vault, transfer), transferPayload);
+  assert.equal(transferActionHash(chainId, vault, transfer), cast('keccak', transferPayload));
+  assert.equal(paramEvaluationPayload(chainId, vault, param), paramPayload);
+  assert.equal(paramActionHash(chainId, vault, param), cast('keccak', paramPayload));
+  assert.equal(criticalBasePayload(chainId, vault, critical), criticalBase);
+  assert.equal(criticalBaseHash(chainId, vault, critical), cast('keccak', criticalBase));
+  assert.equal(criticalEvaluationPayload(chainId, vault, critical, 2), criticalRound);
+  assert.equal(criticalActionHash(chainId, vault, critical, 2), cast('keccak', criticalRound));
+
+  for (const [actual, signature, args] of [
+    [proposeTransferCalldata(transfer), 'proposeTransfer((address,address,uint256,bytes32))', [transferArgument]],
+    [queueTreasuryTransferCalldata(transfer), 'queueTreasuryTransfer((address,address,uint256,bytes32))', [transferArgument]],
+    [executeTreasuryTransferCalldata(transfer), 'executeTreasuryTransfer((address,address,uint256,bytes32))', [transferArgument]],
+    [proposeParamCalldata(param), 'proposeParam((bytes32,address,uint256,bytes32))', [paramArgument]],
+    [queueTreasuryParamCalldata(param), 'queueTreasuryParam((bytes32,address,uint256,bytes32))', [paramArgument]],
+    [executeTreasuryParamCalldata(param), 'executeTreasuryParam((bytes32,address,uint256,bytes32))', [paramArgument]],
+    [proposeCriticalRoundCalldata(critical, 2), 'proposeCriticalRound((address,uint256,bytes,bytes32),uint256)', [criticalArgument, '2']],
+    [stageCriticalActionCalldata(critical), 'stageCriticalAction((address,uint256,bytes,bytes32))', [criticalArgument]],
+    [queueCriticalActionCalldata(critical), 'queueCriticalAction((address,uint256,bytes,bytes32))', [criticalArgument]],
+    [executeCriticalActionCalldata(critical), 'executeCriticalAction((address,uint256,bytes,bytes32))', [criticalArgument]]
+  ]) assert.equal(actual, cast('calldata', signature, ...args));
+  assert.equal(
+    expireQueuedActionCalldata(hash('44')),
+    cast('calldata', 'expireQueuedAction(bytes32)', hash('44'))
+  );
+
+  const transferFlow = prepareTreasuryFlow({
+    chainId, vault, gateway, executor, type: 'transfer', route: 'timeout', action: transfer
+  });
+  assert.equal(transferFlow.custody, executor);
+  assert.deepEqual(transferFlow.steps.map((step) => step.target), [gateway, vault, vault]);
+  const criticalFlow = prepareTreasuryFlow({
+    chainId, vault, gateway, executor, type: 'critical', route: 'evaluated', action: critical
+  });
+  assert.equal(criticalFlow.steps.length, 5);
+  assert.match(criticalFlow.acceptance, /30 days/);
+  assert.throws(
+    () => prepareTreasuryFlow({
+      chainId, vault, gateway, executor, type: 'critical', route: 'timeout', action: critical
+    }),
+    /evaluated route/
+  );
 });
 
 test('ragequit normalizes and exposes the exact sorted unique extra-asset list', () => {

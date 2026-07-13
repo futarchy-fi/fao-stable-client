@@ -15,6 +15,10 @@ ownerless registrar plus the two shared compiler-pinned prerequisites. The FAO
 dashboard never treats governed-site `deployment.json` as registrar authority.
 `fao-creation-codes.json` contains the exact receipt, core, and FLM creation
 blobs; the browser checks all twelve pinned Keccak hashes before using them.
+Each FAO's separate schema-v3 economic manifest supplies its vault, gateway,
+arbitration, and treasury executor. The treasury planner rechecks the executor
+runtime hash and bidirectional on-chain wiring before sending any exact typed
+transfer, bounded parameter, or two-round critical-action step.
 
 The site is dependency-free static HTML, CSS, and JavaScript.
 

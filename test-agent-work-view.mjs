@@ -308,10 +308,10 @@ test('payment planner exposes exact calldata only and binds every step to one pr
     payment: fixture.payment.canonicalHex,
     state: {
       proposed: true,
-      acceptance: { state: 'accepted', accepted: true },
+      acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
       queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
       execution: { state: 'not-queued', executableNow: false },
-      paymentState: { state: 'not-paid' }
+      paymentState: { state: 'not-paid', paid: false }
     }
   });
   assert.equal(plan.actionHash, fixture.payment.actionHash);
@@ -329,36 +329,68 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
   });
   const pending = plan({
     proposed: false,
-    acceptance: { state: 'pending', accepted: false },
+    acceptance: { state: 'pending', accepted: false, route: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
-    paymentState: { state: 'not-paid' }
+    paymentState: { state: 'not-paid', paid: false }
   });
   const proposalDisagreement = plan({
     proposed: false,
-    acceptance: { state: 'disagreement', accepted: false },
+    acceptance: { state: 'disagreement', accepted: false, route: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
-    paymentState: { state: 'not-paid' }
+    paymentState: { state: 'not-paid', paid: false }
   });
   const queueDisagreement = plan({
     proposed: true,
-    acceptance: { state: 'accepted', accepted: true },
+    acceptance: { state: 'accepted', accepted: true, route: 'evaluated' },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'disagreement', executableNow: false },
-    paymentState: { state: 'not-paid' }
+    paymentState: { state: 'not-paid', paid: false }
   });
   const unverified = plan({
     proposed: false,
-    acceptance: { state: 'pending', accepted: false },
+    acceptance: { state: 'pending', accepted: false, route: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
     paymentState: { state: 'unverified' }
   });
+  const contradictory = plan({
+    proposed: false,
+    acceptance: { state: 'pending', accepted: true, route: null },
+    queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
+    execution: { state: 'not-accepted', executableNow: true },
+    paymentState: { state: 'not-paid', paid: true }
+  });
+  const executable = plan({
+    proposed: true,
+    acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
+    queue: { executeAfter: 10n, expiresAt: 20n, executed: false, expired: false },
+    execution: { state: 'executable-now', executableNow: true },
+    paymentState: { state: 'not-paid', paid: false }
+  });
+  const falseExecutable = plan({
+    proposed: true,
+    acceptance: { state: 'disagreement', accepted: false, route: null },
+    queue: { executeAfter: 10n, expiresAt: 20n, executed: false, expired: false },
+    execution: { state: 'disagreement', executableNow: true },
+    paymentState: { state: 'unverified', paid: false }
+  });
+  const stringQueue = plan({
+    proposed: true,
+    acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
+    queue: { executeAfter: '10', expiresAt: '20', executed: false, expired: false },
+    execution: { state: 'executable-now', executableNow: true },
+    paymentState: { state: 'not-paid', paid: false }
+  });
   assert.equal(pending.steps[1].available, true);
   assert.equal(proposalDisagreement.steps[1].available, false);
   assert.equal(queueDisagreement.steps[2].available, false);
-  assert.deepEqual(unverified.steps.slice(1, 3).map((step) => step.available), [false, false]);
+  assert.deepEqual(unverified.steps.slice(1).map((step) => step.available), [false, false, false]);
+  assert.deepEqual(contradictory.steps.slice(1).map((step) => step.available), [false, false, false]);
+  assert.equal(executable.steps[3].available, true);
+  assert.equal(falseExecutable.steps[3].available, false);
+  assert.equal(stringQueue.steps[3].available, false);
 });
 
 test('payment selection keeps exact older digests and bounded inspection isolates failures', async () => {

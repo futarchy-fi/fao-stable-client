@@ -62,11 +62,17 @@ test('pre-deployment is a deliberate read-only state', async () => {
 test('latest request gate discards overlapping and input-stale completions', async () => {
   const gate = latestRequestGate();
   const committed = [];
+  const errors = [];
   let finishOld;
   let finishNew;
-  const run = (request, promise, snapshot) => promise.then((value) => {
-    if (gate.current(request, snapshot)) committed.push(value);
-  });
+  const run = async (request, promise, snapshot) => {
+    try {
+      const value = await promise;
+      if (gate.current(request, snapshot)) committed.push(value);
+    } catch (error) {
+      if (gate.current(request, snapshot)) errors.push(error.message);
+    }
+  };
   const oldPromise = new Promise((resolve) => { finishOld = resolve; });
   const oldRequest = gate.begin('same-input');
   const oldRun = run(oldRequest, oldPromise, 'same-input');
@@ -83,6 +89,65 @@ test('latest request gate discards overlapping and input-stale completions', asy
   assert.equal(gate.current(changed, 'after-input'), false);
   gate.invalidate();
   assert.equal(gate.current(changed, 'before-input'), false);
+
+  let failOld;
+  const oldFailure = new Promise((_, reject) => { failOld = reject; });
+  const failedRequest = gate.begin('manifest-a');
+  const failedRun = run(failedRequest, oldFailure, 'manifest-a');
+  gate.invalidate();
+  failOld(new Error('stale verification failure'));
+  await failedRun;
+  assert.deepEqual(errors, []);
+
+  let finishChanged;
+  const changedPromise = new Promise((resolve) => { finishChanged = resolve; });
+  const changedRequest = gate.begin('manifest-a');
+  const changedRun = run(changedRequest, changedPromise, 'manifest-b');
+  finishChanged('stale-trust-root');
+  await changedRun;
+  assert.deepEqual(committed, ['new']);
+  const dependentPlanner = { trustRoot: committed.at(-1) };
+  assert.deepEqual(dependentPlanner, { trustRoot: 'new' });
+});
+
+test('every async positive-state writer is generation-gated against stale success and error', async () => {
+  const source = await readFile(new URL('./fao-ui.js', import.meta.url), 'utf8');
+  for (const name of [
+    'agentWorkRequests', 'buybackRequests', 'connectionRequests', 'creationPlanRequests',
+    'receiptStateRequests', 'treasuryManifestRequests'
+  ]) {
+    assert.match(source, new RegExp(`const ${name} = latestRequestGate\\(\\);`));
+    assert.match(source, new RegExp(`${name}\\.current\\(`));
+  }
+
+  for (const label of ['treasury', 'creation', 'receipt', 'buyback']) {
+    const gate = latestRequestGate();
+    const positive = [];
+    const errors = [];
+    const run = async (request, promise, snapshot) => {
+      try {
+        const value = await promise;
+        if (gate.current(request, snapshot)) positive.push(value);
+      } catch (error) {
+        if (gate.current(request, snapshot)) errors.push(error.message);
+      }
+    };
+    let finish;
+    const staleSuccess = new Promise((resolve) => { finish = resolve; });
+    const successRequest = gate.begin(`${label}-a`);
+    const successRun = run(successRequest, staleSuccess, `${label}-b`);
+    finish('unsafe-positive-state');
+    await successRun;
+
+    let fail;
+    const staleError = new Promise((_, reject) => { fail = reject; });
+    const errorRequest = gate.begin(`${label}-a`);
+    const errorRun = run(errorRequest, staleError, `${label}-a`);
+    gate.invalidate();
+    fail(new Error('obsolete failure'));
+    await errorRun;
+    assert.deepEqual({ positive, errors }, { positive: [], errors: [] }, label);
+  }
 });
 
 test('writes fail closed on RPC disagreement, wrong chain, and unverified code', () => {

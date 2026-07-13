@@ -707,6 +707,11 @@ let state = {
   agentWork: null
 };
 const agentWorkRequests = latestRequestGate();
+const buybackRequests = latestRequestGate();
+const connectionRequests = latestRequestGate();
+const creationPlanRequests = latestRequestGate();
+const receiptStateRequests = latestRequestGate();
+const treasuryManifestRequests = latestRequestGate();
 
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
@@ -736,6 +741,38 @@ function agentWorkInputSnapshot() {
     elements.treasuryManifestForm.elements.manifest.value,
     [...new FormData(elements.agentWorkForm).entries()]
   ]);
+}
+
+function treasuryManifestInputSnapshot() {
+  return JSON.stringify([
+    state.account,
+    state.walletChainId?.toString() || null,
+    state.rpcChainId?.toString() || null,
+    elements.treasuryManifestForm.elements.manifest.value
+  ]);
+}
+
+function creationPlanInputSnapshot() {
+  return JSON.stringify([
+    state.account,
+    state.walletChainId?.toString() || null,
+    state.rpcChainId?.toString() || null,
+    state.codeState,
+    [...new FormData(elements.createForm).entries()]
+  ]);
+}
+
+function receiptStateSnapshot(plan = state.creationPlan, predictedReceipt = state.predictedReceipt) {
+  return plan && predictedReceipt
+    ? JSON.stringify([
+      state.account,
+      state.walletChainId?.toString() || null,
+      state.rpcChainId?.toString() || null,
+      predictedReceipt,
+      plan.hashes.core,
+      plan.hashes.flm
+    ])
+    : null;
 }
 
 function renderGate() {
@@ -1015,16 +1052,34 @@ async function loadManifest() {
 }
 
 async function syncConnection(requestAccounts = false) {
+  const request = connectionRequests.begin(null);
+  agentWorkRequests.invalidate();
+  buybackRequests.invalidate();
+  creationPlanRequests.invalidate();
+  receiptStateRequests.invalidate();
+  treasuryManifestRequests.invalidate();
+  state.walletChainId = null;
+  state.rpcChainId = null;
+  state.codeState = 'unchecked';
+  state.codeMessage = 'Checking wallet and RPC state…';
+  renderGate();
   if (!window.ethereum) {
-    renderGate();
     return;
   }
-  const accounts = await rpc(requestAccounts ? 'eth_requestAccounts' : 'eth_accounts');
+  let accounts;
+  let walletValue;
+  let rpcValue;
+  try {
+    accounts = await rpc(requestAccounts ? 'eth_requestAccounts' : 'eth_accounts');
+    [walletValue, rpcValue] = await Promise.all([rpc('eth_chainId'), rpc('net_version')]);
+  } catch (error) {
+    if (!connectionRequests.current(request, null)) return;
+    throw error;
+  }
+  if (!connectionRequests.current(request, null)) return;
   state.account = accounts[0] || null;
-  const [walletValue, rpcValue] = await Promise.all([rpc('eth_chainId'), rpc('net_version')]);
   state.walletChainId = chainId(walletValue, 'Wallet');
   state.rpcChainId = chainId(rpcValue, 'RPC');
-  state.codeState = 'unchecked';
   state.codeMessage = 'Not checked';
   renderGate();
 
@@ -1034,9 +1089,11 @@ async function syncConnection(requestAccounts = false) {
     renderGate();
     try {
       const result = await verifyRuntimeCode(state.manifest, rpc);
+      if (!connectionRequests.current(request, null)) return;
       state.codeState = result.status;
       state.codeMessage = `${result.checked.length} / ${result.checked.length} runtime hashes verified`;
     } catch (error) {
+      if (!connectionRequests.current(request, null)) return;
       state.codeState = 'mismatch';
       state.codeMessage = errorMessage(error);
     }
@@ -1059,48 +1116,74 @@ function parseReturnedBool(value, label) {
   throw new Error(`${label} returned a non-boolean word.`);
 }
 
-async function refreshReceiptState() {
-  if (!state.creationPlan || !state.predictedReceipt) return;
+async function readReceiptState(plan, predictedReceipt) {
   const code = fao.normalizeHex(
-    await rpc('eth_getCode', [state.predictedReceipt, 'latest']), undefined, 'receipt runtime code'
+    await rpc('eth_getCode', [predictedReceipt, 'latest']), undefined, 'receipt runtime code'
   );
-  state.receiptExists = code !== '0x';
-  state.coreSealed = false;
-  state.flmSealed = false;
-  if (state.receiptExists) {
-    const call = (data) => rpc('eth_call', [{ to: state.predictedReceipt, data }, 'latest']);
-    const [coreHash, flmHash, coreSealed, flmSealed] = await Promise.all([
+  const receiptExists = code !== '0x';
+  let coreSealed = false;
+  let flmSealed = false;
+  if (receiptExists) {
+    const call = (data) => rpc('eth_call', [{ to: predictedReceipt, data }, 'latest']);
+    const [coreHash, flmHash, coreSealedWord, flmSealedWord] = await Promise.all([
       call(RECEIPT_SELECTORS.coreHash), call(RECEIPT_SELECTORS.flmHash),
       call(RECEIPT_SELECTORS.coreSealed), call(RECEIPT_SELECTORS.flmSealed)
     ]);
-    if (fao.normalizeHex(coreHash, 32, 'receipt core hash') !== state.creationPlan.hashes.core
-      || fao.normalizeHex(flmHash, 32, 'receipt FLM hash') !== state.creationPlan.hashes.flm) {
+    if (fao.normalizeHex(coreHash, 32, 'receipt core hash') !== plan.hashes.core
+      || fao.normalizeHex(flmHash, 32, 'receipt FLM hash') !== plan.hashes.flm) {
       throw new Error('Predicted receipt code does not bind the prepared configuration.');
     }
-    state.coreSealed = parseReturnedBool(coreSealed, 'coreSealed');
-    state.flmSealed = parseReturnedBool(flmSealed, 'flmSealed');
-    if (state.flmSealed && !state.coreSealed) throw new Error('Receipt reports FLM sealed before core.');
+    coreSealed = parseReturnedBool(coreSealedWord, 'coreSealed');
+    flmSealed = parseReturnedBool(flmSealedWord, 'flmSealed');
+    if (flmSealed && !coreSealed) throw new Error('Receipt reports FLM sealed before core.');
   }
-  renderStages();
+  return Object.freeze({ receiptExists, coreSealed, flmSealed });
 }
 
-async function installPreparedInput(input, { persist = true } = {}) {
-  if (!state.creationBundle) throw new Error('Creation bytecode is unavailable.');
-  state.preparedInput = input;
-  state.creationPlan = fao.createPlan({
+async function refreshReceiptState() {
+  const plan = state.creationPlan;
+  const predictedReceipt = state.predictedReceipt;
+  if (!plan || !predictedReceipt) return false;
+  const request = receiptStateRequests.begin(receiptStateSnapshot(plan, predictedReceipt));
+  let receipt;
+  try {
+    receipt = await readReceiptState(plan, predictedReceipt);
+  } catch (error) {
+    if (!receiptStateRequests.current(request, receiptStateSnapshot())) return false;
+    throw error;
+  }
+  if (!receiptStateRequests.current(request, receiptStateSnapshot())) return false;
+  Object.assign(state, receipt);
+  renderStages();
+  return true;
+}
+
+async function installPreparedInput(input, { persist = true, request } = {}) {
+  const creationBundle = state.creationBundle;
+  if (!creationBundle) throw new Error('Creation bytecode is unavailable.');
+  const plan = fao.createPlan({
     ...input,
-    creationCodes: state.creationBundle.creationCodes
+    creationCodes: creationBundle.creationCodes
   });
   const result = await rpc('eth_call', [{
-    to: state.creationPlan.registrar.target,
-    data: state.creationPlan.registrar.predict
+    to: plan.registrar.target,
+    data: plan.registrar.predict
   }, 'latest']);
-  state.predictedReceipt = parseReturnedAddress(result);
+  const predictedReceipt = parseReturnedAddress(result);
+  const receipt = await readReceiptState(plan, predictedReceipt);
+  if (request && !creationPlanRequests.current(request, creationPlanInputSnapshot())) return false;
+  state.preparedInput = input;
+  state.creationPlan = plan;
+  state.predictedReceipt = predictedReceipt;
+  Object.assign(state, receipt);
   if (persist) localStorage.setItem(PREPARED_KEY, JSON.stringify(input));
-  await refreshReceiptState();
+  renderStages();
+  return true;
 }
 
 function invalidatePreparedPlan(message = '') {
+  creationPlanRequests.invalidate();
+  receiptStateRequests.invalidate();
   localStorage.removeItem(PREPARED_KEY);
   state.preparedInput = null;
   state.creationPlan = null;
@@ -1112,15 +1195,16 @@ function invalidatePreparedPlan(message = '') {
   if (message) setMessage(elements.stageStatus, message);
 }
 
-async function prepareCreationPlan() {
-  if (!elements.createForm.reportValidity()) return;
+async function prepareCreationPlan(request) {
   const gate = currentGate();
   if (!gate.canTransact) throw new Error(gate.message);
+  const draft = draftFromForm();
+  const manifest = state.manifest;
   const block = await rpc('eth_getBlockByNumber', ['latest', false]);
   if (!block || typeof block.timestamp !== 'string') throw new Error('RPC returned no latest block timestamp.');
-  const input = creationInputFromDraft(draftFromForm(), state.manifest, BigInt(block.timestamp));
+  const input = creationInputFromDraft(draft, manifest, BigInt(block.timestamp));
   await fao.verifyAssetPolicyContracts(input.coreConfig, rpc);
-  await installPreparedInput(input);
+  if (!await installPreparedInput(input, { request })) return;
   setMessage(
     elements.stageStatus,
     `Exact plan prepared for ${state.predictedReceipt}. Review both configuration hashes before staging.`
@@ -1130,10 +1214,12 @@ async function prepareCreationPlan() {
 async function restorePreparedPlan() {
   const raw = localStorage.getItem(PREPARED_KEY);
   if (!raw || !window.ethereum || state.manifest?.status !== 'active') return;
+  const request = creationPlanRequests.begin(creationPlanInputSnapshot());
   try {
-    await installPreparedInput(JSON.parse(raw), { persist: false });
+    if (!await installPreparedInput(JSON.parse(raw), { persist: false, request })) return;
     setMessage(elements.stageStatus, `Restored exact plan for ${state.predictedReceipt}. On-chain stages were re-read.`);
   } catch (error) {
+    if (!creationPlanRequests.current(request, creationPlanInputSnapshot())) return;
     invalidatePreparedPlan();
     setMessage(elements.stageStatus, `Saved plan rejected: ${errorMessage(error)}`, true);
   }
@@ -1150,34 +1236,50 @@ async function waitForReceipt(hash) {
 
 async function sendCreationStage(event) {
   const stage = event.currentTarget.dataset.stage;
-  if (!state.creationPlan) throw new Error('Prepare and review an exact creation plan first.');
-  await refreshReceiptState();
+  const plan = state.creationPlan;
+  const predictedReceipt = state.predictedReceipt;
+  const preparedInput = state.preparedInput;
+  const account = state.account;
+  if (!plan || !predictedReceipt || !preparedInput) {
+    throw new Error('Prepare and review an exact creation plan first.');
+  }
+  if (!await refreshReceiptState()
+    || state.creationPlan !== plan
+    || state.predictedReceipt !== predictedReceipt
+    || state.preparedInput !== preparedInput
+    || state.account !== account
+    || !currentGate().canTransact) {
+    throw new Error('Creation plan or wallet state changed during stage verification.');
+  }
   const steps = {
     receipt: {
       ready: !state.receiptExists,
-      target: state.creationPlan.registrar.target,
-      data: state.creationPlan.registrar.stage
+      target: plan.registrar.target,
+      data: plan.registrar.stage
     },
     core: {
       ready: state.receiptExists && !state.coreSealed,
-      target: state.predictedReceipt,
-      data: state.creationPlan.receipt.deployCore
+      target: predictedReceipt,
+      data: plan.receipt.deployCore
     },
     flm: {
       ready: state.coreSealed && !state.flmSealed,
-      target: state.predictedReceipt,
-      data: state.creationPlan.receipt.deployFlm
+      target: predictedReceipt,
+      data: plan.receipt.deployFlm
     }
   };
   const step = steps[stage];
   if (!step?.ready) throw new Error(`${stage} is not the next resumable stage.`);
   if (stage === 'core') {
     const block = await rpc('eth_getBlockByNumber', ['latest', false]);
-    if (!block || BigInt(block.timestamp) >= BigInt(state.preparedInput.coreConfig.saleEnd)) {
+    if (!block || BigInt(block.timestamp) >= BigInt(preparedInput.coreConfig.saleEnd)) {
       throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
     }
+    if (state.creationPlan !== plan || state.account !== account || !currentGate().canTransact) {
+      throw new Error('Creation plan or wallet state changed during sale-end verification.');
+    }
   }
-  const hash = await rpc('eth_sendTransaction', [{ from: state.account, to: step.target, data: step.data }]);
+  const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
   setMessage(elements.stageStatus, `${stage} submitted: ${hash}. Waiting for confirmation…`);
   const receipt = await waitForReceipt(hash);
   if (BigInt(receipt.status) !== 1n) throw new Error(`${stage} transaction reverted: ${hash}`);
@@ -1241,9 +1343,7 @@ function prepareRagequit(event) {
   renderGate();
 }
 
-async function loadTreasuryManifest(event) {
-  event.preventDefault();
-  if (!elements.treasuryManifestForm.reportValidity()) return;
+async function loadTreasuryManifest(form, request) {
   if (!state.account || state.walletChainId !== SEPOLIA_CHAIN_ID || state.rpcChainId !== SEPOLIA_CHAIN_ID) {
     throw new Error('Connect a wallet with matching Sepolia wallet and RPC chain IDs first.');
   }
@@ -1253,17 +1353,26 @@ async function loadTreasuryManifest(event) {
   state.buybackModel = null;
   state.agentWork = null;
   agentWorkRequests.invalidate();
+  buybackRequests.invalidate();
   setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   renderBuybackModel();
   renderAgentWork();
-  const manifest = JSON.parse(elements.treasuryManifestForm.elements.manifest.value);
+  const manifest = JSON.parse(form.elements.manifest.value);
   const records = await verifyTreasuryManifest(manifest, rpc);
+  const buybackModel = await readBuybackModel({
+    chainId: SEPOLIA_CHAIN_ID,
+    vault: records.vault,
+    executor: records.executor,
+    request: rpc
+  });
+  if (!treasuryManifestRequests.current(request, treasuryManifestInputSnapshot())) return;
   state.treasuryManifest = manifest;
   state.treasuryRecords = records;
+  state.buybackModel = buybackModel;
   elements.treasuryPlan.hidden = true;
   elements.treasuryExecutor.textContent = records.executor;
   elements.treasuryVault.textContent = records.vault;
-  await refreshBuybackState(false);
+  renderBuybackModel();
   setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
   setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
   renderTreasuryGate();
@@ -1356,23 +1465,37 @@ async function loadAgentWork(form, request) {
 }
 
 async function refreshBuybackState(reverify = true) {
-  if (!treasuryNetworkReady() || !state.treasuryManifest) {
+  const manifest = state.treasuryManifest;
+  const records = state.treasuryRecords;
+  if (!treasuryNetworkReady() || !manifest || !records) {
     throw new Error('Reconnect and verify the treasury manifest before reading buyback state.');
   }
-  if (reverify) {
-    const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
-    if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
-      throw new Error('Treasury manifest wiring changed.');
+  const request = buybackRequests.begin(treasuryManifestInputSnapshot());
+  try {
+    if (reverify) {
+      const fresh = await verifyTreasuryManifest(manifest, rpc);
+      if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
+        throw new Error('Treasury manifest wiring changed.');
+      }
     }
+    const model = await readBuybackModel({
+      chainId: SEPOLIA_CHAIN_ID,
+      vault: records.vault,
+      executor: records.executor,
+      request: rpc
+    });
+    if (!buybackRequests.current(request, treasuryManifestInputSnapshot())
+      || state.treasuryManifest !== manifest
+      || state.treasuryRecords !== records) return null;
+    state.buybackModel = model;
+    renderBuybackModel();
+    return model;
+  } catch (error) {
+    if (!buybackRequests.current(request, treasuryManifestInputSnapshot())
+      || state.treasuryManifest !== manifest
+      || state.treasuryRecords !== records) return null;
+    throw error;
   }
-  state.buybackModel = await readBuybackModel({
-    chainId: SEPOLIA_CHAIN_ID,
-    vault: state.treasuryRecords.vault,
-    executor: state.treasuryRecords.executor,
-    request: rpc
-  });
-  renderBuybackModel();
-  return state.buybackModel;
 }
 
 async function refreshBuybackForUser() {
@@ -1382,6 +1505,7 @@ async function refreshBuybackForUser() {
   const wasConfirmed = state.buybackActionState === BUYBACK_ACTION_STATES.confirmedRefreshNeeded;
   if (!wasConfirmed) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   const model = await refreshBuybackState(true);
+  if (!model) return null;
   setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
   setMessage(
     elements.buybackStatus,
@@ -1393,17 +1517,28 @@ async function refreshBuybackForUser() {
 }
 
 async function sendBuyback() {
+  const manifest = state.treasuryManifest;
+  const records = state.treasuryRecords;
+  const account = state.account;
+  if (!manifest || !records || !account) throw new Error('Verify treasury custody and connect a wallet first.');
   const plan = fao.prepareBuyback({
     chainId: SEPOLIA_CHAIN_ID,
-    vault: state.treasuryRecords.vault
+    vault: records.vault
   });
   const result = await submitBuybackOnce({
     getActionState: () => state.buybackActionState,
     setActionState: setBuybackActionState,
-    refreshBeforeSend: () => refreshBuybackState(true),
+    refreshBeforeSend: async () => {
+      const model = await refreshBuybackState(true);
+      if (!model || state.treasuryManifest !== manifest || state.treasuryRecords !== records
+        || state.account !== account || !treasuryNetworkReady()) {
+        throw new Error('Treasury configuration or wallet state changed during buyback verification.');
+      }
+      return model;
+    },
     send: async () => {
       const hash = await rpc('eth_sendTransaction', [{
-        from: state.account,
+        from: account,
         to: plan.target,
         data: plan.data
       }]);
@@ -1425,7 +1560,11 @@ async function sendBuyback() {
         `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
       setMessage(elements.buybackStatus, `${plan.label} confirmed: ${hash}. Refreshing state…`);
     },
-    refreshAfterConfirmed: () => refreshBuybackState(false)
+    refreshAfterConfirmed: async () => {
+      const model = await refreshBuybackState(false);
+      if (!model) throw new Error('Treasury configuration changed during the confirmed-state refresh.');
+      return model;
+    }
   });
   if (result.decodeError) {
     setMessage(
@@ -1519,16 +1658,24 @@ function prepareTreasury(event) {
 }
 
 async function sendTreasuryStep(index) {
-  if (!treasuryNetworkReady() || !state.treasuryFlow || !state.treasuryManifest) {
+  const manifest = state.treasuryManifest;
+  const records = state.treasuryRecords;
+  const flow = state.treasuryFlow;
+  const account = state.account;
+  if (!treasuryNetworkReady() || !flow || !manifest || !records || !account) {
     throw new Error('Reconnect and verify the treasury manifest before sending.');
   }
-  const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
-  if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
+  const fresh = await verifyTreasuryManifest(manifest, rpc);
+  if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
     throw new Error('Treasury manifest wiring changed.');
   }
-  const step = state.treasuryFlow.steps[index];
+  if (state.treasuryManifest !== manifest || state.treasuryRecords !== records
+    || state.treasuryFlow !== flow || state.account !== account || !treasuryNetworkReady()) {
+    throw new Error('Treasury plan or wallet state changed during send verification.');
+  }
+  const step = flow.steps[index];
   if (!step) throw new Error('Unknown treasury step.');
-  const hash = await rpc('eth_sendTransaction', [{ from: state.account, to: step.target, data: step.data }]);
+  const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
   setMessage(elements.treasuryStatus, `${step.label} submitted: ${hash}. Waiting for confirmation…`);
   const receipt = await waitForReceipt(hash);
   if (BigInt(receipt.status) !== 1n) throw new Error(`${step.label} reverted: ${hash}`);
@@ -1597,14 +1744,29 @@ async function initialize() {
   bindElements();
   elements.createForm.addEventListener('submit', saveDraft);
   elements.createForm.addEventListener('input', () => invalidatePreparedPlan('Draft changed. Prepare a new exact plan before staging.'));
-  elements.preparePlan.addEventListener('click', () => prepareCreationPlan().catch((error) => setMessage(elements.stageStatus, errorMessage(error), true)));
+  elements.preparePlan.addEventListener('click', () => {
+    if (!elements.createForm.reportValidity()) return;
+    const request = creationPlanRequests.begin(creationPlanInputSnapshot());
+    prepareCreationPlan(request).catch((error) => {
+      if (!creationPlanRequests.current(request, creationPlanInputSnapshot())) return;
+      setMessage(elements.stageStatus, errorMessage(error), true);
+    });
+  });
   elements.clearDraft.addEventListener('click', clearDraft);
   elements.ragequitForm.addEventListener('submit', prepareRagequit);
-  elements.treasuryManifestForm.addEventListener('submit', (event) => (
-    loadTreasuryManifest(event).catch((error) => setMessage(elements.treasuryStatus, errorMessage(error), true))
-  ));
+  elements.treasuryManifestForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!event.currentTarget.reportValidity()) return;
+    const request = treasuryManifestRequests.begin(treasuryManifestInputSnapshot());
+    loadTreasuryManifest(event.currentTarget, request).catch((error) => {
+      if (!treasuryManifestRequests.current(request, treasuryManifestInputSnapshot())) return;
+      setMessage(elements.treasuryStatus, errorMessage(error), true);
+    });
+  });
   elements.treasuryManifestForm.addEventListener('input', () => {
+    treasuryManifestRequests.invalidate();
     agentWorkRequests.invalidate();
+    buybackRequests.invalidate();
     state.treasuryManifest = null;
     state.treasuryRecords = null;
     state.treasuryFlow = null;

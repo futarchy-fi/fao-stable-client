@@ -2172,21 +2172,42 @@ export function prepareAgentPaymentTransactions(value) {
   const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
   const state = input.state;
   if (!state || typeof state !== 'object') throw new Error('Agent payment state is required.');
+  const notPaid = state.paymentState?.state === 'not-paid'
+    && state.paymentState.paid === false;
+  const pendingAcceptance = state.acceptance?.state === 'pending'
+    && state.acceptance.accepted === false
+    && state.acceptance.route === null;
+  const acceptedAcceptance = state.acceptance?.state === 'accepted'
+    && state.acceptance.accepted === true
+    && ['timeout', 'evaluated'].includes(state.acceptance.route);
   const queueEmpty = state.queue?.executeAfter === 0n
     && state.queue.expiresAt === 0n
     && state.queue.executed === false
     && state.queue.expired === false;
+  const queueOpen = typeof state.queue?.executeAfter === 'bigint'
+    && typeof state.queue.expiresAt === 'bigint'
+    && state.queue.executeAfter > 0n
+    && state.queue.expiresAt >= state.queue.executeAfter
+    && state.queue.executed === false
+    && state.queue.expired === false;
   const proposalAvailable = state.proposed === false
-    && state.acceptance?.state === 'pending'
+    && pendingAcceptance
     && state.execution?.state === 'not-accepted'
-    && state.paymentState?.state === 'not-paid'
+    && state.execution.executableNow === false
+    && notPaid
     && queueEmpty;
   const queueAvailable = state.proposed === true
-    && state.acceptance?.state === 'accepted'
-    && state.acceptance.accepted === true
+    && acceptedAcceptance
     && state.execution?.state === 'not-queued'
-    && state.paymentState?.state === 'not-paid'
+    && state.execution.executableNow === false
+    && notPaid
     && queueEmpty;
+  const executionAvailable = state.proposed === true
+    && acceptedAcceptance
+    && state.execution?.state === 'executable-now'
+    && state.execution.executableNow === true
+    && notPaid
+    && queueOpen;
   return Object.freeze({
     actionHash: binding.actionHash,
     proposalId: binding.proposalId,
@@ -2214,8 +2235,8 @@ export function prepareAgentPaymentTransactions(value) {
       }),
       Object.freeze({
         ...transaction(vault, executeTreasuryTransferCalldata(action), 'Funded in-window execution reference'),
-        available: state.execution?.executableNow === true,
-        gate: state.execution?.executableNow === true
+        available: executionAvailable,
+        gate: executionAvailable
           ? 'Exact execution simulation succeeded at the pinned block.'
           : 'Unavailable at the pinned block.'
       })

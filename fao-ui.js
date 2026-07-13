@@ -3,6 +3,22 @@ import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-man
 import * as fao from './fao.js';
 
 export const SEPOLIA_CHAIN_ID = 11155111n;
+export const BUYBACK_ACTION_STATES = Object.freeze({
+  refreshNeeded: 'refresh-needed',
+  ready: 'ready',
+  inFlight: 'in-flight',
+  confirmedRefreshNeeded: 'confirmed-refresh-needed'
+});
+
+export function buybackActionStateAfterRefresh(current) {
+  if (!Object.values(BUYBACK_ACTION_STATES).includes(current)) {
+    throw new Error('Invalid buyback action state.');
+  }
+  if (current === BUYBACK_ACTION_STATES.inFlight) {
+    throw new Error('An in-flight buyback cannot be cleared by a state read.');
+  }
+  return BUYBACK_ACTION_STATES.ready;
+}
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 // Display curation is intentionally independent from permissionless registrar state.
@@ -155,6 +171,121 @@ function addressFromWord(value, label) {
   return fao.normalizeAddress(`0x${word.slice(-40)}`);
 }
 
+function uintFromWord(value, label, bits = 256) {
+  const word = fao.normalizeHex(value, 32, label);
+  const number = BigInt(word);
+  if (number >= (1n << BigInt(bits))) throw new Error(`${label} does not fit uint${bits}.`);
+  return number;
+}
+
+function rpcQuantity(value, label) {
+  if (typeof value !== 'string' || !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(value)) {
+    throw new Error(`${label} is not a canonical RPC quantity.`);
+  }
+  return BigInt(value);
+}
+
+export async function readBuybackModel(value) {
+  const input = exactRecord(value, ['chainId', 'vault', 'executor', 'request'], 'Buyback read input');
+  fao.assertChainId(input.chainId, fao.BUYBACK_CHAIN_ID);
+  const vault = fao.normalizeAddress(input.vault);
+  const executor = fao.normalizeAddress(input.executor);
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+
+  const block = await input.request('eth_getBlockByNumber', ['latest', false]);
+  if (!block || typeof block.number !== 'string' || typeof block.timestamp !== 'string') {
+    throw new Error('RPC returned an invalid latest block.');
+  }
+  const blockTag = block.number;
+  rpcQuantity(blockTag, 'Buyback block number');
+  const timestamp = rpcQuantity(block.timestamp, 'Buyback block timestamp');
+  const call = (to, data) => input.request('eth_call', [{ to, data }, blockTag]);
+  const selectors = fao.BUYBACK_SELECTORS;
+  const [wethWord, phase, effectiveSupply, buybackWindow, buybackDailyCap,
+    buybackDailyBps, buybackNavBps, buybackTwapWindow, buybackMaxTickDeviation,
+    buybackWindowStart, buybackWethSpent] = await Promise.all([
+    call(vault, selectors.weth),
+    call(vault, selectors.phase),
+    call(vault, selectors.effectiveSupply),
+    call(executor, selectors.window),
+    call(executor, selectors.dailyCap),
+    call(executor, selectors.dailyBps),
+    call(executor, selectors.navBps),
+    call(executor, selectors.twapWindow),
+    call(executor, selectors.maxTickDeviation),
+    call(executor, selectors.windowStart),
+    call(executor, selectors.wethSpent)
+  ]);
+  const weth = addressFromWord(wethWord, 'vault.WETH');
+  const executorWeth = await call(
+    weth, fao.encodeCalldata(selectors.balanceOf, [fao.addressWord(executor)])
+  );
+  return fao.deriveBuybackModel({
+    timestamp,
+    phase: uintFromWord(phase, 'vault.phase', 8),
+    executorWeth: uintFromWord(executorWeth, 'WETH.balanceOf(executor)'),
+    effectiveSupply: uintFromWord(effectiveSupply, 'vault.effectiveSupply'),
+    buybackWindowStart: uintFromWord(buybackWindowStart, 'executor.buybackWindowStart', 64),
+    buybackWethSpent: uintFromWord(buybackWethSpent, 'executor.buybackWethSpent', 192),
+    buybackWindow: uintFromWord(buybackWindow, 'executor.BUYBACK_WINDOW'),
+    buybackDailyCap: uintFromWord(buybackDailyCap, 'executor.BUYBACK_DAILY_CAP'),
+    buybackDailyBps: uintFromWord(buybackDailyBps, 'executor.BUYBACK_DAILY_BPS'),
+    buybackNavBps: uintFromWord(buybackNavBps, 'executor.BUYBACK_NAV_BPS'),
+    buybackTwapWindow: uintFromWord(buybackTwapWindow, 'executor.BUYBACK_TWAP_WINDOW', 32),
+    buybackMaxTickDeviation: uintFromWord(
+      buybackMaxTickDeviation, 'executor.BUYBACK_MAX_TICK_DEVIATION', 23
+    )
+  });
+}
+
+export async function submitBuybackOnce(operations) {
+  const required = [
+    'getActionState', 'setActionState', 'refreshBeforeSend', 'send', 'wait', 'decode',
+    'onConfirmed', 'refreshAfterConfirmed'
+  ];
+  if (!operations || typeof operations !== 'object'
+    || required.some((key) => typeof operations[key] !== 'function')) {
+    throw new Error(`Buyback submission requires: ${required.join(', ')}.`);
+  }
+  const states = BUYBACK_ACTION_STATES;
+  if (operations.getActionState() !== states.ready) {
+    throw new Error('Buyback submission is disabled until the current state is refreshed.');
+  }
+  operations.setActionState(states.inFlight);
+  let receiptConfirmed = false;
+  try {
+    const model = await operations.refreshBeforeSend();
+    if (!model?.canSubmit) {
+      throw new Error(model?.deterministicReasons?.join(' ') || 'Buyback is not currently callable.');
+    }
+    const hash = await operations.send();
+    const receipt = await operations.wait(hash);
+    if (!receipt || BigInt(receipt.status) !== 1n) throw new Error(`Buyback transaction reverted: ${hash}`);
+    receiptConfirmed = true;
+
+    let event;
+    try {
+      event = operations.decode(receipt);
+    } catch (decodeError) {
+      operations.setActionState(states.confirmedRefreshNeeded);
+      return Object.freeze({ hash, receipt, event: null, decodeError, refreshError: null });
+    }
+
+    operations.setActionState(states.confirmedRefreshNeeded);
+    operations.onConfirmed({ hash, receipt, event });
+    try {
+      await operations.refreshAfterConfirmed();
+      operations.setActionState(buybackActionStateAfterRefresh(operations.getActionState()));
+      return Object.freeze({ hash, receipt, event, decodeError: null, refreshError: null });
+    } catch (refreshError) {
+      return Object.freeze({ hash, receipt, event, decodeError: null, refreshError });
+    }
+  } catch (error) {
+    operations.setActionState(receiptConfirmed ? states.confirmedRefreshNeeded : states.ready);
+    throw error;
+  }
+}
+
 export async function verifyTreasuryManifest(manifest, request) {
   if (typeof request !== 'function') throw new Error('An RPC request function is required.');
   const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
@@ -299,7 +430,9 @@ let state = {
   flmSealed: false,
   treasuryManifest: null,
   treasuryRecords: null,
-  treasuryFlow: null
+  treasuryFlow: null,
+  buybackModel: null,
+  buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded
 };
 
 function rpc(method, params = []) {
@@ -354,6 +487,62 @@ function renderTreasuryGate() {
   const enabled = Boolean(treasuryNetworkReady());
   for (const form of elements.treasuryForms) form.querySelector('button[type="submit"]').disabled = !enabled;
   for (const button of elements.treasurySteps.querySelectorAll('button')) button.disabled = !enabled;
+  elements.refreshBuyback.disabled = !enabled
+    || state.buybackActionState === BUYBACK_ACTION_STATES.inFlight;
+  elements.executeBuyback.disabled = !enabled || !state.buybackModel?.canSubmit
+    || state.buybackActionState !== BUYBACK_ACTION_STATES.ready;
+}
+
+function setBuybackActionState(next) {
+  if (!Object.values(BUYBACK_ACTION_STATES).includes(next)) throw new Error('Invalid buyback action state.');
+  state.buybackActionState = next;
+  elements.buybackTransactionState.textContent = {
+    [BUYBACK_ACTION_STATES.refreshNeeded]: 'Refresh needed',
+    [BUYBACK_ACTION_STATES.ready]: 'Ready to submit',
+    [BUYBACK_ACTION_STATES.inFlight]: 'Transaction in flight',
+    [BUYBACK_ACTION_STATES.confirmedRefreshNeeded]: 'Confirmed · refresh needed'
+  }[next];
+  renderTreasuryGate();
+}
+
+function format18(value) {
+  if (value == null) return '—';
+  const number = BigInt(value);
+  const whole = number / (10n ** 18n);
+  const fraction = (number % (10n ** 18n)).toString().padStart(18, '0').replace(/0+$/, '');
+  return `${whole}${fraction ? `.${fraction}` : ''}`;
+}
+
+function formatTimestamp(value) {
+  const milliseconds = BigInt(value) * 1000n;
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) return String(value);
+  const date = new Date(Number(milliseconds));
+  return Number.isNaN(date.valueOf()) ? String(value) : date.toISOString();
+}
+
+function renderBuybackModel() {
+  const model = state.buybackModel;
+  elements.buybackPhase.textContent = model ? (model.isLive ? 'LIVE' : `Not LIVE (phase ${model.phase})`) : '—';
+  elements.buybackWeth.textContent = model ? `${format18(model.executorWeth)} WETH` : '—';
+  elements.buybackSupply.textContent = model ? `${format18(model.effectiveSupply)} FAO` : '—';
+  elements.buybackNav.textContent = model?.navWethPerTokenWad == null
+    ? '—'
+    : `${format18(model.navWethPerTokenWad)} WETH (95%: ${format18(model.triggerWethPerTokenWad)})`;
+  elements.buybackSpent.textContent = model
+    ? `${format18(model.actualSpent)} WETH${model.windowActive ? ` · ends ${formatTimestamp(model.windowEndsAt)}` : ' · no active window'}`
+    : '—';
+  elements.buybackPercentCap.textContent = model ? `${format18(model.percentCap)} WETH` : '—';
+  elements.buybackRawCap.textContent = model ? `${format18(model.rawCap)} WETH` : '—';
+  elements.buybackAvailable.textContent = model ? `${format18(model.available)} WETH` : '—';
+  elements.buybackChecks.replaceChildren();
+  if (model) {
+    for (const reason of [...model.deterministicReasons, ...model.marketChecks]) {
+      const item = document.createElement('li');
+      item.textContent = reason;
+      elements.buybackChecks.append(item);
+    }
+  }
+  renderTreasuryGate();
 }
 
 function renderInstances() {
@@ -658,19 +847,118 @@ async function loadTreasuryManifest(event) {
   if (!state.account || state.walletChainId !== SEPOLIA_CHAIN_ID || state.rpcChainId !== SEPOLIA_CHAIN_ID) {
     throw new Error('Connect a wallet with matching Sepolia wallet and RPC chain IDs first.');
   }
+  state.treasuryManifest = null;
+  state.treasuryRecords = null;
+  state.treasuryFlow = null;
+  state.buybackModel = null;
+  setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+  renderBuybackModel();
   const manifest = JSON.parse(elements.treasuryManifestForm.elements.manifest.value);
   const records = await verifyTreasuryManifest(manifest, rpc);
   state.treasuryManifest = manifest;
   state.treasuryRecords = records;
-  state.treasuryFlow = null;
   elements.treasuryPlan.hidden = true;
   elements.treasuryExecutor.textContent = records.executor;
   elements.treasuryVault.textContent = records.vault;
-  setMessage(
-    elements.treasuryStatus,
-    'Executor runtime and vault ↔ executor ↔ gateway ↔ arbitration wiring verified on Sepolia.'
-  );
+  await refreshBuybackState(false);
+  setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+  setMessage(elements.treasuryStatus, 'Executor runtime, custody wiring, and buyback state verified on Sepolia.');
   renderTreasuryGate();
+}
+
+async function refreshBuybackState(reverify = true) {
+  if (!treasuryNetworkReady() || !state.treasuryManifest) {
+    throw new Error('Reconnect and verify the treasury manifest before reading buyback state.');
+  }
+  if (reverify) {
+    const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
+    if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
+      throw new Error('Treasury manifest wiring changed.');
+    }
+  }
+  state.buybackModel = await readBuybackModel({
+    chainId: SEPOLIA_CHAIN_ID,
+    vault: state.treasuryRecords.vault,
+    executor: state.treasuryRecords.executor,
+    request: rpc
+  });
+  renderBuybackModel();
+  return state.buybackModel;
+}
+
+async function refreshBuybackForUser() {
+  if (state.buybackActionState === BUYBACK_ACTION_STATES.inFlight) {
+    throw new Error('Wait for the in-flight buyback transaction to confirm.');
+  }
+  const wasConfirmed = state.buybackActionState === BUYBACK_ACTION_STATES.confirmedRefreshNeeded;
+  if (!wasConfirmed) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+  const model = await refreshBuybackState(true);
+  setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+  setMessage(
+    elements.buybackStatus,
+    wasConfirmed
+      ? 'Confirmed transaction state refreshed. A new submission is enabled only if the current policy allows it.'
+      : 'Buyback state refreshed from one Sepolia block.'
+  );
+  return model;
+}
+
+async function sendBuyback() {
+  const plan = fao.prepareBuyback({
+    chainId: SEPOLIA_CHAIN_ID,
+    vault: state.treasuryRecords.vault
+  });
+  const result = await submitBuybackOnce({
+    getActionState: () => state.buybackActionState,
+    setActionState: setBuybackActionState,
+    refreshBeforeSend: () => refreshBuybackState(true),
+    send: async () => {
+      const hash = await rpc('eth_sendTransaction', [{
+        from: state.account,
+        to: plan.target,
+        data: plan.data
+      }]);
+      setMessage(elements.buybackStatus, `${plan.label} submitted: ${hash}. Waiting for confirmation…`);
+      return hash;
+    },
+    wait: waitForReceipt,
+    decode: (receipt) => {
+      const log = receipt.logs?.find((entry) => (
+        typeof entry?.address === 'string'
+        && entry.address.toLowerCase() === plan.target
+        && entry.topics?.[0]?.toLowerCase() === fao.BUYBACK_EVENT_TOPIC
+      ));
+      if (!log) throw new Error('Confirmed transaction did not emit the expected Buyback event.');
+      return fao.decodeBuybackLog(log, plan.target);
+    },
+    onConfirmed: ({ hash, event }) => {
+      elements.buybackLatest.textContent =
+        `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
+      setMessage(elements.buybackStatus, `${plan.label} confirmed: ${hash}. Refreshing state…`);
+    },
+    refreshAfterConfirmed: () => refreshBuybackState(false)
+  });
+  if (result.decodeError) {
+    setMessage(
+      elements.buybackStatus,
+      `Transaction ${result.hash} confirmed, but its Buyback event could not be decoded. Do not submit again; refresh state before any further call. ${errorMessage(result.decodeError)}`,
+      true
+    );
+    return result;
+  }
+  if (result.refreshError) {
+    setMessage(
+      elements.buybackStatus,
+      `${plan.label} confirmed: ${result.hash}. The transaction succeeded, but the later state refresh failed. Do not submit again; use Refresh buyback state. ${errorMessage(result.refreshError)}`,
+      true
+    );
+    return result;
+  }
+  setMessage(
+    elements.buybackStatus,
+    `${plan.label} confirmed: ${result.hash}. ${format18(result.event.companyBurned)} FAO was literally burned; state refreshed.`
+  );
+  return result;
 }
 
 function prepareTreasury(event) {
@@ -791,7 +1079,15 @@ function bindElements() {
     treasuryAcceptance: byId('treasury-acceptance'), treasurySteps: byId('treasury-steps'),
     treasuryTransferForm: byId('treasury-transfer-form'),
     treasuryParamForm: byId('treasury-param-form'),
-    treasuryCriticalForm: byId('treasury-critical-form')
+    treasuryCriticalForm: byId('treasury-critical-form'),
+    refreshBuyback: byId('refresh-buyback'), executeBuyback: byId('execute-buyback'),
+    buybackTransactionState: byId('buyback-transaction-state'),
+    buybackPhase: byId('buyback-phase'), buybackWeth: byId('buyback-weth'),
+    buybackSupply: byId('buyback-supply'), buybackNav: byId('buyback-nav'),
+    buybackSpent: byId('buyback-spent'), buybackPercentCap: byId('buyback-percent-cap'),
+    buybackRawCap: byId('buyback-raw-cap'), buybackAvailable: byId('buyback-available'),
+    buybackChecks: byId('buyback-checks'), buybackStatus: byId('buyback-status'),
+    buybackLatest: byId('buyback-latest')
   };
   elements.treasuryForms = Object.freeze([
     elements.treasuryTransferForm, elements.treasuryParamForm, elements.treasuryCriticalForm
@@ -812,10 +1108,12 @@ async function initialize() {
     state.treasuryManifest = null;
     state.treasuryRecords = null;
     state.treasuryFlow = null;
+    state.buybackModel = null;
+    setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
     elements.treasuryPlan.hidden = true;
     elements.treasuryExecutor.textContent = 'Not verified';
     elements.treasuryVault.textContent = 'Not verified';
-    renderTreasuryGate();
+    renderBuybackModel();
   });
   for (const form of elements.treasuryForms) form.addEventListener('submit', (event) => {
     try {
@@ -824,6 +1122,10 @@ async function initialize() {
       setMessage(elements.treasuryStatus, errorMessage(error), true);
     }
   });
+  elements.refreshBuyback.addEventListener('click', () => refreshBuybackForUser()
+    .catch((error) => setMessage(elements.buybackStatus, errorMessage(error), true)));
+  elements.executeBuyback.addEventListener('click', () => sendBuyback()
+    .catch((error) => setMessage(elements.buybackStatus, errorMessage(error), true)));
   elements.showUnverified.addEventListener('change', renderInstances);
   elements.connect.addEventListener('click', () => syncConnection(true).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
   elements.refresh.addEventListener('click', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));

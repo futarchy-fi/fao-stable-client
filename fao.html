@@ -415,6 +415,37 @@
             </label>
             <button type="submit">Prepare two-round flow</button>
           </form>
+
+          <article class="action-card" aria-labelledby="buyback-heading">
+            <h3 id="buyback-heading">Fixed-policy buyback</h3>
+            <p>
+              Calling buyback controls timing only. The contract fixes the amount, recipient,
+              30-minute TWAP, guard, mean ± 50-tick price clamp, and literal burn.
+            </p>
+            <p class="details">
+              Accepted queued WETH payments are not reserved against buyback. Review both before
+              calling.
+            </p>
+            <dl>
+              <div><dt>Transaction state</dt><dd id="buyback-transaction-state">Refresh needed</dd></div>
+              <div><dt>Phase</dt><dd id="buyback-phase">—</dd></div>
+              <div><dt>Executor WETH</dt><dd><code id="buyback-weth">—</code></dd></div>
+              <div><dt>Effective supply</dt><dd><code id="buyback-supply">—</code></dd></div>
+              <div><dt>WETH-only NAV / FAO</dt><dd><code id="buyback-nav">—</code></dd></div>
+              <div><dt>Anchored-window spent</dt><dd><code id="buyback-spent">—</code></dd></div>
+              <div><dt>1% live balance cap</dt><dd><code id="buyback-percent-cap">—</code></dd></div>
+              <div><dt>Raw cap</dt><dd><code id="buyback-raw-cap">—</code></dd></div>
+              <div><dt>Available now</dt><dd><code id="buyback-available">—</code></dd></div>
+            </dl>
+            <p class="details">A call can still revert for these live market checks:</p>
+            <ul id="buyback-checks"></ul>
+            <div class="actions">
+              <button id="refresh-buyback" type="button" disabled>Refresh buyback state</button>
+              <button id="execute-buyback" type="button" disabled>Call buyback</button>
+            </div>
+            <p id="buyback-status" class="message" role="status" aria-live="polite"></p>
+            <p id="buyback-latest" class="details"></p>
+          </article>
         </div>
 
         <div id="treasury-plan" class="exact-assets" hidden>

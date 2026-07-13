@@ -5,17 +5,23 @@ import test from 'node:test';
 import {
   CORE_CODE_KEYS,
   FLM_CODE_KEYS,
+  BUYBACK_EVENT_TOPIC,
+  BUYBACK_INTENT,
+  BUYBACK_SELECTORS,
   SELECTORS,
   TREASURY_KINDS,
   approveCalldata,
   assertChainId,
   boolWord,
+  buybackCalldata,
   claimCalldata,
   createPlan,
   criticalActionHash,
   criticalBaseHash,
   criticalBasePayload,
   criticalEvaluationPayload,
+  decodeBuybackHistory,
+  deriveBuybackModel,
   depositToSpotCalldata,
   encodeBytes,
   encodeCoreCommitment,
@@ -36,6 +42,7 @@ import {
   normalizeHex,
   predictCalldata,
   prepareTreasuryFlow,
+  prepareBuyback,
   prepareRagequit,
   proposeCriticalRoundCalldata,
   proposeParamCalldata,
@@ -174,6 +181,113 @@ test('dependency-free Ethereum Keccak-256 matches canonical vectors', () => {
   assert.equal(keccak256(`0x${'a5'.repeat(200)}`), cast('keccak', `0x${'a5'.repeat(200)}`));
 });
 
+test('buyback planner is parameterless, chain-bound, and exposes safe intent', () => {
+  assert.equal(SELECTORS.buyback, cast('sig', 'buyback()'));
+  assert.equal(buybackCalldata(), cast('calldata', 'buyback()'));
+  assert.equal(BUYBACK_EVENT_TOPIC, cast('keccak', 'Buyback(address,uint256,uint256)'));
+  for (const [key, signature] of Object.entries({
+    weth: 'WETH()',
+    phase: 'phase()',
+    effectiveSupply: 'effectiveSupply()',
+    window: 'BUYBACK_WINDOW()',
+    dailyCap: 'BUYBACK_DAILY_CAP()',
+    dailyBps: 'BUYBACK_DAILY_BPS()',
+    navBps: 'BUYBACK_NAV_BPS()',
+    twapWindow: 'BUYBACK_TWAP_WINDOW()',
+    maxTickDeviation: 'BUYBACK_MAX_TICK_DEVIATION()',
+    windowStart: 'buybackWindowStart()',
+    wethSpent: 'buybackWethSpent()',
+    balanceOf: 'balanceOf(address)'
+  })) assert.equal(BUYBACK_SELECTORS[key], cast('sig', signature));
+  assert.deepEqual(prepareBuyback({ chainId: 11155111n, vault: address(9) }), {
+    chainId: 11155111n,
+    target: address(9),
+    data: '0xf8ec6911',
+    label: 'Permissionless fixed-policy buyback',
+    intent: BUYBACK_INTENT
+  });
+  assert.match(BUYBACK_INTENT, /controls timing only/);
+  assert.match(BUYBACK_INTENT, /queued WETH payments are not reserved/);
+  assert.throws(
+    () => prepareBuyback({ chainId: 1, vault: address(9) }),
+    /wrong chain/
+  );
+  assert.throws(
+    () => prepareBuyback({ chainId: 11155111, vault: '0x1234' }),
+    /address/
+  );
+});
+
+test('buyback model follows the anchored window and live-balance cap exactly', () => {
+  const base = {
+    timestamp: 2_000n,
+    phase: 2n,
+    executorWeth: 5n * 10n ** 17n,
+    effectiveSupply: 100n * 10n ** 18n,
+    buybackWindowStart: 1_000n,
+    buybackWethSpent: 2n * 10n ** 15n,
+    buybackWindow: 86_400n,
+    buybackDailyCap: 10n ** 16n,
+    buybackDailyBps: 100n,
+    buybackNavBps: 9_500n,
+    buybackTwapWindow: 1_800n,
+    buybackMaxTickDeviation: 50n
+  };
+  const initial = deriveBuybackModel(base);
+  assert.equal(initial.navWethPerTokenWad, 5n * 10n ** 15n);
+  assert.equal(initial.triggerWethPerTokenWad, 4_750_000_000_000_000n);
+  assert.equal(initial.percentCap, 5n * 10n ** 15n);
+  assert.equal(initial.liveCap, 5n * 10n ** 15n);
+  assert.equal(initial.actualSpent, 2n * 10n ** 15n);
+  assert.equal(initial.available, 3n * 10n ** 15n);
+  assert.equal(initial.canSubmit, true);
+
+  const afterDeposit = deriveBuybackModel({ ...base, executorWeth: 2n * 10n ** 18n });
+  assert.equal(afterDeposit.percentCap, 2n * 10n ** 16n);
+  assert.equal(afterDeposit.liveCap, 10n ** 16n);
+  assert.equal(afterDeposit.available, 8n * 10n ** 15n);
+
+  const afterOutflow = deriveBuybackModel({ ...base, executorWeth: 10n ** 17n });
+  assert.equal(afterOutflow.liveCap, 10n ** 15n);
+  assert.equal(afterOutflow.available, 0n);
+  assert.match(afterOutflow.deterministicReasons[0], /exhausted/);
+
+  const rolled = deriveBuybackModel({ ...base, timestamp: 87_400n });
+  assert.equal(rolled.windowActive, false);
+  assert.equal(rolled.windowStart, null);
+  assert.equal(rolled.actualSpent, 0n);
+  assert.equal(rolled.available, 5n * 10n ** 15n);
+});
+
+test('buyback event history decodes exact indexed caller and rejects alien ABI data', () => {
+  const vault = address(7);
+  const caller = address(8);
+  const transactionHash = hash('ab');
+  const log = {
+    address: vault,
+    topics: [BUYBACK_EVENT_TOPIC, `0x${caller.slice(2).padStart(64, '0')}`],
+    data: `0x${uintWord(123n)}${uintWord(456n)}`,
+    transactionHash
+  };
+  assert.deepEqual(decodeBuybackHistory([log], vault), [{
+    vault,
+    caller,
+    wethSpent: 123n,
+    companyBurned: 456n,
+    transactionHash
+  }]);
+  assert.throws(() => decodeBuybackHistory([log], address(99)), /address does not match/);
+  assert.throws(
+    () => decodeBuybackHistory([{ ...log, topics: [hash('11'), log.topics[1]] }], vault),
+    /wrong event topic/
+  );
+  assert.throws(() => decodeBuybackHistory([{ ...log, data: '0x00' }], vault), /exactly 64 bytes/);
+  assert.throws(
+    () => decodeBuybackHistory([{ ...log, topics: [BUYBACK_EVENT_TOPIC, hash('ff')] }], vault),
+    /not an ABI address/
+  );
+});
+
 test('economic config ABI encodings and hashes match Solidity abi.encode', () => {
   const { coreConfig, grants, flmConfig, currentTimestamp } = creationInput();
   const coreArgument = coreCastArgument(coreConfig);
@@ -248,9 +362,9 @@ test('self-serve creation rejects malformed economic and bytecode inputs', () =>
   assert.throws(
     () => createPlan({
       ...input,
-      grants: Array.from({ length: 33 }, () => input.grants[0])
+      grants: Array.from({ length: 17 }, () => input.grants[0])
     }),
-    /more than 32/
+    /more than 16/
   );
   assert.throws(
     () => createPlan({

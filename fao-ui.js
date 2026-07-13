@@ -7,6 +7,7 @@ export const BUYBACK_ACTION_STATES = Object.freeze({
   refreshNeeded: 'refresh-needed',
   ready: 'ready',
   inFlight: 'in-flight',
+  submittedUnknown: 'submitted-unknown',
   confirmedRefreshNeeded: 'confirmed-refresh-needed'
 });
 
@@ -14,8 +15,8 @@ export function buybackActionStateAfterRefresh(current) {
   if (!Object.values(BUYBACK_ACTION_STATES).includes(current)) {
     throw new Error('Invalid buyback action state.');
   }
-  if (current === BUYBACK_ACTION_STATES.inFlight) {
-    throw new Error('An in-flight buyback cannot be cleared by a state read.');
+  if ([BUYBACK_ACTION_STATES.inFlight, BUYBACK_ACTION_STATES.submittedUnknown].includes(current)) {
+    throw new Error('An unresolved buyback cannot be cleared by a state read.');
   }
   return BUYBACK_ACTION_STATES.ready;
 }
@@ -35,24 +36,254 @@ export function latestRequestGate() {
   });
 }
 
-export function singleFlightGate() {
-  let active = null;
+export const TRACKED_OPERATION_STATES = Object.freeze({
+  preBroadcast: 'pre-broadcast',
+  walletRequested: 'wallet-requested',
+  submitted: 'submitted',
+  confirmed: 'confirmed',
+  reverted: 'reverted',
+  cancelled: 'cancelled',
+  failed: 'failed'
+});
+
+const PENDING_OPERATION_STATES = new Set([
+  TRACKED_OPERATION_STATES.preBroadcast,
+  TRACKED_OPERATION_STATES.walletRequested,
+  TRACKED_OPERATION_STATES.submitted
+]);
+
+export function trackedOperationController({ limit = 8, onChange = () => {} } = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || typeof onChange !== 'function') {
+    throw new Error('Tracked operation controller options are invalid.');
+  }
+  let nextId = 0;
+  const journal = [];
+  const snapshots = () => Object.freeze(journal.map((operation) => Object.freeze({ ...operation })));
+  const trim = () => {
+    while (journal.length > limit) {
+      const index = journal.findLastIndex((operation) => !PENDING_OPERATION_STATES.has(operation.state));
+      if (index === -1) return;
+      journal.splice(index, 1);
+    }
+  };
+  const changed = () => {
+    trim();
+    onChange(snapshots());
+  };
+  const known = (operation) => journal.includes(operation);
+  const transition = (operation, from, state, patch = {}) => {
+    if (!known(operation) || !from.includes(operation.state)) {
+      throw new Error('Tracked operation transition is invalid.');
+    }
+    Object.assign(operation, patch, { state });
+    changed();
+    return operation;
+  };
   return Object.freeze({
-    begin() {
-      if (active) return null;
-      active = Object.freeze({});
-      return active;
+    begin(context) {
+      if (!context || Array.isArray(context) || typeof context !== 'object') {
+        throw new Error('Tracked operation context is required.');
+      }
+      const kind = String(context.kind || '').trim();
+      const label = String(context.label || '').trim().slice(0, 120);
+      if (!kind || !label || journal.some((operation) => (
+        operation.kind === kind && PENDING_OPERATION_STATES.has(operation.state)
+      ))) return null;
+      const chainId_ = fao.assertChainId(context.chainId).toString();
+      const account = fao.normalizeAddress(context.account);
+      const vault = context.vault == null ? null : fao.normalizeAddress(context.vault);
+      const target = context.target == null ? null : fao.normalizeAddress(context.target);
+      if (!vault && !target) throw new Error('Tracked operation requires a vault or target.');
+      const operation = {
+        id: ++nextId,
+        kind,
+        label,
+        chainId: chainId_,
+        account,
+        vault,
+        target,
+        state: TRACKED_OPERATION_STATES.preBroadcast,
+        hash: null,
+        key: null,
+        receiptStatus: null,
+        receiptBlockNumber: null,
+        error: null
+      };
+      journal.unshift(operation);
+      changed();
+      return operation;
     },
-    current(operation) {
-      return operation === active;
+    pending(kind) {
+      return journal.find((operation) => (
+        operation.kind === kind && PENDING_OPERATION_STATES.has(operation.state)
+      )) || null;
     },
-    finish(operation) {
-      if (operation !== active) return false;
-      active = null;
-      return true;
+    isPending(operation) {
+      return known(operation) && PENDING_OPERATION_STATES.has(operation.state);
+    },
+    walletRequested(operation) {
+      return transition(
+        operation, [TRACKED_OPERATION_STATES.preBroadcast],
+        TRACKED_OPERATION_STATES.walletRequested
+      );
+    },
+    submitted(operation, hash) {
+      const normalizedHash = fao.normalizeHex(hash, 32, 'Transaction hash');
+      const subject = operation.vault || operation.target;
+      return transition(
+        operation, [TRACKED_OPERATION_STATES.walletRequested],
+        TRACKED_OPERATION_STATES.submitted,
+        { hash: normalizedHash, key: `${operation.chainId}:${subject}:${normalizedHash}`, error: null }
+      );
+    },
+    noteUnknown(operation, error) {
+      if (!known(operation) || operation.state !== TRACKED_OPERATION_STATES.submitted) {
+        throw new Error('Only a submitted operation can have an unknown receipt.');
+      }
+      operation.error = String(error?.message || error || 'Transaction receipt is unknown.').slice(0, 240);
+      changed();
+      return operation;
+    },
+    noteWalletUnknown(operation, error) {
+      if (!known(operation) || operation.state !== TRACKED_OPERATION_STATES.walletRequested) {
+        throw new Error('Only a wallet-requested operation can have an unknown hash.');
+      }
+      operation.error = String(error?.message || error || 'Wallet request outcome is unknown.').slice(0, 240);
+      changed();
+      return operation;
+    },
+    settle(operation, receipt) {
+      const status = BigInt(receipt?.status);
+      if (status !== 0n && status !== 1n) throw new Error('Transaction receipt status is invalid.');
+      const receiptBlockNumber = receipt?.blockNumber == null
+        ? null
+        : rpcQuantity(receipt.blockNumber, 'Transaction receipt block number').toString();
+      if (known(operation)
+        && [TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
+        if (operation.receiptStatus !== status.toString()) {
+          throw new Error('Resolved transaction receipts disagree.');
+        }
+        if (operation.receiptBlockNumber != null && receiptBlockNumber != null
+          && operation.receiptBlockNumber !== receiptBlockNumber) {
+          throw new Error('Resolved transaction receipt blocks disagree.');
+        }
+        if (operation.receiptBlockNumber == null && receiptBlockNumber != null) {
+          operation.receiptBlockNumber = receiptBlockNumber;
+          changed();
+        }
+        return operation;
+      }
+      return transition(
+        operation, [TRACKED_OPERATION_STATES.submitted],
+        status === 1n ? TRACKED_OPERATION_STATES.confirmed : TRACKED_OPERATION_STATES.reverted,
+        { receiptStatus: status.toString(), receiptBlockNumber, error: null }
+      );
+    },
+    cancel(operation, reason = 'Inputs changed before the wallet request.') {
+      return transition(
+        operation, [TRACKED_OPERATION_STATES.preBroadcast],
+        TRACKED_OPERATION_STATES.cancelled,
+        { error: String(reason).slice(0, 240) }
+      );
+    },
+    fail(operation, error) {
+      return transition(
+        operation,
+        [TRACKED_OPERATION_STATES.preBroadcast, TRACKED_OPERATION_STATES.walletRequested],
+        TRACKED_OPERATION_STATES.failed,
+        { error: String(error?.message || error || 'Operation failed.').slice(0, 240) }
+      );
+    },
+    entries() {
+      return snapshots();
     }
   });
 }
+
+function trackedResult(operation, { blocked = false, receipt = null, error = null } = {}) {
+  return Object.freeze({ operation, blocked, receipt, error });
+}
+
+export async function runTrackedTransaction({
+  controller, context, verify, stillCurrent, send, wait, onUpdate = () => {}
+}) {
+  if (!controller || typeof controller.begin !== 'function' || typeof verify !== 'function'
+    || typeof stillCurrent !== 'function' || typeof send !== 'function'
+    || typeof wait !== 'function' || typeof onUpdate !== 'function') {
+    throw new Error('Tracked transaction operations are invalid.');
+  }
+  const operation = controller.begin(context);
+  if (!operation) return trackedResult(controller.pending(context.kind), { blocked: true });
+  const current = () => {
+    try {
+      return Boolean(stillCurrent());
+    } catch {
+      return false;
+    }
+  };
+  const update = () => {
+    if (current()) onUpdate(operation);
+  };
+  try {
+    await verify(operation);
+  } catch (error) {
+    if (current()) controller.fail(operation, error);
+    else controller.cancel(operation);
+    update();
+    return trackedResult(operation, { error });
+  }
+  if (!current()) {
+    controller.cancel(operation);
+    update();
+    return trackedResult(operation);
+  }
+  controller.walletRequested(operation);
+  update();
+  let hash;
+  try {
+    hash = await send(operation);
+    controller.submitted(operation, hash);
+  } catch (error) {
+    if (error?.code === 4001) controller.fail(operation, error);
+    else controller.noteWalletUnknown(operation, error);
+    update();
+    return trackedResult(operation, { error });
+  }
+  update();
+  let receipt;
+  try {
+    receipt = await wait(hash, operation);
+    controller.settle(operation, receipt);
+  } catch (error) {
+    if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      controller.noteUnknown(operation, error);
+    }
+    update();
+    return trackedResult(operation, { error });
+  }
+  update();
+  return trackedResult(operation, { receipt });
+}
+
+export async function reconcileTrackedOperation(controller, operation, readReceipt) {
+  if (!controller?.isPending(operation) || operation.state !== TRACKED_OPERATION_STATES.submitted
+    || typeof readReceipt !== 'function') {
+    throw new Error('A submitted tracked operation is required for reconciliation.');
+  }
+  let receipt;
+  try {
+    receipt = await readReceipt(operation.hash, operation);
+    if (!receipt) throw new Error('Transaction receipt is not available yet.');
+    controller.settle(operation, receipt);
+  } catch (error) {
+    if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      controller.noteUnknown(operation, error);
+    }
+    return trackedResult(operation, { error });
+  }
+  return trackedResult(operation, { receipt });
+}
+
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 const MAX_AGENT_PAYMENT_VIEWS = 100;
@@ -243,7 +474,7 @@ export async function readBuybackModel(value) {
     throw new Error('RPC returned an invalid latest block.');
   }
   const blockTag = block.number;
-  rpcQuantity(blockTag, 'Buyback block number');
+  const blockNumber = rpcQuantity(blockTag, 'Buyback block number');
   const timestamp = rpcQuantity(block.timestamp, 'Buyback block timestamp');
   const call = (to, data) => input.request('eth_call', [{ to, data }, blockTag]);
   const selectors = fao.BUYBACK_SELECTORS;
@@ -266,7 +497,7 @@ export async function readBuybackModel(value) {
   const executorWeth = await call(
     weth, fao.encodeCalldata(selectors.balanceOf, [fao.addressWord(executor)])
   );
-  return fao.deriveBuybackModel({
+  return Object.freeze({ blockNumber, ...fao.deriveBuybackModel({
     timestamp,
     phase: uintFromWord(phase, 'vault.phase', 8),
     executorWeth: uintFromWord(executorWeth, 'WETH.balanceOf(executor)'),
@@ -281,54 +512,24 @@ export async function readBuybackModel(value) {
     buybackMaxTickDeviation: uintFromWord(
       buybackMaxTickDeviation, 'executor.BUYBACK_MAX_TICK_DEVIATION', 23
     )
-  });
+  }) });
 }
 
-export async function submitBuybackOnce(operations) {
-  const required = [
-    'getActionState', 'setActionState', 'refreshBeforeSend', 'send', 'wait', 'decode',
-    'onConfirmed', 'refreshAfterConfirmed'
-  ];
-  if (!operations || typeof operations !== 'object'
-    || required.some((key) => typeof operations[key] !== 'function')) {
-    throw new Error(`Buyback submission requires: ${required.join(', ')}.`);
+function assertBuybackStateCoversReceipt(model, receipt, operation) {
+  if (!model || typeof model.blockNumber !== 'bigint') {
+    throw new Error('Buyback current-state read did not expose its block number.');
   }
-  const states = BUYBACK_ACTION_STATES;
-  if (operations.getActionState() !== states.ready) {
-    throw new Error('Buyback submission is disabled until the current state is refreshed.');
+  let receiptBlock;
+  if (receipt?.blockNumber != null) {
+    receiptBlock = rpcQuantity(receipt.blockNumber, 'Buyback receipt block number');
+  } else if (typeof operation?.receiptBlockNumber === 'string'
+    && /^(?:0|[1-9][0-9]*)$/.test(operation.receiptBlockNumber)) {
+    receiptBlock = BigInt(operation.receiptBlockNumber);
+  } else {
+    throw new Error('Resolved buyback receipt did not expose its block number.');
   }
-  operations.setActionState(states.inFlight);
-  let receiptConfirmed = false;
-  try {
-    const model = await operations.refreshBeforeSend();
-    if (!model?.canSubmit) {
-      throw new Error(model?.deterministicReasons?.join(' ') || 'Buyback is not currently callable.');
-    }
-    const hash = await operations.send();
-    const receipt = await operations.wait(hash);
-    if (!receipt || BigInt(receipt.status) !== 1n) throw new Error(`Buyback transaction reverted: ${hash}`);
-    receiptConfirmed = true;
-
-    let event;
-    try {
-      event = operations.decode(receipt);
-    } catch (decodeError) {
-      operations.setActionState(states.confirmedRefreshNeeded);
-      return Object.freeze({ hash, receipt, event: null, decodeError, refreshError: null });
-    }
-
-    operations.setActionState(states.confirmedRefreshNeeded);
-    operations.onConfirmed({ hash, receipt, event });
-    try {
-      await operations.refreshAfterConfirmed();
-      operations.setActionState(buybackActionStateAfterRefresh(operations.getActionState()));
-      return Object.freeze({ hash, receipt, event, decodeError: null, refreshError: null });
-    } catch (refreshError) {
-      return Object.freeze({ hash, receipt, event, decodeError: null, refreshError });
-    }
-  } catch (error) {
-    operations.setActionState(receiptConfirmed ? states.confirmedRefreshNeeded : states.ready);
-    throw error;
+  if (model.blockNumber < receiptBlock) {
+    throw new Error('Buyback current-state read predates the resolved transaction receipt.');
   }
 }
 
@@ -725,20 +926,24 @@ let state = {
   treasuryFlowRequest: null,
   buybackModel: null,
   buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded,
-  buybackOperation: null,
-  buybackTransactionHash: null,
   agentWork: null
 };
 const agentWorkRequests = latestRequestGate();
 const buybackRequests = latestRequestGate();
-const buybackSends = singleFlightGate();
+const buybackRefreshRequests = latestRequestGate();
 const connectionRequests = latestRequestGate();
 const creationPlanRequests = latestRequestGate();
-const creationStageSends = singleFlightGate();
 const receiptStateRequests = latestRequestGate();
 const treasuryFlowRequests = latestRequestGate();
 const treasuryManifestRequests = latestRequestGate();
-const treasuryStepSends = singleFlightGate();
+const trackedOperations = trackedOperationController({
+  onChange: () => {
+    if (!elements?.operationJournal) return;
+    renderOperationJournal();
+    if (elements.stageButtons) renderStages();
+    if (elements.treasuryForms) renderTreasuryGate();
+  }
+});
 
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
@@ -776,6 +981,14 @@ function treasuryManifestInputSnapshot() {
     state.walletChainId?.toString() || null,
     state.rpcChainId?.toString() || null,
     elements.treasuryManifestForm.elements.manifest.value
+  ]);
+}
+
+function buybackRefreshInputSnapshot() {
+  return JSON.stringify([
+    treasuryManifestInputSnapshot(),
+    state.treasuryRecords?.vault || null,
+    state.treasuryRecords?.executor || null
   ]);
 }
 
@@ -840,15 +1053,66 @@ function treasuryNetworkReady() {
     && state.rpcChainId === SEPOLIA_CHAIN_ID && state.treasuryRecords;
 }
 
+function buybackOperationOwnsCurrentCard(operation) {
+  if (!operation || operation.kind !== 'buyback' || !state.account || !state.treasuryRecords
+    || state.walletChainId !== SEPOLIA_CHAIN_ID || state.rpcChainId !== SEPOLIA_CHAIN_ID) return false;
+  let account;
+  try {
+    account = fao.normalizeAddress(state.account);
+  } catch {
+    return false;
+  }
+  return operation.chainId === SEPOLIA_CHAIN_ID.toString()
+    && operation.account === account
+    && operation.vault === state.treasuryRecords.vault;
+}
+
+function resetBuybackCard(message) {
+  setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+  setMessage(elements.buybackStatus, message);
+}
+
+function alignBuybackCardWithPending() {
+  const operation = trackedOperations.pending('buyback');
+  if (!operation) return false;
+  if (!buybackOperationOwnsCurrentCard(operation)) {
+    resetBuybackCard(
+      'A separately captured buyback operation remains in the transaction journal. This treasury card is not labeled with that operation.'
+    );
+    return true;
+  }
+  if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+    setBuybackActionState(BUYBACK_ACTION_STATES.submittedUnknown);
+    setMessage(
+      elements.buybackStatus,
+      `${operation.label} submitted: ${operation.hash}. Its receipt remains unknown; refresh to reconcile before retry.`,
+      true
+    );
+  } else {
+    setBuybackActionState(BUYBACK_ACTION_STATES.inFlight);
+    setMessage(
+      elements.buybackStatus,
+      `${operation.label}: the captured wallet request has not returned a transaction hash. No retry is enabled.`,
+      Boolean(operation.error)
+    );
+  }
+  return true;
+}
+
 function renderTreasuryGate() {
   const enabled = Boolean(treasuryNetworkReady());
+  const pendingBuyback = trackedOperations.pending('buyback');
+  const canReconcileBuyback = pendingBuyback?.state === TRACKED_OPERATION_STATES.submitted
+    && state.walletChainId?.toString() === pendingBuyback.chainId
+    && state.rpcChainId?.toString() === pendingBuyback.chainId;
   for (const form of elements.treasuryForms) form.querySelector('button[type="submit"]').disabled = !enabled;
-  for (const button of elements.treasurySteps.querySelectorAll('button')) button.disabled = !enabled;
-  elements.refreshBuyback.disabled = !enabled
-    || Boolean(state.buybackOperation)
+  for (const button of elements.treasurySteps.querySelectorAll('button')) {
+    button.disabled = !enabled || Boolean(trackedOperations.pending('treasury'));
+  }
+  elements.refreshBuyback.disabled = (!enabled && !canReconcileBuyback)
     || state.buybackActionState === BUYBACK_ACTION_STATES.inFlight;
   elements.executeBuyback.disabled = !enabled || !state.buybackModel?.canSubmit
-    || Boolean(state.buybackOperation)
+    || Boolean(pendingBuyback)
     || state.buybackActionState !== BUYBACK_ACTION_STATES.ready;
 }
 
@@ -871,6 +1135,7 @@ function setBuybackActionState(next) {
     [BUYBACK_ACTION_STATES.refreshNeeded]: 'Refresh needed',
     [BUYBACK_ACTION_STATES.ready]: 'Ready to submit',
     [BUYBACK_ACTION_STATES.inFlight]: 'Transaction in flight',
+    [BUYBACK_ACTION_STATES.submittedUnknown]: 'Submitted · receipt unknown',
     [BUYBACK_ACTION_STATES.confirmedRefreshNeeded]: 'Confirmed · refresh needed'
   }[next];
   renderTreasuryGate();
@@ -914,6 +1179,40 @@ function renderBuybackModel() {
     }
   }
   renderTreasuryGate();
+}
+
+function renderOperationJournal() {
+  const labels = {
+    [TRACKED_OPERATION_STATES.preBroadcast]: 'Pre-broadcast verification',
+    [TRACKED_OPERATION_STATES.walletRequested]: 'Wallet request invoked · hash pending',
+    [TRACKED_OPERATION_STATES.submitted]: 'Submitted · receipt unknown',
+    [TRACKED_OPERATION_STATES.confirmed]: 'Confirmed · receipt status 1',
+    [TRACKED_OPERATION_STATES.reverted]: 'Reverted · receipt status 0',
+    [TRACKED_OPERATION_STATES.cancelled]: 'Cancelled before wallet request',
+    [TRACKED_OPERATION_STATES.failed]: 'Failed before transaction hash'
+  };
+  const entries = trackedOperations.entries();
+  elements.operationJournal.replaceChildren();
+  elements.operationJournalEmpty.hidden = entries.length !== 0;
+  for (const operation of entries) {
+    const item = document.createElement('li');
+    item.className = 'stage-card';
+    const title = document.createElement('strong');
+    const identity = document.createElement('code');
+    const hash = document.createElement('code');
+    const detail = document.createElement('p');
+    title.textContent = `${operation.label} · ${labels[operation.state]}`;
+    identity.textContent = `chain ${operation.chainId} · ${operation.vault ? `vault ${operation.vault}` : `target ${operation.target}`} · account ${operation.account}`;
+    hash.textContent = operation.hash || `operation ${operation.id} · no hash yet`;
+    detail.className = 'details';
+    detail.textContent = [
+      operation.key,
+      operation.receiptBlockNumber == null ? null : `receipt block ${operation.receiptBlockNumber}`,
+      operation.error
+    ].filter(Boolean).join(' · ');
+    item.append(title, identity, hash, detail);
+    elements.operationJournal.append(item);
+  }
 }
 
 function agentWorkDetail(label, value) {
@@ -1081,7 +1380,8 @@ function renderStages() {
     elements.planCoreHash.textContent = state.creationPlan.hashes.core;
     elements.planFlmHash.textContent = state.creationPlan.hashes.flm;
   }
-  const ready = currentGate().canTransact && state.creationBundle && state.creationPlan;
+  const ready = currentGate().canTransact && state.creationBundle && state.creationPlan
+    && !trackedOperations.pending('creation');
   elements.stageButtons.receipt.disabled = !ready || state.receiptExists;
   elements.stageButtons.core.disabled = !ready || !state.receiptExists || state.coreSealed;
   elements.stageButtons.flm.disabled = !ready || !state.coreSealed || state.flmSealed;
@@ -1102,10 +1402,10 @@ async function loadManifest() {
   renderGate();
 }
 
-async function syncConnection(requestAccounts = false) {
-  const request = connectionRequests.begin(null);
+async function syncConnection(requestAccounts = false, request = connectionRequests.begin(null)) {
   agentWorkRequests.invalidate();
   buybackRequests.invalidate();
+  buybackRefreshRequests.invalidate();
   creationPlanRequests.invalidate();
   receiptStateRequests.invalidate();
   invalidateTreasuryFlow();
@@ -1114,6 +1414,7 @@ async function syncConnection(requestAccounts = false) {
   state.rpcChainId = null;
   state.codeState = 'unchecked';
   state.codeMessage = 'Checking wallet and RPC state…';
+  resetBuybackCard('Wallet context changed. Refresh the current treasury state before any buyback.');
   renderGate();
   if (!window.ethereum) {
     return;
@@ -1150,7 +1451,17 @@ async function syncConnection(requestAccounts = false) {
       state.codeMessage = errorMessage(error);
     }
   }
+  alignBuybackCardWithPending();
   renderGate();
+}
+
+function syncConnectionForUser(requestAccounts = false) {
+  const request = connectionRequests.begin(null);
+  return syncConnection(requestAccounts, request).catch((error) => {
+    if (connectionRequests.current(request, null)) {
+      setMessage(elements.connectionMessage, errorMessage(error), true);
+    }
+  });
 }
 
 function draftFromForm() {
@@ -1283,72 +1594,103 @@ async function waitForReceipt(hash) {
     if (receipt) return receipt;
     await new Promise((resolve) => setTimeout(resolve, 1_500));
   }
-  throw new Error(`Timed out waiting for ${hash}. The exact plan remains saved for resume.`);
+  throw new Error(`Timed out waiting for ${hash}. The operation journal retains this submitted hash for reconciliation.`);
 }
 
 async function sendCreationStage(event) {
-  const operation = creationStageSends.begin();
-  if (!operation) return;
   const stage = event.currentTarget.dataset.stage;
   const plan = state.creationPlan;
   const predictedReceipt = state.predictedReceipt;
   const preparedInput = state.preparedInput;
   const account = state.account;
-  const ownsStatus = () => creationStageSends.current(operation)
-    && state.creationPlan === plan
+  if (!plan || !predictedReceipt || !preparedInput || !account) {
+    setMessage(elements.stageStatus, 'Prepare and review an exact creation plan first.', true);
+    return;
+  }
+  const steps = {
+    receipt: { target: plan.registrar.target, data: plan.registrar.stage },
+    core: { target: predictedReceipt, data: plan.receipt.deployCore },
+    flm: { target: predictedReceipt, data: plan.receipt.deployFlm }
+  };
+  const step = steps[stage];
+  if (!step) {
+    setMessage(elements.stageStatus, 'Unknown creation stage.', true);
+    return;
+  }
+  const ownsCard = () => state.creationPlan === plan
     && state.predictedReceipt === predictedReceipt
     && state.preparedInput === preparedInput
-    && state.account === account;
-  try {
-    if (!plan || !predictedReceipt || !preparedInput) {
-      throw new Error('Prepare and review an exact creation plan first.');
+    && state.account === account
+    && state.walletChainId === SEPOLIA_CHAIN_ID
+    && state.rpcChainId === SEPOLIA_CHAIN_ID;
+  const onUpdate = (operation) => {
+    if (operation.state === TRACKED_OPERATION_STATES.walletRequested) {
+      setMessage(
+        elements.stageStatus,
+        operation.error
+          ? `${stage}: wallet submission was invoked, but no transaction hash was returned. No retry is enabled. ${operation.error}`
+          : `${stage}: wallet submission requested. Waiting for its transaction hash…`,
+        Boolean(operation.error)
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      setMessage(
+        elements.stageStatus,
+        operation.error
+          ? `${stage} submitted: ${operation.hash}. Receipt remains unknown. ${operation.error}`
+          : `${stage} submitted: ${operation.hash}. Waiting for confirmation…`,
+        Boolean(operation.error)
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.reverted) {
+      setMessage(elements.stageStatus, `${stage} reverted: ${operation.hash}.`, true);
+    } else if (operation.state === TRACKED_OPERATION_STATES.failed) {
+      setMessage(elements.stageStatus, operation.error, true);
     }
-    if (!await refreshReceiptState() || !ownsStatus() || !currentGate().canTransact) {
-      throw new Error('Creation plan or wallet state changed during stage verification.');
+  };
+  const result = await runTrackedTransaction({
+    controller: trackedOperations,
+    context: {
+      kind: 'creation', label: `Creation · ${stage}`, chainId: SEPOLIA_CHAIN_ID,
+      account, target: step.target
+    },
+    verify: async () => {
+      if (!await refreshReceiptState() || !ownsCard() || !currentGate().canTransact) {
+        throw new Error('Creation plan or wallet state changed during stage verification.');
+      }
+      const ready = stage === 'receipt'
+        ? !state.receiptExists
+        : stage === 'core'
+          ? state.receiptExists && !state.coreSealed
+          : state.coreSealed && !state.flmSealed;
+      if (!ready) throw new Error(`${stage} is not the next resumable stage.`);
+      if (stage === 'core') {
+        const block = await rpc('eth_getBlockByNumber', ['latest', false]);
+        if (!block || BigInt(block.timestamp) >= BigInt(preparedInput.coreConfig.saleEnd)) {
+          throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
+        }
+      }
+    },
+    stillCurrent: () => ownsCard() && currentGate().canTransact,
+    send: () => rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]),
+    wait: waitForReceipt,
+    onUpdate
+  });
+  if (result.operation?.state === TRACKED_OPERATION_STATES.confirmed && ownsCard()) {
+    try {
+      if (await refreshReceiptState() && ownsCard()) {
+        setMessage(
+          elements.stageStatus,
+          `${stage} confirmed: ${result.operation.hash}. Any account may continue the remaining stages.`
+        );
+      }
+    } catch (error) {
+      if (ownsCard()) {
+        setMessage(
+          elements.stageStatus,
+          `${stage} confirmed: ${result.operation.hash}, but the later state refresh failed. ${errorMessage(error)}`,
+          true
+        );
+      }
     }
-    const steps = {
-      receipt: {
-        ready: !state.receiptExists,
-        target: plan.registrar.target,
-        data: plan.registrar.stage
-      },
-      core: {
-        ready: state.receiptExists && !state.coreSealed,
-        target: predictedReceipt,
-        data: plan.receipt.deployCore
-      },
-      flm: {
-        ready: state.coreSealed && !state.flmSealed,
-        target: predictedReceipt,
-        data: plan.receipt.deployFlm
-      }
-    };
-    const step = steps[stage];
-    if (!step?.ready) throw new Error(`${stage} is not the next resumable stage.`);
-    if (stage === 'core') {
-      const block = await rpc('eth_getBlockByNumber', ['latest', false]);
-      if (!block || BigInt(block.timestamp) >= BigInt(preparedInput.coreConfig.saleEnd)) {
-        throw new Error('The prepared sale end is no longer in the future. Prepare a new FAO configuration.');
-      }
-      if (!ownsStatus() || !currentGate().canTransact) {
-        throw new Error('Creation plan or wallet state changed during sale-end verification.');
-      }
-    }
-    const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
-    if (ownsStatus()) setMessage(elements.stageStatus, `${stage} submitted: ${hash}. Waiting for confirmation…`);
-    const receipt = await waitForReceipt(hash);
-    if (BigInt(receipt.status) !== 1n) throw new Error(`${stage} transaction reverted: ${hash}`);
-    if (ownsStatus()) {
-      await refreshReceiptState();
-      if (ownsStatus()) {
-        setMessage(elements.stageStatus, `${stage} confirmed: ${hash}. Any account may continue the remaining stages.`);
-      }
-    }
-  } catch (error) {
-    if (ownsStatus()) setMessage(elements.stageStatus, errorMessage(error), true);
-  } finally {
-    creationStageSends.finish(operation);
-    renderStages();
   }
 }
 
@@ -1419,7 +1761,7 @@ async function loadTreasuryManifest(form, request) {
   state.agentWork = null;
   agentWorkRequests.invalidate();
   buybackRequests.invalidate();
-  if (!state.buybackOperation) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+  resetBuybackCard('Treasury manifest verification changed this card identity. Earlier operations remain in the journal.');
   renderBuybackModel();
   renderAgentWork();
   const manifest = JSON.parse(form.elements.manifest.value);
@@ -1437,7 +1779,7 @@ async function loadTreasuryManifest(form, request) {
   elements.treasuryExecutor.textContent = records.executor;
   elements.treasuryVault.textContent = records.vault;
   renderBuybackModel();
-  if (!state.buybackOperation) {
+  if (!alignBuybackCardWithPending()) {
     setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
   }
   setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
@@ -1564,118 +1906,201 @@ async function refreshBuybackState(reverify = true) {
   }
 }
 
-async function refreshBuybackForUser() {
-  if (state.buybackActionState === BUYBACK_ACTION_STATES.inFlight) {
-    throw new Error('Wait for the in-flight buyback transaction to confirm.');
+async function refreshBuybackForUser(request) {
+  let resolved = null;
+  const pending = trackedOperations.pending('buyback');
+  if (pending) {
+    if (pending.state !== TRACKED_OPERATION_STATES.submitted || !pending.hash) {
+      alignBuybackCardWithPending();
+      return null;
+    }
+    resolved = await reconcileTrackedOperation(
+      trackedOperations,
+      pending,
+      (hash) => rpc('eth_getTransactionReceipt', [hash])
+    );
+    if (!buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) return null;
+    const ownsResolvedCard = buybackOperationOwnsCurrentCard(resolved.operation);
+    if (resolved.operation.state === TRACKED_OPERATION_STATES.submitted) {
+      if (ownsResolvedCard) {
+        setBuybackActionState(BUYBACK_ACTION_STATES.submittedUnknown);
+        setMessage(
+          elements.buybackStatus,
+          `Transaction ${pending.hash} remains submitted with no canonical receipt yet. No new buyback can be sent. ${pending.error || ''}`,
+          true
+        );
+      } else {
+        resetBuybackCard(
+          'A separately captured buyback remains unresolved in the transaction journal. This treasury card is not labeled with that operation.'
+        );
+      }
+      return null;
+    }
+    setBuybackActionState(
+      ownsResolvedCard && resolved.operation.state === TRACKED_OPERATION_STATES.confirmed
+        ? BUYBACK_ACTION_STATES.confirmedRefreshNeeded
+        : BUYBACK_ACTION_STATES.refreshNeeded
+    );
+  } else if (state.buybackActionState === BUYBACK_ACTION_STATES.inFlight) {
+    throw new Error('Wait for the wallet submission request to return.');
   }
-  const wasConfirmed = state.buybackActionState === BUYBACK_ACTION_STATES.confirmedRefreshNeeded;
+  const resolvedOwnsCard = resolved && buybackOperationOwnsCurrentCard(resolved.operation);
+  const wasConfirmed = (resolvedOwnsCard
+    && resolved.operation.state === TRACKED_OPERATION_STATES.confirmed)
+    || (!resolved && state.buybackActionState === BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
   if (!wasConfirmed) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   const model = await refreshBuybackState(true);
-  if (!model) return null;
+  if (!model || !buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) return null;
+  if (resolved) assertBuybackStateCoversReceipt(model, resolved.receipt, resolved.operation);
   setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
   setMessage(
     elements.buybackStatus,
-    wasConfirmed
-      ? 'Confirmed transaction state refreshed. A new submission is enabled only if the current policy allows it.'
-      : 'Buyback state refreshed from one Sepolia block.'
+    resolvedOwnsCard
+      ? `${resolved.operation.label} ${resolved.operation.state}: ${resolved.operation.hash}. Current buyback state refreshed from Sepolia.`
+      : resolved
+        ? 'Current buyback state refreshed from Sepolia. A separately captured operation was reconciled only in the transaction journal.'
+        : wasConfirmed
+          ? 'Confirmed transaction state refreshed. A new submission is enabled only if the current policy allows it.'
+          : 'Buyback state refreshed from one Sepolia block.'
   );
   return model;
 }
 
+function refreshBuybackForUserEvent() {
+  const request = buybackRefreshRequests.begin(buybackRefreshInputSnapshot());
+  return refreshBuybackForUser(request).catch((error) => {
+    if (buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) {
+      setMessage(elements.buybackStatus, errorMessage(error), true);
+    }
+  });
+}
+
 async function sendBuyback() {
-  const operation = buybackSends.begin();
-  if (!operation) return null;
-  state.buybackOperation = operation;
-  state.buybackTransactionHash = null;
-  renderTreasuryGate();
   const manifest = state.treasuryManifest;
   const records = state.treasuryRecords;
   const account = state.account;
-  const ownsStatus = () => buybackSends.current(operation)
-    && state.buybackOperation === operation
-    && state.treasuryManifest === manifest
+  if (!manifest || !records || !account || trackedOperations.pending('buyback')
+    || state.buybackActionState !== BUYBACK_ACTION_STATES.ready) {
+    setMessage(elements.buybackStatus, 'Verify and refresh treasury custody before calling buyback.', true);
+    return null;
+  }
+  const plan = fao.prepareBuyback({ chainId: SEPOLIA_CHAIN_ID, vault: records.vault });
+  const ownsCard = () => state.treasuryManifest === manifest
     && state.treasuryRecords === records
-    && state.account === account;
-  try {
-    if (!manifest || !records || !account) {
-      throw new Error('Verify treasury custody and connect a wallet first.');
+    && state.account === account
+    && state.walletChainId === SEPOLIA_CHAIN_ID
+    && state.rpcChainId === SEPOLIA_CHAIN_ID;
+  const onUpdate = (operation) => {
+    if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      setBuybackActionState(BUYBACK_ACTION_STATES.submittedUnknown);
+    } else if (operation.state === TRACKED_OPERATION_STATES.confirmed) {
+      setBuybackActionState(
+        ownsCard() ? BUYBACK_ACTION_STATES.confirmedRefreshNeeded : BUYBACK_ACTION_STATES.refreshNeeded
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.reverted
+      || operation.state === TRACKED_OPERATION_STATES.cancelled) {
+      setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+    } else if (operation.state === TRACKED_OPERATION_STATES.failed) {
+      setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
     }
-    const plan = fao.prepareBuyback({ chainId: SEPOLIA_CHAIN_ID, vault: records.vault });
-    const result = await submitBuybackOnce({
-      getActionState: () => state.buybackActionState,
-      setActionState: setBuybackActionState,
-      refreshBeforeSend: async () => {
-        const model = await refreshBuybackState(true);
-        if (!model || state.treasuryManifest !== manifest || state.treasuryRecords !== records
-          || state.account !== account || !treasuryNetworkReady()) {
-          throw new Error('Treasury configuration or wallet state changed during buyback verification.');
-        }
-        return model;
-      },
-      send: async () => {
-        const hash = await rpc('eth_sendTransaction', [{ from: account, to: plan.target, data: plan.data }]);
-        if (buybackSends.current(operation) && state.buybackOperation === operation) {
-          state.buybackTransactionHash = hash;
-        }
-        if (ownsStatus()) {
-          setMessage(elements.buybackStatus, `${plan.label} submitted: ${hash}. Waiting for confirmation…`);
-        }
-        return hash;
-      },
-      wait: waitForReceipt,
-      decode: (receipt) => {
-        const log = receipt.logs?.find((entry) => (
-          typeof entry?.address === 'string'
-          && entry.address.toLowerCase() === plan.target
-          && entry.topics?.[0]?.toLowerCase() === fao.BUYBACK_EVENT_TOPIC
-        ));
-        if (!log) throw new Error('Confirmed transaction did not emit the expected Buyback event.');
-        return fao.decodeBuybackLog(log, plan.target);
-      },
-      onConfirmed: ({ hash, event }) => {
-        if (!ownsStatus()) return;
-        elements.buybackLatest.textContent =
-          `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
-        setMessage(elements.buybackStatus, `${plan.label} confirmed: ${hash}. Refreshing state…`);
-      },
-      refreshAfterConfirmed: async () => {
-        const model = await refreshBuybackState(false);
-        if (!model) throw new Error('Treasury configuration changed during the confirmed-state refresh.');
-        return model;
-      }
-    });
-    if (!ownsStatus()) return result;
-    if (result.decodeError) {
+    if (operation.state === TRACKED_OPERATION_STATES.walletRequested) {
       setMessage(
         elements.buybackStatus,
-        `Transaction ${result.hash} confirmed, but its Buyback event could not be decoded. Do not submit again; refresh state before any further call. ${errorMessage(result.decodeError)}`,
+        operation.error
+          ? `${plan.label}: wallet submission was invoked, but no transaction hash was returned. No retry is enabled. ${operation.error}`
+          : `${plan.label}: wallet submission requested. Waiting for its hash…`,
+        Boolean(operation.error)
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      setMessage(
+        elements.buybackStatus,
+        operation.error
+          ? `${plan.label} submitted: ${operation.hash}. Receipt remains unknown; use Refresh buyback state to reconcile. ${operation.error}`
+          : `${plan.label} submitted: ${operation.hash}. Waiting for confirmation…`,
+        Boolean(operation.error)
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.reverted) {
+      setMessage(elements.buybackStatus, `${plan.label} reverted: ${operation.hash}.`, true);
+    } else if (operation.state === TRACKED_OPERATION_STATES.failed) {
+      setMessage(elements.buybackStatus, operation.error, true);
+    }
+  };
+  setBuybackActionState(BUYBACK_ACTION_STATES.inFlight);
+  const result = await runTrackedTransaction({
+    controller: trackedOperations,
+    context: {
+      kind: 'buyback', label: plan.label, chainId: SEPOLIA_CHAIN_ID,
+      account, vault: records.vault, target: plan.target
+    },
+    verify: async () => {
+      const model = await refreshBuybackState(true);
+      if (!model || !ownsCard() || !treasuryNetworkReady()) {
+        throw new Error('Treasury configuration or wallet state changed during buyback verification.');
+      }
+      if (!model.canSubmit) {
+        throw new Error(model.deterministicReasons.join(' ') || 'Buyback is not currently callable.');
+      }
+    },
+    stillCurrent: () => ownsCard() && treasuryNetworkReady(),
+    send: () => rpc('eth_sendTransaction', [{ from: account, to: plan.target, data: plan.data }]),
+    wait: waitForReceipt,
+    onUpdate
+  });
+  const operation = result.operation;
+  if (!operation || !ownsCard()
+    || ![TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
+    return result;
+  }
+  let event = null;
+  let decodeError = null;
+  if (operation.state === TRACKED_OPERATION_STATES.confirmed) {
+    try {
+      const log = result.receipt.logs?.find((entry) => (
+        typeof entry?.address === 'string'
+        && entry.address.toLowerCase() === plan.target
+        && entry.topics?.[0]?.toLowerCase() === fao.BUYBACK_EVENT_TOPIC
+      ));
+      if (!log) throw new Error('Confirmed transaction did not emit the expected Buyback event.');
+      event = fao.decodeBuybackLog(log, plan.target);
+    } catch (error) {
+      decodeError = error;
+    }
+  }
+  try {
+    const model = await refreshBuybackState(false);
+    if (!model || !ownsCard()) return result;
+    assertBuybackStateCoversReceipt(model, result.receipt, operation);
+    setBuybackActionState(BUYBACK_ACTION_STATES.ready);
+    if (operation.state === TRACKED_OPERATION_STATES.reverted) {
+      setMessage(
+        elements.buybackStatus,
+        `${plan.label} reverted: ${operation.hash}. Current state refreshed; policy permits a later retry only if still callable.`,
         true
       );
-    } else if (result.refreshError) {
+    } else if (decodeError) {
       setMessage(
         elements.buybackStatus,
-        `${plan.label} confirmed: ${result.hash}. The transaction succeeded, but the later state refresh failed. Do not submit again; use Refresh buyback state. ${errorMessage(result.refreshError)}`,
+        `${plan.label} confirmed: ${operation.hash}. Current state refreshed, but the Buyback event could not be decoded. ${errorMessage(decodeError)}`,
         true
       );
     } else {
+      elements.buybackLatest.textContent =
+        `Latest: ${format18(event.wethSpent)} WETH spent and ${format18(event.companyBurned)} FAO burned by ${event.caller}.`;
       setMessage(
         elements.buybackStatus,
-        `${plan.label} confirmed: ${result.hash}. ${format18(result.event.companyBurned)} FAO was literally burned; state refreshed.`
+        `${plan.label} confirmed: ${operation.hash}. ${format18(event.companyBurned)} FAO was literally burned; state refreshed.`
       );
     }
-    return result;
   } catch (error) {
-    if (state.buybackTransactionHash && state.buybackOperation === operation
-      && state.buybackActionState === BUYBACK_ACTION_STATES.ready) {
-      setBuybackActionState(BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
+    if (ownsCard()) {
+      setMessage(
+        elements.buybackStatus,
+        `${plan.label} ${operation.state}: ${operation.hash}. The receipt is resolved, but current-state refresh failed. ${errorMessage(error)}`,
+        true
+      );
     }
-    if (ownsStatus()) setMessage(elements.buybackStatus, errorMessage(error), true);
-    return null;
-  } finally {
-    if (state.buybackOperation === operation) state.buybackOperation = null;
-    buybackSends.finish(operation);
-    renderTreasuryGate();
   }
+  return result;
 }
 
 function prepareTreasury(event) {
@@ -1753,48 +2178,68 @@ async function sendTreasuryStep(index, flow, form, request) {
   if (state.treasuryFlow !== flow || state.treasuryFlowForm !== form
     || state.treasuryFlowRequest !== request
     || !treasuryFlowRequests.current(request, treasuryFlowInputSnapshot(form))) return;
-  const operation = treasuryStepSends.begin();
-  if (!operation) return;
   const manifest = state.treasuryManifest;
   const records = state.treasuryRecords;
   const account = state.account;
-  const ownsStatus = () => treasuryStepSends.current(operation)
-    && state.treasuryManifest === manifest
+  const step = flow.steps[index];
+  if (!step || !manifest || !records || !account) {
+    setMessage(elements.treasuryStatus, 'Reconnect and verify the treasury manifest before sending.', true);
+    return;
+  }
+  const ownsCard = () => state.treasuryManifest === manifest
     && state.treasuryRecords === records
     && state.treasuryFlow === flow
     && state.treasuryFlowForm === form
     && state.treasuryFlowRequest === request
     && state.account === account
+    && state.walletChainId === SEPOLIA_CHAIN_ID
+    && state.rpcChainId === SEPOLIA_CHAIN_ID
     && treasuryFlowRequests.current(request, treasuryFlowInputSnapshot(form));
-  try {
-    if (!treasuryNetworkReady() || !manifest || !records || !account) {
-      throw new Error('Reconnect and verify the treasury manifest before sending.');
-    }
-    const fresh = await verifyTreasuryManifest(manifest, rpc);
-    if (!ownsStatus()) return;
-    if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
-      throw new Error('Treasury manifest wiring changed.');
-    }
-    const step = flow.steps[index];
-    if (!step) throw new Error('Unknown treasury step.');
-    const hash = await rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]);
-    if (ownsStatus()) {
-      setMessage(elements.treasuryStatus, `${step.label} submitted: ${hash}. Waiting for confirmation…`);
-    }
-    const receipt = await waitForReceipt(hash);
-    if (BigInt(receipt.status) !== 1n) throw new Error(`${step.label} reverted: ${hash}`);
-    if (ownsStatus()) {
+  const onUpdate = (operation) => {
+    if (operation.state === TRACKED_OPERATION_STATES.walletRequested) {
       setMessage(
         elements.treasuryStatus,
-        `${step.label} confirmed: ${hash}. Re-check acceptance and timing before sending the next step.`
+        operation.error
+          ? `${step.label}: wallet submission was invoked, but no transaction hash was returned. No retry is enabled. ${operation.error}`
+          : `${step.label}: wallet submission requested. Waiting for its hash…`,
+        Boolean(operation.error)
       );
+    } else if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      setMessage(
+        elements.treasuryStatus,
+        operation.error
+          ? `${step.label} submitted: ${operation.hash}. Receipt remains unknown. ${operation.error}`
+          : `${step.label} submitted: ${operation.hash}. Waiting for confirmation…`,
+        Boolean(operation.error)
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.confirmed) {
+      setMessage(
+        elements.treasuryStatus,
+        `${step.label} confirmed: ${operation.hash}. Re-check acceptance and timing before sending the next step.`
+      );
+    } else if (operation.state === TRACKED_OPERATION_STATES.reverted) {
+      setMessage(elements.treasuryStatus, `${step.label} reverted: ${operation.hash}.`, true);
+    } else if (operation.state === TRACKED_OPERATION_STATES.failed) {
+      setMessage(elements.treasuryStatus, operation.error, true);
     }
-  } catch (error) {
-    if (ownsStatus()) setMessage(elements.treasuryStatus, errorMessage(error), true);
-  } finally {
-    treasuryStepSends.finish(operation);
-    renderTreasuryGate();
-  }
+  };
+  await runTrackedTransaction({
+    controller: trackedOperations,
+    context: {
+      kind: 'treasury', label: step.label, chainId: SEPOLIA_CHAIN_ID,
+      account, vault: records.vault, target: step.target
+    },
+    verify: async () => {
+      const fresh = await verifyTreasuryManifest(manifest, rpc);
+      if (fresh.vault !== records.vault || fresh.executor !== records.executor) {
+        throw new Error('Treasury manifest wiring changed.');
+      }
+    },
+    stillCurrent: () => ownsCard() && treasuryNetworkReady(),
+    send: () => rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]),
+    wait: waitForReceipt,
+    onUpdate
+  });
 }
 
 function unavailableAction(event) {
@@ -1836,6 +2281,8 @@ function bindElements() {
     buybackRawCap: byId('buyback-raw-cap'), buybackAvailable: byId('buyback-available'),
     buybackChecks: byId('buyback-checks'), buybackStatus: byId('buyback-status'),
     buybackLatest: byId('buyback-latest'),
+    operationJournal: byId('operation-journal'),
+    operationJournalEmpty: byId('operation-journal-empty'),
     agentWorkForm: byId('agent-work-form'),
     agentWorkVerification: byId('agent-work-verification'),
     agentWorkBlock: byId('agent-work-block'),
@@ -1854,6 +2301,7 @@ function bindElements() {
 
 async function initialize() {
   bindElements();
+  renderOperationJournal();
   elements.createForm.addEventListener('submit', saveDraft);
   elements.createForm.addEventListener('input', () => invalidatePreparedPlan('Draft changed. Prepare a new exact plan before staging.'));
   elements.preparePlan.addEventListener('click', () => {
@@ -1879,12 +2327,13 @@ async function initialize() {
     treasuryManifestRequests.invalidate();
     agentWorkRequests.invalidate();
     buybackRequests.invalidate();
+    buybackRefreshRequests.invalidate();
     state.treasuryManifest = null;
     state.treasuryRecords = null;
     invalidateTreasuryFlow();
     state.buybackModel = null;
     state.agentWork = null;
-    if (!state.buybackOperation) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+    resetBuybackCard('Treasury configuration changed. Earlier operations remain labeled only in the transaction journal.');
     elements.treasuryExecutor.textContent = 'Not verified';
     elements.treasuryVault.textContent = 'Not verified';
     renderBuybackModel();
@@ -1917,12 +2366,11 @@ async function initialize() {
   for (const form of elements.treasuryForms) form.addEventListener('input', () => {
     invalidateTreasuryFlow('Treasury action changed. Prepare and review a new exact flow before sending.');
   });
-  elements.refreshBuyback.addEventListener('click', () => refreshBuybackForUser()
-    .catch((error) => setMessage(elements.buybackStatus, errorMessage(error), true)));
+  elements.refreshBuyback.addEventListener('click', refreshBuybackForUserEvent);
   elements.executeBuyback.addEventListener('click', sendBuyback);
   elements.showUnverified.addEventListener('change', renderInstances);
-  elements.connect.addEventListener('click', () => syncConnection(true).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
-  elements.refresh.addEventListener('click', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
+  elements.connect.addEventListener('click', () => syncConnectionForUser(true));
+  elements.refresh.addEventListener('click', () => syncConnectionForUser(false));
   for (const form of document.querySelectorAll('#buy-form, #deposit-form, #redeem-form')) form.addEventListener('submit', unavailableAction);
   for (const button of document.querySelectorAll('[data-stage]')) {
     button.addEventListener('click', sendCreationStage);
@@ -1930,8 +2378,8 @@ async function initialize() {
   for (const button of document.querySelectorAll('[data-action], #execute-ragequit')) button.addEventListener('click', unavailableAction);
 
   if (window.ethereum?.on) {
-    window.ethereum.on('accountsChanged', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
-    window.ethereum.on('chainChanged', () => syncConnection(false).catch((error) => setMessage(elements.connectionMessage, errorMessage(error), true)));
+    window.ethereum.on('accountsChanged', () => syncConnectionForUser(false));
+    window.ethereum.on('chainChanged', () => syncConnectionForUser(false));
   }
 
   restoreDraft();

@@ -220,16 +220,20 @@ function lifecycleFixture({ accepted = true, queue = 'none', paid = false } = {}
 function lifecycleRequest(scenario, {
   proposalAccepted = true, proposalSettled = true, proposalState = 5n,
   queueExpiresAt = scenario.expiresAt, timestamp = 150n, staticError = null,
-  balanceMismatch = false
+  balanceMismatch = false, queueExecuted = scenario.executed.length !== 0,
+  queueExpired = false
 } = {}) {
   const proposalWords = [
     0n, 0n, 0n, 0n, 0n, proposalState, 3n,
     proposalSettled ? 1n : 0n, proposalAccepted ? 1n : 0n, 0n, 1n
   ];
   const hasQueue = scenario.queued.length === 1;
-  const queueWords = hasQueue
-    ? [scenario.executeAfter, queueExpiresAt, scenario.executed.length ? 1n : 0n, 0n]
-    : [0n, 0n, 0n, 0n];
+  const queueWords = [
+    hasQueue ? scenario.executeAfter : 0n,
+    hasQueue ? queueExpiresAt : 0n,
+    queueExecuted ? 1n : 0n,
+    queueExpired ? 1n : 0n
+  ];
   return async (method, params) => {
     if (method === 'eth_getLogs') {
       const { address: target, topics } = params[0];
@@ -317,6 +321,14 @@ test('proposal flags and queue widths must match canonical lifecycle states', as
   );
   await assert.rejects(
     readLifecycle(scenario, { queueExpiresAt: scenario.executeAfter }),
+    /window is invalid/
+  );
+  await assert.rejects(
+    readLifecycle(scenario, { queueExecuted: true, queueExpired: true }),
+    /window is invalid/
+  );
+  await assert.rejects(
+    readLifecycle(lifecycleFixture(), { queueExpired: true }),
     /window is invalid/
   );
 });

@@ -457,6 +457,17 @@
           <ol id="treasury-steps" class="stage-list"></ol>
         </div>
 
+        <article class="ragequit-card" aria-labelledby="operation-journal-heading">
+          <h3 id="operation-journal-heading">Transaction operation journal</h3>
+          <p>
+            Wallet requests remain labeled by their captured chain, vault or target, and account.
+            Changing the current manifest never relabels an earlier transaction. Refresh buyback
+            state reconciles a submitted buyback receipt before any retry can be enabled.
+          </p>
+          <p id="operation-journal-empty" class="details">No transaction operation has started.</p>
+          <ol id="operation-journal" class="stage-list" aria-live="polite"></ol>
+        </article>
+
         <article id="agent-work" class="ragequit-card" aria-labelledby="agent-work-heading">
           <div class="section-heading">
             <h3 id="agent-work-heading">Agent task → receipt → payment evidence</h3>

@@ -1974,15 +1974,19 @@ function decodeQueueView(value) {
   const words = abiWords(value, 4, 'Queued transfer view');
   const executeAfter = BigInt(words[0]);
   const expiresAt = BigInt(words[1]);
+  const executed = abiBool(words[2], 'Queued transfer executed');
+  const expired = abiBool(words[3], 'Queued transfer expired');
   if ((executeAfter === 0n) !== (expiresAt === 0n)
-    || (executeAfter !== 0n && expiresAt <= executeAfter)) {
+    || (executeAfter !== 0n && expiresAt <= executeAfter)
+    || (executeAfter === 0n && (executed || expired))
+    || (executed && expired)) {
     throw new Error('Queued transfer window is invalid.');
   }
   return Object.freeze({
     executeAfter,
     expiresAt,
-    executed: abiBool(words[2], 'Queued transfer executed'),
-    expired: abiBool(words[3], 'Queued transfer expired')
+    executed,
+    expired
   });
 }
 

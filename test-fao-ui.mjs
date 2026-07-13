@@ -4,6 +4,7 @@ import test from 'node:test';
 
 import {
   BUYBACK_ACTION_STATES,
+  TRACKED_OPERATION_STATES,
   buybackActionStateAfterRefresh,
   creationInputFromDraft,
   deriveNetworkGate,
@@ -11,8 +12,9 @@ import {
   latestRequestGate,
   parseExtraAssetInput,
   readBuybackModel,
-  singleFlightGate,
-  submitBuybackOnce,
+  reconcileTrackedOperation,
+  runTrackedTransaction,
+  trackedOperationController,
   validateCreationBundle,
   verifyAgentWorkProvenance,
   verifyTreasuryManifest,
@@ -115,12 +117,15 @@ test('latest request gate discards overlapping and input-stale completions', asy
 test('every async positive-state writer is generation-gated against stale success and error', async () => {
   const source = await readFile(new URL('./fao-ui.js', import.meta.url), 'utf8');
   for (const name of [
-    'agentWorkRequests', 'buybackRequests', 'connectionRequests', 'creationPlanRequests',
+    'agentWorkRequests', 'buybackRefreshRequests', 'buybackRequests',
+    'connectionRequests', 'creationPlanRequests',
     'receiptStateRequests', 'treasuryFlowRequests', 'treasuryManifestRequests'
   ]) {
     assert.match(source, new RegExp(`const ${name} = latestRequestGate\\(\\);`));
     assert.match(source, new RegExp(`${name}\\.current\\(`));
   }
+  assert.equal((source.match(/await runTrackedTransaction\(\{/g) || []).length, 3);
+  assert.match(source, /await reconcileTrackedOperation\(/);
 
   for (const label of ['treasury', 'creation', 'receipt', 'buyback']) {
     const gate = latestRequestGate();
@@ -152,7 +157,226 @@ test('every async positive-state writer is generation-gated against stale succes
   }
 });
 
-test('typed treasury edits revoke the exact prepared flow before any send', async () => {
+test('production transaction runner preserves timeout, status-0, and status-1 truth', async () => {
+  const context = {
+    kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+    account: address(9), vault: address(1), target: address(2)
+  };
+  for (const [receipt, expected] of [
+    [new Error('receipt RPC timeout'), TRACKED_OPERATION_STATES.submitted],
+    [{ status: '0x0' }, TRACKED_OPERATION_STATES.reverted],
+    [{ status: '0x1' }, TRACKED_OPERATION_STATES.confirmed]
+  ]) {
+    const controller = trackedOperationController();
+    const result = await runTrackedTransaction({
+      controller,
+      context,
+      verify: async () => {},
+      stillCurrent: () => true,
+      send: async () => hash('71'),
+      wait: async () => {
+        if (receipt instanceof Error) throw receipt;
+        return receipt;
+      }
+    });
+    assert.equal(result.operation.state, expected);
+    assert.equal(result.operation.hash, hash('71'));
+    assert.equal(result.operation.vault, address(1));
+    assert.equal(result.operation.account, address(9));
+    assert.equal(result.operation.chainId, '11155111');
+    assert.equal(
+      result.operation.key,
+      `11155111:${address(1)}:${hash('71')}`
+    );
+    if (expected === TRACKED_OPERATION_STATES.submitted) {
+      assert.match(result.operation.error, /timeout/);
+      assert.equal(controller.pending('buyback'), result.operation);
+    } else {
+      assert.equal(result.operation.receiptStatus, expected === TRACKED_OPERATION_STATES.confirmed ? '1' : '0');
+      assert.equal(controller.pending('buyback'), null);
+    }
+  }
+
+  const transitions = [];
+  const transitionController = trackedOperationController({
+    onChange: (entries) => transitions.push(entries[0].state)
+  });
+  let finishVerification;
+  const verification = new Promise((resolve) => { finishVerification = resolve; });
+  let transitionSends = 0;
+  const transitionRun = runTrackedTransaction({
+    controller: transitionController,
+    context,
+    verify: async () => verification,
+    stillCurrent: () => true,
+    send: async () => { transitionSends += 1; return hash('70'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  const duplicateBeforeWallet = await runTrackedTransaction({
+    controller: transitionController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { transitionSends += 1; return hash('70'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(duplicateBeforeWallet.blocked, true);
+  assert.deepEqual(transitions, [TRACKED_OPERATION_STATES.preBroadcast]);
+  finishVerification();
+  await transitionRun;
+  assert.equal(transitionSends, 1);
+  assert.deepEqual(transitions, [
+    TRACKED_OPERATION_STATES.preBroadcast,
+    TRACKED_OPERATION_STATES.walletRequested,
+    TRACKED_OPERATION_STATES.submitted,
+    TRACKED_OPERATION_STATES.confirmed
+  ]);
+
+  const unknownController = trackedOperationController();
+  const unknownHash = await runTrackedTransaction({
+    controller: unknownController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw new Error('provider disconnected after wallet invocation'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(unknownHash.operation.state, TRACKED_OPERATION_STATES.walletRequested);
+  assert.equal(unknownHash.operation.hash, null);
+  assert.ok(unknownController.pending('buyback'));
+
+  const rejectedController = trackedOperationController();
+  const rejected = Object.assign(new Error('user rejected request'), { code: 4001 });
+  const rejectedResult = await runTrackedTransaction({
+    controller: rejectedController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw rejected; },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(rejectedResult.operation.state, TRACKED_OPERATION_STATES.failed);
+  assert.equal(rejectedController.pending('buyback'), null);
+});
+
+test('production journal survives manifest switches and reconciliation owns liveness', async () => {
+  const controller = trackedOperationController();
+  const vaultA = address(1);
+  const vaultB = address(2);
+  let currentVault = vaultA;
+  let cardStatus = 'manifest A';
+  let sends = 0;
+  let announceSend;
+  const sendStarted = new Promise((resolve) => { announceSend = resolve; });
+  let returnHash;
+  const wallet = new Promise((resolve) => { returnHash = resolve; });
+  const context = {
+    kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+    account: address(9), vault: vaultA, target: address(3)
+  };
+  const updateCard = (operation) => {
+    cardStatus = operation.state;
+  };
+  const first = runTrackedTransaction({
+    controller,
+    context,
+    verify: async () => {},
+    stillCurrent: () => currentVault === vaultA,
+    send: async () => {
+      sends += 1;
+      announceSend();
+      return wallet;
+    },
+    wait: async () => { throw new Error('receipt timeout'); },
+    onUpdate: updateCard
+  });
+  await sendStarted;
+  currentVault = vaultB;
+  cardStatus = 'manifest B';
+  returnHash(hash('72'));
+  const submitted = await first;
+  assert.equal(submitted.operation.state, TRACKED_OPERATION_STATES.submitted);
+  assert.equal(submitted.operation.vault, vaultA);
+  assert.equal(submitted.operation.hash, hash('72'));
+  assert.equal(cardStatus, 'manifest B');
+
+  const duplicate = await runTrackedTransaction({
+    controller,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('73'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(duplicate.blocked, true);
+  assert.equal(sends, 1);
+
+  const unknown = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => null
+  );
+  assert.equal(unknown.operation.state, TRACKED_OPERATION_STATES.submitted);
+  assert.equal(controller.pending('buyback'), submitted.operation);
+  const confirmed = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => ({ status: '0x1' })
+  );
+  assert.equal(confirmed.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(cardStatus, 'manifest B');
+  assert.equal(controller.pending('buyback'), null);
+
+  const retry = await runTrackedTransaction({
+    controller,
+    context: { ...context, vault: vaultB },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('73'); },
+    wait: async () => ({ status: '0x0' })
+  });
+  assert.equal(retry.operation.state, TRACKED_OPERATION_STATES.reverted);
+  assert.equal(sends, 2);
+});
+
+test('completion after a post-hash manifest switch updates only the captured journal', async () => {
+  const controller = trackedOperationController();
+  const vaultA = address(1);
+  let currentVault = vaultA;
+  let cardStatus = 'manifest A';
+  let submitted;
+  const submittedSignal = new Promise((resolve) => { submitted = resolve; });
+  let finishReceipt;
+  const receipt = new Promise((resolve) => { finishReceipt = resolve; });
+  const resultPromise = runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account: address(9), vault: vaultA, target: address(3)
+    },
+    verify: async () => {},
+    stillCurrent: () => currentVault === vaultA,
+    send: async () => hash('74'),
+    wait: async () => receipt,
+    onUpdate: (operation) => {
+      if (operation.state === TRACKED_OPERATION_STATES.submitted) submitted();
+      cardStatus = operation.state;
+    }
+  });
+  await submittedSignal;
+  currentVault = address(2);
+  cardStatus = 'manifest B';
+  const reconciled = await reconcileTrackedOperation(
+    controller,
+    controller.pending('buyback'),
+    async () => ({ status: '0x1', blockNumber: '0x20' })
+  );
+  assert.equal(reconciled.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(reconciled.operation.receiptBlockNumber, '32');
+  finishReceipt({ status: '0x1', blockNumber: '0x20' });
+  const result = await resultPromise;
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(result.operation.vault, vaultA);
+  assert.equal(cardStatus, 'manifest B');
+});
+
+test('real treasury plan edits cancel before verification but not after wallet invocation', async () => {
   for (const [field, next] of [
     ['recipient', address(8)], ['amount', '2'], ['route', 'evaluated'], ['type', 'param']
   ]) {
@@ -160,10 +384,7 @@ test('typed treasury edits revoke the exact prepared flow before any send', asyn
       type: 'transfer', route: 'timeout', asset: address(4), recipient: address(5),
       amount: '1', salt: hash('11')
     };
-    const snapshot = () => JSON.stringify(input);
-    const generations = latestRequestGate();
-    const sends = singleFlightGate();
-    const request = generations.begin(snapshot());
+    const captured = JSON.stringify(input);
     const flow = prepareTreasuryFlow({
       chainId: 11155111, vault: address(1), gateway: address(2), executor: address(3),
       type: 'transfer', route: input.route,
@@ -172,127 +393,62 @@ test('typed treasury edits revoke the exact prepared flow before any send', asyn
       }
     });
     let finishVerification;
-    const verified = new Promise((resolve) => { finishVerification = resolve; });
-    let broadcasts = 0;
-    const send = async () => {
-      if (!generations.current(request, snapshot())) return;
-      const operation = sends.begin();
-      if (!operation) return;
-      try {
-        await verified;
-        if (!generations.current(request, snapshot())) return;
-        assert.ok(flow.steps[0].data.startsWith('0x'));
-        broadcasts += 1;
-      } finally {
-        sends.finish(operation);
-      }
-    };
-    const pending = send();
-    input[field] = next;
-    generations.invalidate();
-    finishVerification();
-    await pending;
-    assert.equal(broadcasts, 0, field);
-  }
-});
-
-test('operation locks survive configuration changes and own completion status', async () => {
-  const lock = singleFlightGate();
-  let active = null;
-  let actionState = BUYBACK_ACTION_STATES.ready;
-  let sends = 0;
-  let transactionHash = null;
-  let completedBy = null;
-  let manifest = 'manifest-a';
-  let status = 'submitted-a';
-  let finishReceipt;
-  const receipt = new Promise((resolve) => { finishReceipt = resolve; });
-  const call = async () => {
-    const operation = lock.begin();
-    if (!operation) return null;
-    active = operation;
-    const capturedManifest = manifest;
-    try {
-      return await submitBuybackOnce({
-        getActionState: () => actionState,
-        setActionState: (next) => { actionState = next; },
-        refreshBeforeSend: async () => ({ canSubmit: true, deterministicReasons: [] }),
-        send: async () => {
-          sends += 1;
-          transactionHash = hash('77');
-          return transactionHash;
-        },
-        wait: async () => receipt,
-        decode: () => ({ companyBurned: 1n }),
-        onConfirmed: () => {
-          if (!lock.current(operation)) return;
-          completedBy = operation;
-          if (manifest === capturedManifest) status = 'old confirmed';
-        },
-        refreshAfterConfirmed: async () => ({ canSubmit: false })
-      });
-    } finally {
-      if (active === operation) active = null;
-      lock.finish(operation);
-    }
-  };
-
-  const first = call();
-  await Promise.resolve();
-  assert.equal(sends, 1);
-  // Manifest edit/reload must not reset action state while the independent operation exists.
-  manifest = 'manifest-b';
-  status = 'new manifest';
-  if (!active) actionState = BUYBACK_ACTION_STATES.refreshNeeded;
-  if (!active) actionState = buybackActionStateAfterRefresh(actionState);
-  const second = await call();
-  assert.equal(second, null);
-  assert.equal(sends, 1);
-  assert.equal(transactionHash, hash('77'));
-  assert.equal(actionState, BUYBACK_ACTION_STATES.inFlight);
-  finishReceipt({ status: '0x1' });
-  await first;
-  assert.ok(completedBy);
-  assert.equal(status, 'new manifest');
-  assert.equal(active, null);
-  assert.equal(transactionHash, hash('77'));
-  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
-});
-
-test('single-flight stage sends and generation ownership suppress duplicate and stale status', async () => {
-  for (const label of ['creation', 'treasury']) {
-    const lock = singleFlightGate();
-    const generations = latestRequestGate();
-    let snapshot = `${label}-plan-a`;
-    const request = generations.begin(snapshot);
-    let finish;
-    const receipt = new Promise((resolve) => { finish = resolve; });
+    const verification = new Promise((resolve) => { finishVerification = resolve; });
     let sends = 0;
-    let status = 'submitted-a';
-    const run = async (fail = false) => {
-      const operation = lock.begin();
-      if (!operation) return;
-      try {
-        sends += 1;
-        await receipt;
-        if (fail) throw new Error('old failure');
-        if (lock.current(operation) && generations.current(request, snapshot)) status = 'old success';
-      } catch (error) {
-        if (lock.current(operation) && generations.current(request, snapshot)) status = error.message;
-      } finally {
-        lock.finish(operation);
-      }
-    };
-    const first = run(label === 'treasury');
-    await run();
-    assert.equal(sends, 1, label);
-    snapshot = `${label}-plan-b`;
-    generations.invalidate();
-    status = 'new plan';
-    finish();
-    await first;
-    assert.equal(status, 'new plan', label);
+    const pending = runTrackedTransaction({
+      controller: trackedOperationController(),
+      context: {
+        kind: 'treasury', label: flow.steps[0].label, chainId: 11155111,
+        account: address(9), vault: address(1), target: flow.steps[0].target
+      },
+      verify: async () => { await verification; assert.ok(flow.steps[0].data.startsWith('0x')); },
+      stillCurrent: () => JSON.stringify(input) === captured,
+      send: async () => { sends += 1; return hash('75'); },
+      wait: async () => ({ status: '0x1' })
+    });
+    input[field] = next;
+    finishVerification();
+    const result = await pending;
+    assert.equal(result.operation.state, TRACKED_OPERATION_STATES.cancelled, field);
+    assert.equal(sends, 0, field);
   }
+
+  const input = { recipient: address(5), amount: '1', type: 'transfer' };
+  const captured = JSON.stringify(input);
+  const controller = trackedOperationController();
+  let cardStatus = 'prepared';
+  let sends = 0;
+  let walletInvoked;
+  const invoked = new Promise((resolve) => { walletInvoked = resolve; });
+  let returnHash;
+  const wallet = new Promise((resolve) => { returnHash = resolve; });
+  const pending = runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'treasury', label: 'Transfer proposal', chainId: 11155111,
+      account: address(9), vault: address(1), target: address(2)
+    },
+    verify: async () => {},
+    stillCurrent: () => JSON.stringify(input) === captured,
+    send: async () => {
+      sends += 1;
+      walletInvoked();
+      return wallet;
+    },
+    wait: async () => ({ status: '0x1' }),
+    onUpdate: (operation) => {
+      cardStatus = operation.state;
+    }
+  });
+  await invoked;
+  input.amount = '2';
+  cardStatus = 'new form';
+  returnHash(hash('76'));
+  const result = await pending;
+  assert.equal(sends, 1);
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(result.operation.hash, hash('76'));
+  assert.equal(cardStatus, 'new form');
 });
 
 test('writes fail closed on RPC disagreement, wrong chain, and unverified code', () => {
@@ -616,6 +772,7 @@ test('buyback read is one-block, chain/address-bound, and rejects malformed ABI 
   const model = await readBuybackModel({
     chainId: 11155111, vault, executor, request
   });
+  assert.equal(model.blockNumber, 16n);
   assert.equal(model.executorWeth, 5n * 10n ** 17n);
   assert.equal(model.effectiveSupply, 100n * 10n ** 18n);
   assert.equal(model.available, 3n * 10n ** 15n);
@@ -644,67 +801,17 @@ test('buyback read is one-block, chain/address-bound, and rejects malformed ABI 
   );
 });
 
-test('buyback double-click keeps one transaction in flight and sends only once', async () => {
-  let actionState = BUYBACK_ACTION_STATES.ready;
-  let sends = 0;
-  let releasePreflight;
-  const preflight = new Promise((resolve) => { releasePreflight = resolve; });
-  const operations = {
-    getActionState: () => actionState,
-    setActionState: (next) => { actionState = next; },
-    refreshBeforeSend: () => preflight,
-    send: async () => { sends += 1; return hash('11'); },
-    wait: async () => ({ status: '0x1' }),
-    decode: () => ({ companyBurned: 1n }),
-    onConfirmed: () => {},
-    refreshAfterConfirmed: async () => {}
-  };
-
-  const first = submitBuybackOnce(operations);
-  assert.equal(actionState, BUYBACK_ACTION_STATES.inFlight);
-  await assert.rejects(submitBuybackOnce(operations), /disabled until.*refreshed/);
-  assert.equal(sends, 0);
-  releasePreflight({ canSubmit: true, deterministicReasons: [] });
-  const result = await first;
-  assert.equal(result.hash, hash('11'));
-  assert.equal(sends, 1);
-  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
-});
-
-test('confirmed buyback stays disabled through refresh failure and recovers only after a later refresh', async () => {
-  let actionState = BUYBACK_ACTION_STATES.ready;
-  let sends = 0;
-  const order = [];
-  const operations = {
-    getActionState: () => actionState,
-    setActionState: (next) => { actionState = next; order.push(next); },
-    refreshBeforeSend: async () => ({ canSubmit: true, deterministicReasons: [] }),
-    send: async () => { sends += 1; return hash('22'); },
-    wait: async () => ({ status: '0x1' }),
-    decode: () => ({ companyBurned: 2n }),
-    onConfirmed: () => {
-      assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
-      order.push('confirmed-rendered');
-    },
-    refreshAfterConfirmed: async () => {
-      assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
-      order.push('post-confirmation-refresh');
-      throw new Error('RPC unavailable after confirmation');
-    }
-  };
-
-  const result = await submitBuybackOnce(operations);
-  assert.match(result.refreshError.message, /RPC unavailable/);
-  assert.equal(result.decodeError, null);
-  assert.equal(actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded);
-  assert.ok(order.indexOf('confirmed-rendered') < order.indexOf('post-confirmation-refresh'));
-  await assert.rejects(submitBuybackOnce(operations), /disabled until.*refreshed/);
-  assert.equal(sends, 1);
-
-  actionState = buybackActionStateAfterRefresh(actionState);
-  assert.equal(actionState, BUYBACK_ACTION_STATES.ready);
+test('only a resolved buyback state can become ready after a current-state read', () => {
+  assert.equal(
+    buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.confirmedRefreshNeeded),
+    BUYBACK_ACTION_STATES.ready
+  );
   assert.throws(
     () => buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.inFlight),
+    /cannot be cleared/
+  );
+  assert.throws(
+    () => buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.submittedUnknown),
     /cannot be cleared/
   );
 });
@@ -810,6 +917,8 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'controls timing only',
     'Accepted queued WETH payments are not reserved',
     'Transaction state',
+    'Transaction operation journal',
+    'captured chain, vault or target, and account',
     'Call buyback',
     'Agent task → receipt → payment evidence',
     'build prediction is not a',

@@ -5,6 +5,11 @@ binding to `TransferAction`, plus `AgentWorkIndex` publish calldata and log deco
 payments are authorized, executable only while funded, and never partial; the index provides no
 escrow or payment authority. Golden bytes live in `agent-document-golden.json`.
 
+The dashboard accepts an explicit deployed index address, runtime hash, and start block. It
+reconstructs task → receipt → payment lineage at one pinned block while keeping accepted,
+executable-now, paid, and balance-proof-unverified states separate. Plans are calldata only: the
+client neither treats the pinned CREATE2 prediction as deployed nor signs or sends transactions.
+
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed
 site.

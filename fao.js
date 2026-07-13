@@ -163,6 +163,25 @@ export const AGENT_WORK_INDEX = Object.freeze({
   publishedTopic: keccak256('Published(bytes32,bytes32,bytes32,address,bytes)')
 });
 
+export const AGENT_WORK_EVENTS = Object.freeze({
+  transferProposed: keccak256('TransferProposed(uint256,address,address,address,uint256,bytes32)'),
+  finalizedByTimeout: keccak256('FinalizedByTimeout(uint256,bool,address,uint256)'),
+  evaluationResolved: keccak256('EvaluationResolved(uint256,bool,address,uint256)'),
+  transferQueued: keccak256('TreasuryTransferQueued(bytes32,uint256,uint256,uint256)'),
+  transferExecuted: keccak256('TreasuryTransferExecuted(bytes32,address,address,uint256)')
+});
+
+export const AGENT_WORK_VIEWS = Object.freeze({
+  getProposal: '0xc7f758a8',
+  queuedActions: '0xf3df92bf'
+});
+
+export const AGENT_PAYMENT_COPY = Object.freeze({
+  accepted: 'Accepted means the exact transfer was authorized. Funds are not reserved and no payment has occurred.',
+  executable: 'Executable now means the exact queued call succeeded in simulation at the pinned block.',
+  paid: 'Paid requires the exact execution event and exact conserved executor/recipient balance deltas.'
+});
+
 export function normalizeHex(value, bytes, label = 'hex value') {
   if (typeof value !== 'string' || !/^0x(?:[0-9a-fA-F]{2})*$/.test(value)) {
     throw new Error(`${label} must be 0x-prefixed, even-length hex.`);
@@ -1559,5 +1578,516 @@ export function decodeAgentDocumentPublishedLog(log) {
       byte.toString(16).padStart(2, '0')
     )).join('')}`, { allowZero: true }),
     document: bytesHex(document)
+  });
+}
+
+const ZERO_DIGEST = `0x${'00'.repeat(32)}`;
+const MAX_AGENT_DOCUMENT_BYTES = 65_536;
+
+function rpcQuantity(value, label) {
+  if (typeof value !== 'string' || !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(value)) {
+    throw new Error(`${label} must be a canonical RPC quantity.`);
+  }
+  return BigInt(value);
+}
+
+function rpcTag(value, label) {
+  return `0x${unsigned(value, 256, label).toString(16)}`;
+}
+
+function topicAddress(value, label, { allowZero = false } = {}) {
+  const word = normalizeHex(value, 32, label);
+  if (word.slice(2, 26) !== '0'.repeat(24)) throw new Error(`${label} is not an ABI address.`);
+  return normalizeAddress(`0x${word.slice(-40)}`, { allowZero });
+}
+
+function abiWords(value, count, label) {
+  const data = normalizeHex(value, count * 32, label).slice(2);
+  return Object.freeze(Array.from({ length: count }, (_, index) => (
+    `0x${data.slice(index * 64, index * 64 + 64)}`
+  )));
+}
+
+function abiBool(value, label) {
+  const number = BigInt(normalizeHex(value, 32, label));
+  if (number > 1n) throw new Error(`${label} is not an ABI boolean.`);
+  return number === 1n;
+}
+
+function normalizeEventLog(log, address, topic, topicCount, dataWords, label) {
+  if (!log || Array.isArray(log) || typeof log !== 'object' || log.removed === true) {
+    throw new Error(`${label} is invalid or removed.`);
+  }
+  if (normalizeAddress(log.address) !== normalizeAddress(address)) {
+    throw new Error(`${label} came from another contract.`);
+  }
+  if (!Array.isArray(log.topics) || log.topics.length !== topicCount
+    || normalizeHex(log.topics[0], 32, `${label} topic`) !== topic) {
+    throw new Error(`${label} topics are invalid.`);
+  }
+  const blockNumber = rpcQuantity(log.blockNumber, `${label} block number`);
+  const logIndex = rpcQuantity(log.logIndex, `${label} log index`);
+  return Object.freeze({
+    log,
+    topics: Object.freeze(log.topics.map((entry, index) => (
+      normalizeHex(entry, 32, `${label} topic ${index}`)
+    ))),
+    words: abiWords(log.data, dataWords, `${label} data`),
+    blockNumber,
+    logIndex,
+    transactionHash: normalizeHex(log.transactionHash, 32, `${label} transaction hash`)
+  });
+}
+
+export function validateAgentWorkIndexConfig(value) {
+  const config = requireRecord(
+    value, ['address', 'runtimeCodeKeccak256', 'startBlock'], 'AgentWorkIndex config'
+  );
+  return Object.freeze({
+    address: normalizeAddress(config.address),
+    runtimeCodeKeccak256: normalizeHex(
+      config.runtimeCodeKeccak256, 32, 'AgentWorkIndex runtime hash'
+    ),
+    startBlock: unsigned(config.startBlock, 256, 'AgentWorkIndex start block')
+  });
+}
+
+function agentPublicationMeta(log, indexAddress) {
+  if (normalizeAddress(log.address) !== normalizeAddress(indexAddress)) {
+    throw new Error('Published log came from another index.');
+  }
+  if (log.removed === true) throw new Error('Published log was removed.');
+  return Object.freeze({
+    blockNumber: rpcQuantity(log.blockNumber, 'Published block number'),
+    logIndex: rpcQuantity(log.logIndex, 'Published log index'),
+    transactionHash: normalizeHex(log.transactionHash, 32, 'Published transaction hash')
+  });
+}
+
+function agentDocumentProfile(kind) {
+  if (kind === AGENT_WORK_KINDS.task) return ['task', validateAgentTask];
+  if (kind === AGENT_WORK_KINDS.receipt) return ['receipt', validateAgentReceipt];
+  if (kind === AGENT_WORK_KINDS.payment) return ['payment', validateAgentPayment];
+  return null;
+}
+
+export function reconstructAgentWorkLogs(logs, value) {
+  if (!Array.isArray(logs)) throw new Error('AgentWorkIndex logs must be an array.');
+  const input = requireRecord(value, ['index', 'chainId', 'vault'], 'Agent-work reconstruction');
+  const index = normalizeAddress(input.index);
+  const chainId = assertChainId(input.chainId).toString();
+  const vault = normalizeAddress(input.vault);
+  const accepted = [];
+  const rejected = [];
+
+  for (const log of logs) {
+    try {
+      const meta = agentPublicationMeta(log, index);
+      if (typeof log.data !== 'string' || (log.data.length - 2) / 2 > MAX_AGENT_DOCUMENT_BYTES + 128) {
+        throw new Error(`Published log exceeds the ${MAX_AGENT_DOCUMENT_BYTES}-byte client limit.`);
+      }
+      const event = decodeAgentDocumentPublishedLog(log);
+      const profile = agentDocumentProfile(event.kind);
+      if (!profile) throw new Error('Published kind is not a v1 agent-work kind.');
+      const [type, validate] = profile;
+      const document = validate(event.document);
+      if (document.chainId !== chainId || document.vault !== vault) {
+        throw new Error('Published document is a cross-chain or cross-vault replay.');
+      }
+      const parentDigest = type === 'task'
+        ? ZERO_DIGEST
+        : document[type === 'receipt' ? 'task' : 'receipt'];
+      if (event.parentDigest !== parentDigest) {
+        throw new Error('Published parent digest disagrees with the canonical document.');
+      }
+      accepted.push(Object.freeze({ ...event, ...meta, type, value: document }));
+    } catch (error) {
+      rejected.push(Object.freeze({
+        transactionHash: typeof log?.transactionHash === 'string' ? log.transactionHash.toLowerCase() : null,
+        reason: String(error?.message || error).slice(0, 240)
+      }));
+    }
+  }
+
+  accepted.sort((left, right) => (
+    left.blockNumber === right.blockNumber
+      ? Number(left.logIndex - right.logIndex)
+      : left.blockNumber < right.blockNumber ? -1 : 1
+  ));
+  const publications = new Map();
+  for (const record of accepted) {
+    const existing = publications.get(record.documentDigest);
+    if (existing) existing.push(record);
+    else publications.set(record.documentDigest, [record]);
+  }
+  const unique = Array.from(publications.values(), (entries) => Object.freeze({
+    ...entries[0],
+    duplicateCount: entries.length - 1,
+    publications: Object.freeze(entries.map((entry) => Object.freeze({
+      publisher: entry.publisher,
+      transactionHash: entry.transactionHash,
+      blockNumber: entry.blockNumber,
+      logIndex: entry.logIndex
+    })))
+  }));
+  const taskDigests = new Set(unique.filter((entry) => entry.type === 'task').map((entry) => entry.documentDigest));
+  const receiptByDigest = new Map(unique.filter((entry) => entry.type === 'receipt').map((entry) => [entry.documentDigest, entry]));
+  const records = [];
+  for (const record of unique) {
+    let reason = null;
+    if (record.type === 'receipt' && !taskDigests.has(record.value.task)) {
+      reason = 'Receipt has no valid task parent in the configured index range.';
+    } else if (record.type === 'payment') {
+      const receipt = receiptByDigest.get(record.value.receipt);
+      if (!receipt || receipt.value.task !== record.value.task || !taskDigests.has(record.value.task)) {
+        reason = 'Payment has no exact valid task → receipt lineage in the configured index range.';
+      }
+    }
+    if (reason) rejected.push(Object.freeze({ transactionHash: record.transactionHash, reason }));
+    else records.push(record);
+  }
+  const receiptCounts = new Map();
+  for (const record of records) {
+    if (record.type !== 'receipt') continue;
+    receiptCounts.set(record.value.task, (receiptCounts.get(record.value.task) || 0) + 1);
+  }
+  const finalRecords = records.map((record) => Object.freeze({
+    ...record,
+    conflictingReceipt: record.type === 'receipt' && receiptCounts.get(record.value.task) > 1
+  }));
+  return Object.freeze({
+    records: Object.freeze(finalRecords),
+    tasks: Object.freeze(finalRecords.filter((entry) => entry.type === 'task')),
+    receipts: Object.freeze(finalRecords.filter((entry) => entry.type === 'receipt')),
+    payments: Object.freeze(finalRecords.filter((entry) => entry.type === 'payment')),
+    rejected: Object.freeze(rejected)
+  });
+}
+
+export async function readAgentWorkIndex(value) {
+  const input = requireRecord(value, ['request', 'config', 'chainId', 'vault'], 'Agent-work index read');
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+  const config = validateAgentWorkIndexConfig(input.config);
+  const expectedChain = assertChainId(input.chainId);
+  const actualChain = rpcQuantity(await input.request('eth_chainId', []), 'RPC chain ID');
+  if (actualChain !== expectedChain) {
+    throw new Error(`AgentWorkIndex RPC chain mismatch: expected ${expectedChain}, received ${actualChain}.`);
+  }
+  const block = await input.request('eth_getBlockByNumber', ['finalized', false]);
+  if (!block || typeof block !== 'object') throw new Error('RPC returned no finalized block.');
+  const blockNumber = rpcQuantity(block.number, 'Pinned block number');
+  const timestamp = rpcQuantity(block.timestamp, 'Pinned block timestamp');
+  if (config.startBlock > blockNumber) throw new Error('AgentWorkIndex start block is after the pinned block.');
+  const blockTag = rpcTag(blockNumber, 'Pinned block number');
+  const code = normalizeHex(
+    await input.request('eth_getCode', [config.address, blockTag]), undefined,
+    'AgentWorkIndex runtime code'
+  );
+  if (code === '0x') {
+    throw new Error('Configured AgentWorkIndex is not deployed at the pinned block. A predicted address is not a deployment.');
+  }
+  if (keccak256(code) !== config.runtimeCodeKeccak256) {
+    throw new Error('Configured AgentWorkIndex runtime bytecode does not match the supplied hash.');
+  }
+  const logs = await input.request('eth_getLogs', [{
+    address: config.address,
+    fromBlock: rpcTag(config.startBlock, 'AgentWorkIndex start block'),
+    toBlock: blockTag,
+    topics: [AGENT_WORK_INDEX.publishedTopic]
+  }]);
+  const reconstructed = reconstructAgentWorkLogs(logs, {
+    index: config.address, chainId: expectedChain, vault: input.vault
+  });
+  return Object.freeze({
+    config,
+    blockNumber,
+    blockTag,
+    timestamp,
+    ...reconstructed
+  });
+}
+
+function decodeTransferProposed(log, gateway) {
+  const event = normalizeEventLog(
+    log, gateway, AGENT_WORK_EVENTS.transferProposed, 4, 3, 'TransferProposed log'
+  );
+  return Object.freeze({
+    ...event,
+    proposalId: BigInt(event.topics[1]),
+    proposer: topicAddress(event.topics[2], 'TransferProposed proposer'),
+    asset: topicAddress(event.topics[3], 'TransferProposed asset', { allowZero: true }),
+    recipient: topicAddress(event.words[0], 'TransferProposed recipient'),
+    amount: BigInt(event.words[1]),
+    salt: event.words[2]
+  });
+}
+
+function decodeSettlement(log, arbitration) {
+  const topic = normalizeHex(log?.topics?.[0], 32, 'Settlement event topic');
+  if (topic !== AGENT_WORK_EVENTS.finalizedByTimeout && topic !== AGENT_WORK_EVENTS.evaluationResolved) {
+    throw new Error('Settlement log has an unknown event topic.');
+  }
+  const event = normalizeEventLog(log, arbitration, topic, 3, 2, 'Settlement log');
+  return Object.freeze({
+    ...event,
+    proposalId: BigInt(event.topics[1]),
+    accepted: abiBool(event.words[0], 'Settlement accepted'),
+    winner: topicAddress(event.topics[2], 'Settlement winner', { allowZero: true }),
+    payout: BigInt(event.words[1]),
+    route: topic === AGENT_WORK_EVENTS.finalizedByTimeout ? 'timeout' : 'evaluated'
+  });
+}
+
+function decodeTransferQueued(log, vault) {
+  const event = normalizeEventLog(
+    log, vault, AGENT_WORK_EVENTS.transferQueued, 3, 2, 'TreasuryTransferQueued log'
+  );
+  return Object.freeze({
+    ...event,
+    actionHash: event.topics[1],
+    proposalId: BigInt(event.topics[2]),
+    executeAfter: BigInt(event.words[0]),
+    expiresAt: BigInt(event.words[1])
+  });
+}
+
+function decodeTransferExecuted(log, vault) {
+  const event = normalizeEventLog(
+    log, vault, AGENT_WORK_EVENTS.transferExecuted, 4, 1, 'TreasuryTransferExecuted log'
+  );
+  return Object.freeze({
+    ...event,
+    actionHash: event.topics[1],
+    asset: topicAddress(event.topics[2], 'TreasuryTransferExecuted asset', { allowZero: true }),
+    recipient: topicAddress(event.topics[3], 'TreasuryTransferExecuted recipient'),
+    amount: BigInt(event.words[0])
+  });
+}
+
+function decodeProposalView(value) {
+  const words = abiWords(value, 11, 'Arbitration proposal view');
+  const state = BigInt(words[5]);
+  if (state > 5n) throw new Error('Arbitration proposal state is invalid.');
+  return Object.freeze({
+    state,
+    lastStateChangeAt: BigInt(words[6]),
+    settled: abiBool(words[7], 'Proposal settled'),
+    accepted: abiBool(words[8], 'Proposal accepted'),
+    queuePosition: BigInt(words[9]),
+    exists: abiBool(words[10], 'Proposal exists')
+  });
+}
+
+function decodeQueueView(value) {
+  const words = abiWords(value, 4, 'Queued transfer view');
+  return Object.freeze({
+    executeAfter: BigInt(words[0]),
+    expiresAt: BigInt(words[1]),
+    executed: abiBool(words[2], 'Queued transfer executed'),
+    expired: abiBool(words[3], 'Queued transfer expired')
+  });
+}
+
+function exactTransferEvent(event, binding) {
+  return event.proposalId === BigInt(binding.proposalId)
+    && event.asset === binding.action.asset
+    && event.recipient === binding.action.recipient
+    && event.amount === binding.action.amount
+    && event.salt === binding.action.salt;
+}
+
+async function balanceAt(request, asset, account, blockTag) {
+  if (asset === ZERO_ADDRESS) {
+    return rpcQuantity(await request('eth_getBalance', [account, blockTag]), 'Native balance');
+  }
+  const result = await request('eth_call', [{
+    to: asset,
+    data: encodeCalldata(BUYBACK_SELECTORS.balanceOf, [addressWord(account)])
+  }, blockTag]);
+  return BigInt(normalizeHex(result, 32, 'ERC-20 balance'));
+}
+
+async function executionBalanceEvidence(request, event, executor) {
+  if (event.blockNumber === 0n) throw new Error('Execution event has no prior balance block.');
+  const beforeTag = rpcTag(event.blockNumber - 1n, 'Execution prior block');
+  const afterTag = rpcTag(event.blockNumber, 'Execution block');
+  const [executorBefore, executorAfter, recipientBefore, recipientAfter] = await Promise.all([
+    balanceAt(request, event.asset, executor, beforeTag),
+    balanceAt(request, event.asset, executor, afterTag),
+    balanceAt(request, event.asset, event.recipient, beforeTag),
+    balanceAt(request, event.asset, event.recipient, afterTag)
+  ]);
+  const exact = executorBefore >= executorAfter && recipientAfter >= recipientBefore
+    && executorBefore - executorAfter === event.amount
+    && recipientAfter - recipientBefore === event.amount;
+  return Object.freeze({ executorBefore, executorAfter, recipientBefore, recipientAfter, exact });
+}
+
+async function lifecycleLogs(request, address, fromBlock, toBlock, topics) {
+  const logs = await request('eth_getLogs', [{ address, fromBlock, toBlock, topics }]);
+  if (!Array.isArray(logs)) throw new Error('RPC returned invalid lifecycle logs.');
+  return logs;
+}
+
+export async function readAgentPaymentState(value) {
+  const input = requireRecord(value, [
+    'request', 'chainId', 'vault', 'gateway', 'arbitration', 'executor', 'startBlock',
+    'blockNumber', 'timestamp', 'payment'
+  ], 'Agent payment state read');
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+  const vault = normalizeAddress(input.vault);
+  const gateway = normalizeAddress(input.gateway);
+  const arbitration = normalizeAddress(input.arbitration);
+  const executor = normalizeAddress(input.executor);
+  const payment = validateAgentPayment(input.payment);
+  const action = agentPaymentTransferAction(payment);
+  const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
+  const fromBlock = rpcTag(input.startBlock, 'Lifecycle start block');
+  const blockNumber = unsigned(input.blockNumber, 256, 'Pinned block number');
+  const toBlock = rpcTag(blockNumber, 'Pinned block number');
+  const timestamp = unsigned(input.timestamp, 256, 'Pinned block timestamp');
+  const idTopic = binding.actionHash;
+  const [proposedRaw, settlementRaw, queuedRaw, executedRaw] = await Promise.all([
+    lifecycleLogs(input.request, gateway, fromBlock, toBlock, [AGENT_WORK_EVENTS.transferProposed, idTopic]),
+    lifecycleLogs(input.request, arbitration, fromBlock, toBlock, [[
+      AGENT_WORK_EVENTS.finalizedByTimeout, AGENT_WORK_EVENTS.evaluationResolved
+    ], idTopic]),
+    lifecycleLogs(input.request, vault, fromBlock, toBlock, [AGENT_WORK_EVENTS.transferQueued, idTopic]),
+    lifecycleLogs(input.request, vault, fromBlock, toBlock, [AGENT_WORK_EVENTS.transferExecuted, idTopic])
+  ]);
+  const proposals = proposedRaw.map((log) => decodeTransferProposed(log, gateway));
+  const settlements = settlementRaw.map((log) => decodeSettlement(log, arbitration));
+  const queues = queuedRaw.map((log) => decodeTransferQueued(log, vault));
+  const executions = executedRaw.map((log) => decodeTransferExecuted(log, vault));
+  const exactProposals = proposals.filter((event) => exactTransferEvent(event, binding));
+  const proposed = proposals.length === 1 && exactProposals.length === 1;
+  let proposal = null;
+  if (proposals.length || settlements.length) {
+    proposal = decodeProposalView(await input.request('eth_call', [{
+      to: arbitration,
+      data: encodeCalldata(AGENT_WORK_VIEWS.getProposal, [uintWord(binding.proposalId)])
+    }, toBlock]));
+  }
+  let acceptance;
+  if (!proposed && (proposals.length || proposal || settlements.length)) {
+    acceptance = Object.freeze({ state: 'disagreement', accepted: false, route: null });
+  } else if (!proposal && settlements.length === 0) {
+    acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
+  } else if (proposal?.exists && !proposal.settled && settlements.length === 0) {
+    acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
+  } else if (!proposal?.exists || !proposal.settled || settlements.length !== 1
+    || settlements[0].proposalId !== BigInt(binding.proposalId)
+    || settlements[0].accepted !== proposal.accepted) {
+    acceptance = Object.freeze({ state: 'disagreement', accepted: false, route: null });
+  } else {
+    acceptance = Object.freeze({
+      state: proposal.accepted ? 'accepted' : 'rejected',
+      accepted: proposal.accepted,
+      route: settlements[0].route
+    });
+  }
+
+  const queueView = decodeQueueView(await input.request('eth_call', [{
+    to: vault,
+    data: encodeCalldata(AGENT_WORK_VIEWS.queuedActions, [bytes32Word(binding.actionHash)])
+  }, toBlock]));
+  const exactQueues = queues.filter((event) => (
+    event.actionHash === binding.actionHash
+    && event.proposalId === BigInt(binding.proposalId)
+    && event.executeAfter === queueView.executeAfter
+    && event.expiresAt === queueView.expiresAt
+  ));
+  const exactExecutions = executions.filter((event) => (
+    event.actionHash === binding.actionHash
+    && event.asset === action.asset
+    && event.recipient === action.recipient
+    && event.amount === action.amount
+  ));
+
+  let paymentState = Object.freeze({ state: 'not-paid', paid: false, evidence: null });
+  if (queueView.executed || executions.length) {
+    if (queueView.executed && executions.length === 1 && exactExecutions.length === 1) {
+      try {
+        const evidence = await executionBalanceEvidence(input.request, exactExecutions[0], executor);
+        paymentState = Object.freeze({
+          state: evidence.exact ? 'paid' : 'unverified', paid: evidence.exact, evidence
+        });
+      } catch (error) {
+        paymentState = Object.freeze({
+          state: 'unverified', paid: false,
+          evidence: Object.freeze({ error: String(error?.message || error).slice(0, 240) })
+        });
+      }
+    } else {
+      paymentState = Object.freeze({ state: 'unverified', paid: false, evidence: null });
+    }
+  }
+
+  let execution;
+  if (paymentState.state === 'paid') {
+    execution = Object.freeze({ state: 'paid', executableNow: false });
+  } else if (!acceptance.accepted) {
+    execution = Object.freeze({ state: 'not-accepted', executableNow: false });
+  } else if (queues.length !== 1 || exactQueues.length !== 1 || queueView.executeAfter === 0n) {
+    execution = Object.freeze({
+      state: queues.length || queueView.executeAfter !== 0n ? 'disagreement' : 'not-queued',
+      executableNow: false
+    });
+  } else if (queueView.executed || queueView.expired) {
+    execution = Object.freeze({
+      state: paymentState.state === 'unverified' ? 'payment-unverified' : 'closed', executableNow: false
+    });
+  } else if (timestamp < queueView.executeAfter) {
+    execution = Object.freeze({ state: 'grace-period', executableNow: false });
+  } else if (timestamp > queueView.expiresAt) {
+    execution = Object.freeze({ state: 'expired', executableNow: false });
+  } else {
+    try {
+      await input.request('eth_call', [{
+        to: vault,
+        data: executeTreasuryTransferCalldata(action)
+      }, toBlock]);
+      execution = Object.freeze({ state: 'executable-now', executableNow: true });
+    } catch (error) {
+      execution = Object.freeze({
+        state: 'blocked-at-pinned-block', executableNow: false,
+        reason: String(error?.message || error).slice(0, 240)
+      });
+    }
+  }
+  return Object.freeze({
+    payment,
+    action,
+    actionHash: binding.actionHash,
+    proposalId: binding.proposalId,
+    proposed,
+    acceptance,
+    queue: queueView,
+    execution,
+    paymentState,
+    copy: AGENT_PAYMENT_COPY
+  });
+}
+
+export function prepareAgentPaymentTransactions(value) {
+  const input = requireRecord(
+    value, ['index', 'gateway', 'vault', 'chainId', 'payment'], 'Agent payment transaction plan'
+  );
+  const index = normalizeAddress(input.index);
+  const gateway = normalizeAddress(input.gateway);
+  const vault = normalizeAddress(input.vault);
+  const payment = validateAgentPayment(input.payment);
+  const publication = prepareAgentDocumentPublication('payment', payment);
+  const action = agentPaymentTransferAction(payment);
+  const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
+  return Object.freeze({
+    actionHash: binding.actionHash,
+    proposalId: binding.proposalId,
+    steps: Object.freeze([
+      transaction(index, publication.calldata, 'Publish exact payment envelope'),
+      transaction(gateway, proposeTransferCalldata(action), 'Propose exact payment transfer'),
+      transaction(vault, queueTreasuryTransferCalldata(action), 'Queue only after exact acceptance'),
+      transaction(vault, executeTreasuryTransferCalldata(action), 'Execute only while funded and in-window')
+    ])
   });
 }

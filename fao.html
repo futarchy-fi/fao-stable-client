@@ -24,6 +24,7 @@
           <a href="#sale">Sale</a>
           <a href="#liquidity">Liquidity</a>
           <a href="#governance">Release and treasury</a>
+          <a href="#agent-work">Agent work</a>
         </nav>
       </header>
 
@@ -454,6 +455,57 @@
           <p>Assets stay in the verified executor; callers submit policy-bound actions to the gateway and vault.</p>
           <ol id="treasury-steps" class="stage-list"></ol>
         </div>
+
+        <article id="agent-work" class="ragequit-card" aria-labelledby="agent-work-heading">
+          <div class="section-heading">
+            <h3 id="agent-work-heading">Agent task → receipt → payment evidence</h3>
+            <span id="agent-work-verification" class="status unverified">Not configured</span>
+          </div>
+          <p>
+            Configure an actually deployed, code-verified AgentWorkIndex. A build pin or predicted
+            CREATE2 address is not a deployment. The inspector reads finalized evidence through one
+            pinned Sepolia block and never holds a key or sends a transaction.
+          </p>
+          <form id="agent-work-form">
+            <div class="form-grid">
+              <label>Deployed index address
+                <input name="address" autocomplete="off" required placeholder="0x…">
+              </label>
+              <label>Runtime Keccak-256
+                <input name="runtimeCodeKeccak256" autocomplete="off" required placeholder="0x…">
+              </label>
+              <label>Deployment start block
+                <input name="startBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              </label>
+            </div>
+            <button type="submit">Verify and reconstruct evidence</button>
+          </form>
+          <dl>
+            <div><dt>Pinned block</dt><dd id="agent-work-block">—</dd></div>
+            <div><dt>Valid tasks</dt><dd id="agent-work-task-count">—</dd></div>
+            <div><dt>Valid receipts</dt><dd id="agent-work-receipt-count">—</dd></div>
+            <div><dt>Valid payments</dt><dd id="agent-work-payment-count">—</dd></div>
+            <div><dt>Rejected inert records</dt><dd id="agent-work-rejected-count">—</dd></div>
+          </dl>
+          <p id="agent-work-status" class="message" role="status" aria-live="polite"></p>
+          <p class="notice">
+            Accepted is authorization, not payment. Executable-now requires a successful exact
+            simulation. Paid requires the exact execution event and exact executor decrease plus
+            recipient increase across that execution block. If archive reads fail or unrelated
+            same-block balance changes obscure those deltas, the result remains unverified—not paid
+            and not unpaid.
+          </p>
+          <div id="agent-work-results" hidden>
+            <h4>Tasks and receipts</h4>
+            <ul id="agent-work-tasks" class="stage-list"></ul>
+            <h4>Payment lineages</h4>
+            <ul id="agent-work-payments" class="stage-list"></ul>
+            <details>
+              <summary>Rejected inert records</summary>
+              <ul id="agent-work-rejected"></ul>
+            </details>
+          </div>
+        </article>
       </section>
     </main>
     <footer class="wide">Stable surface · code verification ≠ organization endorsement · no legacy fallback</footer>

@@ -21,6 +21,7 @@ export function buybackActionStateAfterRefresh(current) {
 }
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
+const MAX_AGENT_PAYMENT_VIEWS = 100;
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
 export const PINNED_DEPENDENCIES = Object.freeze({
@@ -432,7 +433,8 @@ let state = {
   treasuryRecords: null,
   treasuryFlow: null,
   buybackModel: null,
-  buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded
+  buybackActionState: BUYBACK_ACTION_STATES.refreshNeeded,
+  agentWork: null
 };
 
 function rpc(method, params = []) {
@@ -543,6 +545,111 @@ function renderBuybackModel() {
     }
   }
   renderTreasuryGate();
+}
+
+function agentWorkDetail(label, value) {
+  const row = document.createElement('p');
+  const strong = document.createElement('strong');
+  const code = document.createElement('code');
+  strong.textContent = `${label}: `;
+  code.textContent = value;
+  row.append(strong, code);
+  return row;
+}
+
+function renderAgentWork() {
+  const view = state.agentWork;
+  elements.agentWorkResults.hidden = !view;
+  elements.agentWorkVerification.textContent = view ? 'Code verified' : 'Not configured';
+  elements.agentWorkVerification.className = `status ${view ? 'verified' : 'unverified'}`;
+  elements.agentWorkBlock.textContent = view ? view.blockNumber.toString() : '—';
+  elements.agentWorkTaskCount.textContent = view ? String(view.tasks.length) : '—';
+  elements.agentWorkReceiptCount.textContent = view ? String(view.receipts.length) : '—';
+  elements.agentWorkPaymentCount.textContent = view ? String(view.payments.length) : '—';
+  elements.agentWorkRejectedCount.textContent = view ? String(view.rejected.length) : '—';
+  elements.agentWorkTasks.replaceChildren();
+  elements.agentWorkPayments.replaceChildren();
+  elements.agentWorkRejected.replaceChildren();
+  if (!view) return;
+
+  for (const task of view.tasks) {
+    const receipts = view.receipts.filter((entry) => entry.value.task === task.documentDigest);
+    const item = document.createElement('li');
+    item.className = 'stage-card';
+    const body = document.createElement('div');
+    const heading = document.createElement('h4');
+    heading.textContent = task.value.title;
+    body.append(heading, agentWorkDetail('Task digest', task.documentDigest));
+    if (task.duplicateCount) {
+      const duplicates = document.createElement('p');
+      duplicates.className = 'details';
+      duplicates.textContent = `${task.duplicateCount + 1} identical on-chain publications; shown once by digest.`;
+      body.append(duplicates);
+    }
+    const receiptList = document.createElement('ul');
+    for (const receipt of receipts) {
+      const row = document.createElement('li');
+      row.textContent = `${receipt.value.summary} · ${receipt.documentDigest}`
+        + `${receipt.duplicateCount ? ` · ${receipt.duplicateCount + 1} identical publications` : ''}`
+        + `${receipt.conflictingReceipt ? ' · conflicting receipt' : ''}`;
+      receiptList.append(row);
+    }
+    if (receipts.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'details';
+      empty.textContent = 'No valid receipt in the configured range.';
+      body.append(empty);
+    } else body.append(receiptList);
+    item.append(body);
+    elements.agentWorkTasks.append(item);
+  }
+
+  for (const entry of view.paymentViews) {
+    const { record, state: payment, plan } = entry;
+    const item = document.createElement('li');
+    item.className = 'stage-card';
+    const body = document.createElement('div');
+    const heading = document.createElement('h4');
+    heading.textContent = `${record.value.amount} raw units → ${record.value.recipient}`;
+    const meanings = document.createElement('p');
+    meanings.className = 'details';
+    meanings.textContent = `Acceptance: ${payment.acceptance.state}${payment.acceptance.route ? ` (${payment.acceptance.route})` : ''} · Executability: ${payment.execution.state} · Payment: ${payment.paymentState.state}.`;
+    body.append(
+      heading,
+      agentWorkDetail('Envelope', record.documentDigest),
+      agentWorkDetail('Proposal / action', payment.actionHash),
+      meanings
+    );
+    const exact = document.createElement('details');
+    const summary = document.createElement('summary');
+    const steps = document.createElement('ol');
+    summary.textContent = 'Exact read-only transaction plan';
+    for (const step of plan.steps) {
+      const row = document.createElement('li');
+      const label = document.createElement('strong');
+      const target = document.createElement('code');
+      const data = document.createElement('code');
+      label.textContent = step.label;
+      target.textContent = step.target;
+      data.textContent = step.data;
+      row.append(label, document.createElement('br'), target, document.createElement('br'), data);
+      steps.append(row);
+    }
+    exact.append(summary, steps);
+    body.append(exact);
+    item.append(body);
+    elements.agentWorkPayments.append(item);
+  }
+  if (view.paymentViews.length === 0) {
+    const empty = document.createElement('li');
+    empty.textContent = 'No valid payment lineage in the configured range.';
+    elements.agentWorkPayments.append(empty);
+  }
+  for (const rejected of view.rejected) {
+    const item = document.createElement('li');
+    item.textContent = `${rejected.transactionHash || 'Unknown transaction'} · ${rejected.reason}`;
+    elements.agentWorkRejected.append(item);
+  }
 }
 
 function renderInstances() {
@@ -851,8 +958,10 @@ async function loadTreasuryManifest(event) {
   state.treasuryRecords = null;
   state.treasuryFlow = null;
   state.buybackModel = null;
+  state.agentWork = null;
   setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   renderBuybackModel();
+  renderAgentWork();
   const manifest = JSON.parse(elements.treasuryManifestForm.elements.manifest.value);
   const records = await verifyTreasuryManifest(manifest, rpc);
   state.treasuryManifest = manifest;
@@ -864,6 +973,66 @@ async function loadTreasuryManifest(event) {
   setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
   setMessage(elements.treasuryStatus, 'Executor runtime, custody wiring, and buyback state verified on Sepolia.');
   renderTreasuryGate();
+}
+
+async function loadAgentWork(event) {
+  event.preventDefault();
+  if (!event.currentTarget.reportValidity()) return;
+  if (!treasuryNetworkReady() || !state.treasuryManifest) {
+    throw new Error('Verify an active FAO treasury on matching Sepolia first.');
+  }
+  state.agentWork = null;
+  renderAgentWork();
+  const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
+  if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
+    throw new Error('Treasury manifest wiring changed.');
+  }
+  const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const view = await fao.readAgentWorkIndex({
+    request: rpc,
+    config: {
+      address: values.address,
+      runtimeCodeKeccak256: values.runtimeCodeKeccak256,
+      startBlock: values.startBlock
+    },
+    chainId: SEPOLIA_CHAIN_ID,
+    vault: fresh.vault
+  });
+  const inspectedPayments = view.payments.slice(-MAX_AGENT_PAYMENT_VIEWS);
+  const paymentViews = await Promise.all(inspectedPayments.map(async (record) => {
+    const payment = await fao.readAgentPaymentState({
+      request: rpc,
+      chainId: SEPOLIA_CHAIN_ID,
+      vault: fresh.vault,
+      gateway: fresh.gateway,
+      arbitration: fresh.arbitration,
+      executor: fresh.executor,
+      startBlock: view.config.startBlock,
+      blockNumber: view.blockNumber,
+      timestamp: view.timestamp,
+      payment: record.document
+    });
+    return Object.freeze({
+      record,
+      state: payment,
+      plan: fao.prepareAgentPaymentTransactions({
+        index: view.config.address,
+        gateway: fresh.gateway,
+        vault: fresh.vault,
+        chainId: SEPOLIA_CHAIN_ID,
+        payment: record.document
+      })
+    });
+  }));
+  const omittedPayments = view.payments.length - inspectedPayments.length;
+  state.agentWork = Object.freeze({
+    ...view, paymentViews: Object.freeze(paymentViews), omittedPayments
+  });
+  renderAgentWork();
+  setMessage(
+    elements.agentWorkStatus,
+    `Verified index code and reconstructed ${view.records.length} valid records through finalized Sepolia block ${view.blockNumber}. Rejected records remain inert evidence.${omittedPayments ? ` Lifecycle reads show the latest ${MAX_AGENT_PAYMENT_VIEWS} of ${view.payments.length} payments.` : ''}`
+  );
 }
 
 async function refreshBuybackState(reverify = true) {
@@ -1087,7 +1256,17 @@ function bindElements() {
     buybackSpent: byId('buyback-spent'), buybackPercentCap: byId('buyback-percent-cap'),
     buybackRawCap: byId('buyback-raw-cap'), buybackAvailable: byId('buyback-available'),
     buybackChecks: byId('buyback-checks'), buybackStatus: byId('buyback-status'),
-    buybackLatest: byId('buyback-latest')
+    buybackLatest: byId('buyback-latest'),
+    agentWorkForm: byId('agent-work-form'),
+    agentWorkVerification: byId('agent-work-verification'),
+    agentWorkBlock: byId('agent-work-block'),
+    agentWorkTaskCount: byId('agent-work-task-count'),
+    agentWorkReceiptCount: byId('agent-work-receipt-count'),
+    agentWorkPaymentCount: byId('agent-work-payment-count'),
+    agentWorkRejectedCount: byId('agent-work-rejected-count'),
+    agentWorkStatus: byId('agent-work-status'), agentWorkResults: byId('agent-work-results'),
+    agentWorkTasks: byId('agent-work-tasks'), agentWorkPayments: byId('agent-work-payments'),
+    agentWorkRejected: byId('agent-work-rejected')
   };
   elements.treasuryForms = Object.freeze([
     elements.treasuryTransferForm, elements.treasuryParamForm, elements.treasuryCriticalForm
@@ -1109,11 +1288,25 @@ async function initialize() {
     state.treasuryRecords = null;
     state.treasuryFlow = null;
     state.buybackModel = null;
+    state.agentWork = null;
     setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
     elements.treasuryPlan.hidden = true;
     elements.treasuryExecutor.textContent = 'Not verified';
     elements.treasuryVault.textContent = 'Not verified';
     renderBuybackModel();
+    renderAgentWork();
+  });
+  elements.agentWorkForm.addEventListener('submit', (event) => (
+    loadAgentWork(event).catch((error) => {
+      state.agentWork = null;
+      renderAgentWork();
+      setMessage(elements.agentWorkStatus, errorMessage(error), true);
+    })
+  ));
+  elements.agentWorkForm.addEventListener('input', () => {
+    state.agentWork = null;
+    renderAgentWork();
+    setMessage(elements.agentWorkStatus, 'Configuration changed. Verify the deployed index again.');
   });
   for (const form of elements.treasuryForms) form.addEventListener('submit', (event) => {
     try {

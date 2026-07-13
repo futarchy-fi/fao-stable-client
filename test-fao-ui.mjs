@@ -334,7 +334,11 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'controls timing only',
     'Accepted queued WETH payments are not reserved',
     'Transaction state',
-    'Call buyback'
+    'Call buyback',
+    'Agent task → receipt → payment evidence',
+    'predicted\\s+CREATE2 address is not a deployment',
+    'Accepted is authorization, not payment',
+    'unverified—not paid'
   ]) assert.match(html, new RegExp(text));
   assert.match(html, /role="status" aria-live="polite"/);
   assert.match(html, /data-write[^>]*disabled/);

@@ -12,11 +12,14 @@ import {
   readBuybackModel,
   submitBuybackOnce,
   validateCreationBundle,
+  verifyAgentWorkProvenance,
   verifyTreasuryManifest,
   verifyRuntimeCode,
   visibleInstances
 } from './fao-ui.js';
-import { BUYBACK_SELECTORS, addressWord, encodeCalldata, keccak256, uintWord } from './fao.js';
+import {
+  BUYBACK_SELECTORS, addressWord, economicCommitmentHashes, encodeCalldata, keccak256, uintWord
+} from './fao.js';
 import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
 
 const address = (value) => `0x${value.toString(16).padStart(40, '0')}`;
@@ -33,11 +36,14 @@ function treasuryManifest() {
   const contracts = Object.fromEntries(contractNames.map((name, index) => [name, address(index + 1)]));
   contracts.vestingWallets = [];
   return {
-    schemaVersion: 3, creationRoute: 'registrar', status: 'live', network: 'sepolia',
+    schemaVersion: 4, creationRoute: 'create', status: 'live', network: 'sepolia',
     chainId: 11155111, transactions: {}, receipt: {}, prerequisites: {}, coreConfig: {},
     grants: [], flmConfig: {}, feeTier: 500, poolInitCodeHash: hash('aa'),
     observationCardinality: 120, contracts, codeBlobs: {},
-    runtimeCodeHashes: { treasuryExecutor: keccak256('0x6001') }, finalization: {}
+    runtimeCodeHashes: {
+      vault: keccak256('0x6001'), proposalGateway: keccak256('0x6001'),
+      arbitration: keccak256('0x6001'), treasuryExecutor: keccak256('0x6001')
+    }, finalization: {}
   };
 }
 
@@ -85,11 +91,14 @@ test('runtime verification requires an exact hash map and matches every contract
   );
 });
 
-test('schema-v3 treasury manifest verifies executor runtime and four-way wiring', async () => {
+test('schema-v4 treasury manifest verifies four runtimes and wiring at one finalized block', async () => {
   const manifest = treasuryManifest();
   const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
   const request = async (method, params) => {
     if (method === 'eth_getCode') return '0x6001';
+    if (method === 'eth_getBlockByNumber') {
+      return { number: '0x10', timestamp: '0x20', hash: hash('44') };
+    }
     assert.equal(method, 'eth_call');
     const [{ to, data }] = params;
     if (to === records.vault && data === '0x0d618c81') return word(records.executor);
@@ -99,14 +108,244 @@ test('schema-v3 treasury manifest verifies executor runtime and four-way wiring'
     throw new Error('unexpected call');
   };
   assert.deepEqual(await verifyTreasuryManifest(manifest, request), {
-    status: 'verified', ...records
+    status: 'verified', ...records,
+    blockNumber: 16n,
+    blockHash: hash('44'),
+    timestamp: 32n,
+    blockTag: '0x10'
   });
   await assert.rejects(
     verifyTreasuryManifest({
-      ...manifest, runtimeCodeHashes: { treasuryExecutor: hash('11') }
+      ...manifest, runtimeCodeHashes: {
+        ...manifest.runtimeCodeHashes, treasuryExecutor: hash('11')
+      }
     }, request),
     /runtime bytecode/
   );
+  assert.throws(() => validateTreasuryManifest({ ...manifest, schemaVersion: 3 }), /version 4/);
+  assert.throws(() => validateTreasuryManifest({
+    ...manifest,
+    runtimeCodeHashes: {
+      treasuryExecutor: manifest.runtimeCodeHashes.treasuryExecutor,
+      vault: manifest.runtimeCodeHashes.vault,
+      proposalGateway: manifest.runtimeCodeHashes.proposalGateway,
+      arbitration: manifest.runtimeCodeHashes.arbitration
+    }
+  }), /canonical order/);
+});
+
+test('agent lifecycle roots self-consistent stacks without unsafe JSON-number preimage claims', async () => {
+  const bundle = JSON.parse(await readFile(new URL('./fao-creation-codes.json', import.meta.url), 'utf8'));
+  const deploymentRecord = (id, source, contract, code) => ({
+    address: address(id), source, contract,
+    transaction: { hash: hash(id.toString(16).padStart(2, '0')), block: id, nonce: id, from: address(id + 100) },
+    creationCodeBytes: 1, creationCodeKeccak256: keccak256(code),
+    runtimeCodeBytes: (code.length - 2) / 2, runtimeCodeKeccak256: keccak256(code)
+  });
+  const registrarCode = '0x600a';
+  const shared = {
+    schemaVersion: 1, network: 'sepolia', chainId: 11155111,
+    registrar: deploymentRecord(40, 'src/FaoGenesisRegistrar.sol', 'FaoGenesisRegistrar', registrarCode),
+    prerequisites: {
+      proposalImplementation: deploymentRecord(
+        41, 'src/FAOFutarchyProposal.sol', 'FAOFutarchyProposal', '0x600b'
+      ),
+      stackDeployer: deploymentRecord(
+        42, 'src/FAOSiteStackDeployer.sol', 'FAOSiteStackDeployer', '0x600c'
+      )
+    }
+  };
+  const cid = `ipfs://b${'a'.repeat(58)}`;
+  const input = creationInputFromDraft({
+    tokenName: 'Evidence FAO', tokenSymbol: 'EFAO',
+    governedRepository: 'https://github.com/example/fao', governedSite: 'https://example.test',
+    saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
+    initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
+    tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',
+    daoURI: cid, metadataURI: cid, votingStrategyMetadataURI: cid,
+    proposalValidationStrategyMetadataURI: cid
+  }, { ...shared, status: 'active' }, 2_000_000_000n);
+  const commitments = economicCommitmentHashes(input.coreConfig, input.grants, input.flmConfig);
+  const dependencyKeys = [
+    'proxyFactory', 'spaceImplementation', 'proposalValidationStrategy', 'stackDeployer',
+    'proposalImplementation', 'weth', 'conditionalTokens', 'wrapped1155Factory',
+    'uniswapV3Factory'
+  ];
+  const economicCoreConfig = { ...input.coreConfig };
+  for (const key of dependencyKeys) {
+    economicCoreConfig[key] = {
+      target: input.coreConfig[key].target,
+      runtimeCodeKeccak256: input.coreConfig[key].codehash
+    };
+  }
+  const economicFlmConfig = {
+    positionManager: {
+      target: input.flmConfig.positionManager.target,
+      runtimeCodeKeccak256: input.flmConfig.positionManager.codehash
+    }
+  };
+  const base = treasuryManifest();
+  const receiptAddress = address(30);
+  const stager = address(31);
+  const lifecycleCodes = {
+    [base.contracts.vault]: '0x6101',
+    [base.contracts.proposalGateway]: '0x6102',
+    [base.contracts.arbitration]: '0x6103',
+    [base.contracts.treasuryExecutor]: '0x6104'
+  };
+  const manifest = {
+    ...base,
+    creationRoute: 'registrar',
+    transactions: {
+      receiptCreate: { hash: hash('77'), block: 5, nonce: 1, from: stager },
+      deployCore: { hash: hash('78'), block: 6, nonce: 2, from: stager },
+      deployFlm: { hash: hash('79'), block: 7, nonce: 3, from: stager }
+    },
+    receipt: {
+      address: receiptAddress,
+      source: 'src/FaoGenesisDeployment.sol',
+      contract: 'FaoGenesisDeployment',
+      stageNonce: 1,
+      creationCodeBytes: (bundle.creationCodes.receipt.length - 2) / 2,
+      creationCodeKeccak256: keccak256(bundle.creationCodes.receipt),
+      coreConfigHash: commitments.core,
+      flmConfigHash: commitments.flm,
+      registrar: {
+        target: shared.registrar.address,
+        runtimeCodeKeccak256: shared.registrar.runtimeCodeKeccak256
+      }
+    },
+    coreConfig: economicCoreConfig,
+    grants: input.grants,
+    flmConfig: economicFlmConfig,
+    runtimeCodeHashes: {
+      vault: keccak256(lifecycleCodes[base.contracts.vault]),
+      proposalGateway: keccak256(lifecycleCodes[base.contracts.proposalGateway]),
+      arbitration: keccak256(lifecycleCodes[base.contracts.arbitration]),
+      treasuryExecutor: keccak256(lifecycleCodes[base.contracts.treasuryExecutor])
+    }
+  };
+  const pinnedHash = hash('88');
+  const stageHash = hash('66');
+  const coreBlockHash = hash('67');
+  const flmBlockHash = hash('68');
+  const stageLog = {
+    address: shared.registrar.address,
+    blockNumber: '0x5',
+    blockHash: stageHash,
+    transactionHash: manifest.transactions.receiptCreate.hash,
+    logIndex: '0x0',
+    topics: [
+      '0x8973a01bba3f334d825bf89174c5a81d41623a8065f3217205ab1a3e59a104f4',
+      `0x${addressWord(receiptAddress)}`,
+      commitments.core,
+      commitments.flm
+    ],
+    data: word(stager)
+  };
+  const coreLog = {
+    address: receiptAddress,
+    blockNumber: '0x6', blockHash: coreBlockHash,
+    transactionHash: manifest.transactions.deployCore.hash, logIndex: '0x0',
+    topics: [
+      '0x14ff846bb4cfd1fc5532bfd1985c0eb4c21898c217d598c527e99057d0a37e4c',
+      `0x${addressWord(manifest.contracts.vault)}`,
+      `0x${addressWord(manifest.contracts.companyToken)}`,
+      `0x${addressWord(manifest.contracts.space)}`
+    ],
+    data: `0x${[
+      manifest.contracts.arbitration, manifest.contracts.evaluator, manifest.contracts.spotPool
+    ].map((value) => addressWord(value)).join('')}`
+  };
+  const flmLog = {
+    address: receiptAddress,
+    blockNumber: '0x7', blockHash: flmBlockHash,
+    transactionHash: manifest.transactions.deployFlm.hash, logIndex: '0x0',
+    topics: [
+      '0xaddc5fbefc27baeeb76557046cf0702c071bbfb91d131ff9312e6e401d6fe4e1',
+      `0x${addressWord(manifest.contracts.manager)}`
+    ],
+    data: `0x${[
+      manifest.contracts.relay, manifest.contracts.spotAdapter
+    ].map((value) => addressWord(value)).join('')}`
+  };
+  const request = async (method, params) => {
+    if (method === 'eth_getCode') {
+      const target = params[0];
+      if (target === shared.registrar.address) return registrarCode;
+      if (target === shared.prerequisites.proposalImplementation.address) return '0x600b';
+      if (target === shared.prerequisites.stackDeployer.address) return '0x600c';
+      if (target === receiptAddress) return '0x6010';
+      return lifecycleCodes[target] || '0x';
+    }
+    if (method === 'eth_getLogs') {
+      const filter = params[0];
+      if (filter.address === shared.registrar.address) return [stageLog];
+      if (filter.topics[0] === coreLog.topics[0]) return [coreLog];
+      if (filter.topics[0] === flmLog.topics[0]) return [flmLog];
+    }
+    if (method === 'eth_getBlockByNumber') {
+      return { hash: {
+        '0x5': stageHash, '0x6': coreBlockHash, '0x7': flmBlockHash
+      }[params[0]] || pinnedHash };
+    }
+    if (method === 'eth_call') {
+      const [{ to, data }] = params;
+      if (to === shared.registrar.address && data === '0x831c4e7b') {
+        return keccak256(bundle.creationCodes.receipt);
+      }
+      if (to === shared.registrar.address && data.startsWith('0x5421831b')) return word(receiptAddress);
+      if (to === receiptAddress && data === '0xb1b4fc36') return commitments.core;
+      if (to === receiptAddress && data === '0x1092769f') return commitments.flm;
+      if (to === receiptAddress && ['0x73797f98', '0xe05abb68'].includes(data)) return `0x${uintWord(1)}`;
+      if (to === receiptAddress && data === '0xfbfa77cf') return word(manifest.contracts.vault);
+      if (to === receiptAddress && data === '0x04e31dfb') return word(manifest.contracts.proposalGateway);
+      if (to === receiptAddress && data === '0x9b732350') return word(manifest.contracts.arbitration);
+      if (to === manifest.contracts.vault && data === '0x0d618c81') return word(manifest.contracts.treasuryExecutor);
+      if (to === manifest.contracts.treasuryExecutor && data === '0x411557d1') return word(manifest.contracts.vault);
+      if (to === manifest.contracts.proposalGateway && data === '0xfbfa77cf') return word(manifest.contracts.vault);
+      if (to === manifest.contracts.proposalGateway && data === '0x9b732350') return word(manifest.contracts.arbitration);
+    }
+    throw new Error(`unexpected ${method} ${JSON.stringify(params)}`);
+  };
+  const repoLoadedShared = { ...shared, status: 'active', explorer: 'https://sepolia.etherscan.io' };
+  const verified = await verifyAgentWorkProvenance({
+    manifest,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  });
+  assert.equal(verified.receipt, receiptAddress);
+  assert.equal(verified.vault, manifest.contracts.vault);
+
+  const lossyDisplayOnly = structuredClone(manifest);
+  lossyDisplayOnly.coreConfig.saleCap = Number.MAX_SAFE_INTEGER + 2;
+  const hashSealed = await verifyAgentWorkProvenance({
+    manifest: lossyDisplayOnly,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  });
+  assert.equal(hashSealed.receipt, receiptAddress);
+
+  const malicious = structuredClone(manifest);
+  malicious.contracts.vault = address(50);
+  malicious.contracts.proposalGateway = address(51);
+  malicious.contracts.arbitration = address(52);
+  malicious.contracts.treasuryExecutor = address(53);
+  malicious.runtimeCodeHashes = {
+    vault: keccak256('0x6201'), proposalGateway: keccak256('0x6202'),
+    arbitration: keccak256('0x6203'), treasuryExecutor: keccak256('0x6204')
+  };
+  await assert.rejects(verifyAgentWorkProvenance({
+    manifest: malicious,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  }), /CoreSealed|receipt lifecycle wiring/);
 });
 
 test('buyback read is one-block, chain/address-bound, and rejects malformed ABI words', async () => {
@@ -336,7 +575,12 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'Transaction state',
     'Call buyback',
     'Agent task → receipt → payment evidence',
-    'predicted\\s+CREATE2 address is not a deployment',
+    'build prediction is not a',
+    'explicitly incomplete',
+    'Valid payment envelopes',
+    'block-delta-consistent',
+    'not a transaction-level state diff',
+    'does not claim to revalidate the full economic config',
     'Accepted is authorization, not payment',
     'unverified—not paid'
   ]) assert.match(html, new RegExp(text));

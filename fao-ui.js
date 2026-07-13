@@ -22,6 +22,7 @@ export function buybackActionStateAfterRefresh(current) {
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
 const MAX_AGENT_PAYMENT_VIEWS = 100;
+const MAX_AGENT_RENDERED_RECORDS = 100;
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
 export const PINNED_DEPENDENCIES = Object.freeze({
@@ -38,8 +39,18 @@ const RECEIPT_SELECTORS = Object.freeze({
   coreHash: '0xb1b4fc36',
   flmHash: '0x1092769f',
   coreSealed: '0x73797f98',
-  flmSealed: '0xe05abb68'
+  flmSealed: '0xe05abb68',
+  vault: '0xfbfa77cf',
+  proposalGateway: '0x04e31dfb',
+  arbitration: '0x9b732350'
 });
+const REGISTRAR_RECEIPT_CODE_HASH = '0x831c4e7b';
+const GENESIS_STAGED_TOPIC =
+  '0x8973a01bba3f334d825bf89174c5a81d41623a8065f3217205ab1a3e59a104f4';
+const CORE_SEALED_TOPIC =
+  '0x14ff846bb4cfd1fc5532bfd1985c0eb4c21898c217d598c527e99057d0a37e4c';
+const FLM_SEALED_TOPIC =
+  '0xaddc5fbefc27baeeb76557046cf0702c071bbfb91d131ff9312e6e401d6fe4e1';
 const TREASURY_VIEW_SELECTORS = Object.freeze({
   executorFromVault: '0x0d618c81',
   vaultFromExecutor: '0x411557d1',
@@ -287,21 +298,38 @@ export async function submitBuybackOnce(operations) {
   }
 }
 
-export async function verifyTreasuryManifest(manifest, request) {
+export async function verifyTreasuryManifest(manifest, request, pinnedBlock = null) {
   if (typeof request !== 'function') throw new Error('An RPC request function is required.');
   const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
-  const call = (to, data) => request('eth_call', [{ to, data }, 'latest']);
-  const [executorCode, executorFromVault, vaultFromExecutor, vaultFromGateway, arbitrationFromGateway] =
+  const block = pinnedBlock || await request('eth_getBlockByNumber', ['finalized', false]);
+  if (!block || typeof block !== 'object') throw new Error('RPC returned no pinned finalized block.');
+  const blockNumber = rpcQuantity(block.number, 'Treasury pinned block number');
+  const blockHash = fao.normalizeHex(block.hash, 32, 'Treasury pinned block hash');
+  const timestamp = rpcQuantity(block.timestamp, 'Treasury pinned block timestamp');
+  const blockTag = `0x${blockNumber.toString(16)}`;
+  const call = (to, data) => request('eth_call', [{ to, data }, blockTag]);
+  const [vaultCode, gatewayCode, arbitrationCode, executorCode,
+    executorFromVault, vaultFromExecutor, vaultFromGateway, arbitrationFromGateway] =
     await Promise.all([
-      request('eth_getCode', [records.executor, 'latest']),
+      request('eth_getCode', [records.vault, blockTag]),
+      request('eth_getCode', [records.gateway, blockTag]),
+      request('eth_getCode', [records.arbitration, blockTag]),
+      request('eth_getCode', [records.executor, blockTag]),
       call(records.vault, TREASURY_VIEW_SELECTORS.executorFromVault),
       call(records.executor, TREASURY_VIEW_SELECTORS.vaultFromExecutor),
       call(records.gateway, TREASURY_VIEW_SELECTORS.vaultFromGateway),
       call(records.gateway, TREASURY_VIEW_SELECTORS.arbitrationFromGateway)
     ]);
-  const code = fao.normalizeHex(executorCode, undefined, 'Treasury executor runtime code');
-  if (code === '0x' || fao.keccak256(code) !== records.executorRuntimeCodeKeccak256) {
-    throw new Error('Treasury executor runtime bytecode does not match the economic manifest.');
+  for (const [label, code_, expected] of [
+    ['vault', vaultCode, records.vaultRuntimeCodeKeccak256],
+    ['proposal gateway', gatewayCode, records.gatewayRuntimeCodeKeccak256],
+    ['arbitration', arbitrationCode, records.arbitrationRuntimeCodeKeccak256],
+    ['executor', executorCode, records.executorRuntimeCodeKeccak256]
+  ]) {
+    const code = fao.normalizeHex(code_, undefined, `Treasury ${label} runtime code`);
+    if (code === '0x' || fao.keccak256(code) !== expected) {
+      throw new Error(`Treasury ${label} runtime bytecode does not match the economic manifest.`);
+    }
   }
   if (addressFromWord(executorFromVault, 'vault.TREASURY_EXECUTOR') !== records.executor
     || addressFromWord(vaultFromExecutor, 'executor.VAULT') !== records.vault
@@ -309,7 +337,234 @@ export async function verifyTreasuryManifest(manifest, request) {
     || addressFromWord(arbitrationFromGateway, 'gateway.arbitration') !== records.arbitration) {
     throw new Error('Treasury vault, executor, gateway, and arbitration wiring does not match the manifest.');
   }
-  return Object.freeze({ status: 'verified', ...records });
+  const after = await request('eth_getBlockByNumber', [blockTag, false]);
+  if (!after || fao.normalizeHex(after.hash, 32, 'Re-read treasury block hash') !== blockHash) {
+    throw new Error('Finalized block hash changed during treasury verification.');
+  }
+  return Object.freeze({
+    status: 'verified', ...records, blockNumber, blockHash, timestamp, blockTag
+  });
+}
+
+export async function verifyAgentWorkProvenance(value) {
+  const input = exactRecord(value, [
+    'manifest', 'selfServeManifest', 'creationBundle', 'indexView', 'request'
+  ], 'Agent-work provenance input');
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+  const manifest = validateTreasuryManifest(input.manifest);
+  if (manifest.creationRoute !== 'registrar') {
+    throw new Error('Positive agent-work lifecycle status requires canonical registrar provenance.');
+  }
+  const { explorer: _explorer, status: normalizedStatus, ...sharedFields } = input.selfServeManifest;
+  const sharedInput = normalizedStatus === 'pre-deployment'
+    ? { ...sharedFields, status: normalizedStatus }
+    : sharedFields;
+  const shared = validateSelfServeManifest(sharedInput);
+  if (shared.status !== 'active') throw new Error('The canonical ownerless registrar is not deployed.');
+  const bundle = validateCreationBundle(input.creationBundle);
+  const view = input.indexView;
+  if (!view || typeof view !== 'object') throw new Error('A pinned AgentWorkIndex view is required.');
+  const blockNumber = BigInt(view.blockNumber);
+  const blockTag = `0x${blockNumber.toString(16)}`;
+  const blockHash = fao.normalizeHex(view.blockHash, 32, 'Agent-work pinned block hash');
+  const receipt = manifest.receipt;
+  const registrar = shared.registrar;
+  if (receipt.registrar.target !== registrar.address
+    || receipt.registrar.runtimeCodeKeccak256 !== registrar.runtimeCodeKeccak256) {
+    throw new Error('Economic receipt does not bind the canonical self-serve registrar.');
+  }
+  const receiptBaseCode = fao.normalizeHex(
+    bundle.creationCodes.receipt, undefined, 'Embedded receipt creation code'
+  );
+  if ((receiptBaseCode.length - 2) / 2 !== receipt.creationCodeBytes
+    || fao.keccak256(receiptBaseCode) !== receipt.creationCodeKeccak256) {
+    throw new Error('Economic receipt does not bind the embedded receipt base blob.');
+  }
+  // JSON numbers above 2^53 are not lossless in browsers. The stable client verifies the
+  // hash-sealed deployment and wiring; FAO's Python validator verifies the full config preimage.
+  const hashes = Object.freeze({ core: receipt.coreConfigHash, flm: receipt.flmConfigHash });
+  const expectedDependencies = {
+    ...PINNED_DEPENDENCIES,
+    proposalImplementation: {
+      target: shared.prerequisites.proposalImplementation.address,
+      codehash: shared.prerequisites.proposalImplementation.runtimeCodeKeccak256
+    },
+    stackDeployer: {
+      target: shared.prerequisites.stackDeployer.address,
+      codehash: shared.prerequisites.stackDeployer.runtimeCodeKeccak256
+    }
+  };
+  for (const [key, expected] of Object.entries(expectedDependencies)) {
+    const actual = key === 'positionManager' ? manifest.flmConfig.positionManager : manifest.coreConfig[key];
+    if (!actual || fao.normalizeAddress(actual.target) !== expected.target
+      || Object.keys(actual).length !== 2
+      || !Object.hasOwn(actual, 'runtimeCodeKeccak256')
+      || fao.normalizeHex(
+        actual.runtimeCodeKeccak256, 32, `${key} configured runtime code hash`
+      ) !== expected.codehash) {
+      throw new Error(`Economic receipt does not bind the stable client's canonical ${key}.`);
+    }
+  }
+  const call = (to, data) => input.request('eth_call', [{ to, data }, blockTag]);
+  const [registrarCode, proposalCode, stackCode, registrarReceiptHash, predictedWord] = await Promise.all([
+    input.request('eth_getCode', [registrar.address, blockTag]),
+    input.request('eth_getCode', [shared.prerequisites.proposalImplementation.address, blockTag]),
+    input.request('eth_getCode', [shared.prerequisites.stackDeployer.address, blockTag]),
+    call(registrar.address, REGISTRAR_RECEIPT_CODE_HASH),
+    call(registrar.address, fao.predictCalldata(hashes.core, hashes.flm, receiptBaseCode))
+  ]);
+  const normalizedRegistrarCode = fao.normalizeHex(
+    registrarCode, undefined, 'Canonical registrar runtime code'
+  );
+  if (normalizedRegistrarCode === '0x'
+    || fao.keccak256(normalizedRegistrarCode) !== registrar.runtimeCodeKeccak256) {
+    throw new Error('Canonical registrar runtime bytecode does not match selfserve-deployment.json.');
+  }
+  for (const [label, code_, record] of [
+    ['proposal implementation', proposalCode, shared.prerequisites.proposalImplementation],
+    ['stack deployer', stackCode, shared.prerequisites.stackDeployer]
+  ]) {
+    const code = fao.normalizeHex(code_, undefined, `Canonical ${label} runtime code`);
+    if (code === '0x' || fao.keccak256(code) !== record.runtimeCodeKeccak256) {
+      throw new Error(`Canonical ${label} runtime bytecode does not match selfserve-deployment.json.`);
+    }
+  }
+  if (fao.normalizeHex(registrarReceiptHash, 32, 'Registrar receipt base hash')
+    !== fao.keccak256(receiptBaseCode)) {
+    throw new Error('Canonical registrar immutable receipt hash does not match the embedded blob.');
+  }
+  if (addressFromWord(predictedWord, 'Registrar predicted receipt') !== receipt.address) {
+    throw new Error('Economic receipt is not the canonical registrar CREATE2 prediction.');
+  }
+  const stageBlock = BigInt(manifest.transactions.receiptCreate.block);
+  if (stageBlock > blockNumber) throw new Error('Receipt staging postdates the pinned finalized block.');
+  const stageTag = `0x${stageBlock.toString(16)}`;
+  const stageLogs = await input.request('eth_getLogs', [{
+    address: registrar.address,
+    fromBlock: stageTag,
+    toBlock: stageTag,
+    topics: [
+      GENESIS_STAGED_TOPIC,
+      `0x${fao.addressWord(receipt.address)}`,
+      receipt.coreConfigHash,
+      receipt.flmConfigHash
+    ]
+  }]);
+  if (!Array.isArray(stageLogs) || stageLogs.length !== 1) {
+    throw new Error('Canonical GenesisStaged provenance log is missing or ambiguous.');
+  }
+  const stageLog = stageLogs[0];
+  rpcQuantity(stageLog.logIndex, 'GenesisStaged log index');
+  const stageBlockEvidence = await input.request('eth_getBlockByNumber', [stageTag, false]);
+  const expectedStageTopics = [
+    GENESIS_STAGED_TOPIC,
+    `0x${fao.addressWord(receipt.address)}`,
+    receipt.coreConfigHash,
+    receipt.flmConfigHash
+  ];
+  if (!stageBlockEvidence || stageLog.removed === true
+    || fao.normalizeAddress(stageLog.address) !== registrar.address
+    || !Array.isArray(stageLog.topics) || stageLog.topics.length !== expectedStageTopics.length
+    || stageLog.topics.some((topic, index) => (
+      fao.normalizeHex(topic, 32, `GenesisStaged topic ${index}`) !== expectedStageTopics[index]
+    ))
+    || fao.normalizeHex(stageLog.blockHash, 32, 'GenesisStaged block hash')
+      !== fao.normalizeHex(stageBlockEvidence.hash, 32, 'GenesisStaged canonical block hash')
+    || BigInt(stageLog.blockNumber) !== stageBlock
+    || fao.normalizeHex(stageLog.transactionHash, 32, 'GenesisStaged transaction hash')
+      !== manifest.transactions.receiptCreate.hash
+    || addressFromWord(stageLog.data, 'GenesisStaged stager')
+      !== manifest.transactions.receiptCreate.from) {
+    throw new Error('GenesisStaged event does not match canonical transaction provenance.');
+  }
+  for (const spec of [
+    {
+      label: 'CoreSealed',
+      topic: CORE_SEALED_TOPIC,
+      transaction: manifest.transactions.deployCore,
+      topics: [
+        CORE_SEALED_TOPIC,
+        `0x${fao.addressWord(manifest.contracts.vault)}`,
+        `0x${fao.addressWord(manifest.contracts.companyToken)}`,
+        `0x${fao.addressWord(manifest.contracts.space)}`
+      ],
+      data: `0x${[
+        manifest.contracts.arbitration, manifest.contracts.evaluator, manifest.contracts.spotPool
+      ].map((address) => fao.addressWord(address)).join('')}`
+    },
+    {
+      label: 'FlmSealed',
+      topic: FLM_SEALED_TOPIC,
+      transaction: manifest.transactions.deployFlm,
+      topics: [FLM_SEALED_TOPIC, `0x${fao.addressWord(manifest.contracts.manager)}`],
+      data: `0x${[
+        manifest.contracts.relay, manifest.contracts.spotAdapter
+      ].map((address) => fao.addressWord(address)).join('')}`
+    }
+  ]) {
+    const eventBlock = BigInt(spec.transaction.block);
+    if (eventBlock > blockNumber) throw new Error(`${spec.label} postdates the pinned finalized block.`);
+    const eventTag = `0x${eventBlock.toString(16)}`;
+    const [logs, canonicalBlock] = await Promise.all([
+      input.request('eth_getLogs', [{
+        address: receipt.address,
+        fromBlock: eventTag,
+        toBlock: eventTag,
+        topics: [spec.topic]
+      }]),
+      input.request('eth_getBlockByNumber', [eventTag, false])
+    ]);
+    const log = Array.isArray(logs) && logs.length === 1 ? logs[0] : null;
+    if (log) rpcQuantity(log.logIndex, `${spec.label} log index`);
+    if (!log || !canonicalBlock || log.removed === true
+      || fao.normalizeAddress(log.address) !== receipt.address
+      || BigInt(log.blockNumber) !== eventBlock
+      || fao.normalizeHex(log.blockHash, 32, `${spec.label} block hash`)
+        !== fao.normalizeHex(canonicalBlock.hash, 32, `${spec.label} canonical block hash`)
+      || fao.normalizeHex(log.transactionHash, 32, `${spec.label} transaction hash`)
+        !== spec.transaction.hash
+      || !Array.isArray(log.topics) || log.topics.length !== spec.topics.length
+      || log.topics.some((topic, index) => (
+        fao.normalizeHex(topic, 32, `${spec.label} topic ${index}`) !== spec.topics[index]
+      ))
+      || fao.normalizeHex(log.data, spec.data.length / 2 - 1, `${spec.label} data`) !== spec.data) {
+      throw new Error(`${spec.label} event does not match canonical receipt provenance.`);
+    }
+  }
+  const [receiptCode, coreHash, flmHash, coreSealed, flmSealed,
+    receiptVault, receiptGateway, receiptArbitration] = await Promise.all([
+    input.request('eth_getCode', [receipt.address, blockTag]),
+    call(receipt.address, RECEIPT_SELECTORS.coreHash),
+    call(receipt.address, RECEIPT_SELECTORS.flmHash),
+    call(receipt.address, RECEIPT_SELECTORS.coreSealed),
+    call(receipt.address, RECEIPT_SELECTORS.flmSealed),
+    call(receipt.address, RECEIPT_SELECTORS.vault),
+    call(receipt.address, RECEIPT_SELECTORS.proposalGateway),
+    call(receipt.address, RECEIPT_SELECTORS.arbitration)
+  ]);
+  if (fao.normalizeHex(receiptCode, undefined, 'Receipt runtime code') === '0x'
+    || fao.normalizeHex(coreHash, 32, 'Receipt core hash') !== hashes.core
+    || fao.normalizeHex(flmHash, 32, 'Receipt FLM hash') !== hashes.flm
+    || uintFromWord(coreSealed, 'Receipt coreSealed') !== 1n
+    || uintFromWord(flmSealed, 'Receipt flmSealed') !== 1n) {
+    throw new Error('Canonical receipt code or sealed commitments do not match.');
+  }
+  const records = treasuryRuntimeRecords(manifest);
+  if (addressFromWord(receiptVault, 'Receipt vault') !== records.vault
+    || addressFromWord(receiptGateway, 'Receipt proposal gateway') !== records.gateway
+    || addressFromWord(receiptArbitration, 'Receipt arbitration') !== records.arbitration) {
+    throw new Error('Canonical receipt lifecycle wiring does not match the economic manifest.');
+  }
+  const verified = await verifyTreasuryManifest(manifest, input.request, {
+    number: blockTag,
+    hash: blockHash,
+    timestamp: `0x${BigInt(view.timestamp).toString(16)}`
+  });
+  const after = await input.request('eth_getBlockByNumber', [blockTag, false]);
+  if (!after || fao.normalizeHex(after.hash, 32, 'Re-read provenance block hash') !== blockHash) {
+    throw new Error('Finalized block hash changed during registrar provenance verification.');
+  }
+  return Object.freeze({ ...verified, receipt: receipt.address, registrar: registrar.address });
 }
 
 export function creationInputFromDraft(draft, manifest, currentTimestamp) {
@@ -560,7 +815,7 @@ function agentWorkDetail(label, value) {
 function renderAgentWork() {
   const view = state.agentWork;
   elements.agentWorkResults.hidden = !view;
-  elements.agentWorkVerification.textContent = view ? 'Code verified' : 'Not configured';
+  elements.agentWorkVerification.textContent = view ? 'Code + provenance verified' : 'Not configured';
   elements.agentWorkVerification.className = `status ${view ? 'verified' : 'unverified'}`;
   elements.agentWorkBlock.textContent = view ? view.blockNumber.toString() : '—';
   elements.agentWorkTaskCount.textContent = view ? String(view.tasks.length) : '—';
@@ -572,8 +827,8 @@ function renderAgentWork() {
   elements.agentWorkRejected.replaceChildren();
   if (!view) return;
 
-  for (const task of view.tasks) {
-    const receipts = view.receipts.filter((entry) => entry.value.task === task.documentDigest);
+  for (const task of view.renderedTasks) {
+    const receipts = view.renderedReceipts.filter((entry) => entry.value.task === task.documentDigest);
     const item = document.createElement('li');
     item.className = 'stage-card';
     const body = document.createElement('div');
@@ -605,7 +860,7 @@ function renderAgentWork() {
   }
 
   for (const entry of view.paymentViews) {
-    const { record, state: payment, plan } = entry;
+    const { record, state: payment, plan, error } = entry;
     const item = document.createElement('li');
     item.className = 'stage-card';
     const body = document.createElement('div');
@@ -613,29 +868,41 @@ function renderAgentWork() {
     heading.textContent = `${record.value.amount} raw units → ${record.value.recipient}`;
     const meanings = document.createElement('p');
     meanings.className = 'details';
-    meanings.textContent = `Acceptance: ${payment.acceptance.state}${payment.acceptance.route ? ` (${payment.acceptance.route})` : ''} · Executability: ${payment.execution.state} · Payment: ${payment.paymentState.state}.`;
+    meanings.textContent = error
+      ? `Lifecycle verification: unverified · ${error}`
+      : `Acceptance: ${payment.acceptance.state}${payment.acceptance.route ? ` (${payment.acceptance.route})` : ''} · Executability: ${payment.execution.state} · Payment: ${payment.paymentState.state}${payment.paymentState.state === 'paid' ? ' · block-delta-consistent' : ''}.`;
     body.append(
       heading,
       agentWorkDetail('Envelope', record.documentDigest),
-      agentWorkDetail('Proposal / action', payment.actionHash),
+      agentWorkDetail('Proposal / action', payment?.actionHash || 'Unverified'),
       meanings
     );
+    if (!plan) {
+      item.append(body);
+      elements.agentWorkPayments.append(item);
+      continue;
+    }
     const exact = document.createElement('details');
     const summary = document.createElement('summary');
     const steps = document.createElement('ol');
-    summary.textContent = 'Exact read-only transaction plan';
+    summary.textContent = 'State-gated calldata references';
+    const omissions = document.createElement('p');
+    omissions.className = 'details';
+    omissions.textContent = plan.omissions;
     for (const step of plan.steps) {
       const row = document.createElement('li');
       const label = document.createElement('strong');
       const target = document.createElement('code');
       const data = document.createElement('code');
-      label.textContent = step.label;
+      const gate = document.createElement('span');
+      label.textContent = `${step.label} · ${step.available ? 'available' : 'not available'}`;
+      gate.textContent = step.gate;
       target.textContent = step.target;
       data.textContent = step.data;
-      row.append(label, document.createElement('br'), target, document.createElement('br'), data);
+      row.append(label, document.createElement('br'), gate, document.createElement('br'), target, document.createElement('br'), data);
       steps.append(row);
     }
-    exact.append(summary, steps);
+    exact.append(summary, omissions, steps);
     body.append(exact);
     item.append(body);
     elements.agentWorkPayments.append(item);
@@ -645,7 +912,7 @@ function renderAgentWork() {
     empty.textContent = 'No valid payment lineage in the configured range.';
     elements.agentWorkPayments.append(empty);
   }
-  for (const rejected of view.rejected) {
+  for (const rejected of view.renderedRejected) {
     const item = document.createElement('li');
     item.textContent = `${rejected.transactionHash || 'Unknown transaction'} · ${rejected.reason}`;
     elements.agentWorkRejected.append(item);
@@ -971,7 +1238,7 @@ async function loadTreasuryManifest(event) {
   elements.treasuryVault.textContent = records.vault;
   await refreshBuybackState(false);
   setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
-  setMessage(elements.treasuryStatus, 'Executor runtime, custody wiring, and buyback state verified on Sepolia.');
+  setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
   renderTreasuryGate();
 }
 
@@ -983,23 +1250,26 @@ async function loadAgentWork(event) {
   }
   state.agentWork = null;
   renderAgentWork();
-  const fresh = await verifyTreasuryManifest(state.treasuryManifest, rpc);
-  if (fresh.vault !== state.treasuryRecords.vault || fresh.executor !== state.treasuryRecords.executor) {
-    throw new Error('Treasury manifest wiring changed.');
-  }
   const values = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const manifest = validateTreasuryManifest(state.treasuryManifest);
   const view = await fao.readAgentWorkIndex({
     request: rpc,
-    config: {
-      address: values.address,
-      runtimeCodeKeccak256: values.runtimeCodeKeccak256,
-      startBlock: values.startBlock
-    },
+    config: { address: values.address, startBlock: values.startBlock },
     chainId: SEPOLIA_CHAIN_ID,
-    vault: fresh.vault
+    vault: manifest.contracts.vault
   });
-  const inspectedPayments = view.payments.slice(-MAX_AGENT_PAYMENT_VIEWS);
-  const paymentViews = await Promise.all(inspectedPayments.map(async (record) => {
+  const fresh = await verifyAgentWorkProvenance({
+    manifest,
+    selfServeManifest: state.manifest,
+    creationBundle: state.creationBundle,
+    indexView: view,
+    request: rpc
+  });
+  const inspectedPayments = fao.selectAgentPayments(view.payments, {
+    limit: MAX_AGENT_PAYMENT_VIEWS,
+    digest: values.lookupDigest
+  });
+  const paymentViews = await fao.inspectAgentPayments(inspectedPayments, 3, async (record) => {
     const payment = await fao.readAgentPaymentState({
       request: rpc,
       chainId: SEPOLIA_CHAIN_ID,
@@ -1009,6 +1279,7 @@ async function loadAgentWork(event) {
       executor: fresh.executor,
       startBlock: view.config.startBlock,
       blockNumber: view.blockNumber,
+      blockHash: view.blockHash,
       timestamp: view.timestamp,
       payment: record.document
     });
@@ -1020,18 +1291,41 @@ async function loadAgentWork(event) {
         gateway: fresh.gateway,
         vault: fresh.vault,
         chainId: SEPOLIA_CHAIN_ID,
-        payment: record.document
+        payment: record.document,
+        state: payment
       })
     });
-  }));
+  });
+  const exactPayment = values.lookupDigest
+    ? view.payments.find((record) => record.documentDigest === values.lookupDigest.toLowerCase())
+    : null;
+  const exactReceipt = exactPayment
+    ? view.receipts.find((record) => record.documentDigest === exactPayment.value.receipt)
+    : null;
+  const exactTask = exactPayment
+    ? view.tasks.find((record) => record.documentDigest === exactPayment.value.task)
+    : null;
+  const cappedWith = (records, exact) => {
+    const selected = records.slice(-MAX_AGENT_RENDERED_RECORDS);
+    if (exact && !selected.some((record) => record.documentDigest === exact.documentDigest)) {
+      if (selected.length === MAX_AGENT_RENDERED_RECORDS) selected.shift();
+      selected.push(exact);
+    }
+    return Object.freeze(selected);
+  };
   const omittedPayments = view.payments.length - inspectedPayments.length;
   state.agentWork = Object.freeze({
-    ...view, paymentViews: Object.freeze(paymentViews), omittedPayments
+    ...view,
+    paymentViews,
+    renderedTasks: cappedWith(view.tasks, exactTask),
+    renderedReceipts: cappedWith(view.receipts, exactReceipt),
+    renderedRejected: Object.freeze(view.rejected.slice(-MAX_AGENT_RENDERED_RECORDS)),
+    omittedPayments
   });
   renderAgentWork();
   setMessage(
     elements.agentWorkStatus,
-    `Verified index code and reconstructed ${view.records.length} valid records through finalized Sepolia block ${view.blockNumber}. Rejected records remain inert evidence.${omittedPayments ? ` Lifecycle reads show the latest ${MAX_AGENT_PAYMENT_VIEWS} of ${view.payments.length} payments.` : ''}`
+    `Verified canonical registrar provenance, receipt, lifecycle code, wiring, and index code through finalized Sepolia block ${view.blockNumber}. The caller-selected start block makes this an explicitly incomplete discovery range; rejected records remain inert. Rendered record lists are capped at ${MAX_AGENT_RENDERED_RECORDS}.${omittedPayments ? ` Lifecycle reads show ${inspectedPayments.length} of ${view.payments.length} envelopes; use exact digest lookup for an older envelope.` : ''}`
   );
 }
 

@@ -12,11 +12,13 @@ import {
   agentPaymentTransferAction,
   buildAgentReceipt,
   buildAgentTask,
+  inspectAgentPayments,
   keccak256,
   prepareAgentPaymentTransactions,
   readAgentPaymentState,
   readAgentWorkIndex,
   reconstructAgentWorkLogs,
+  selectAgentPayments,
   uintWord,
   validateAgentPaymentBinding
 } from './fao.js';
@@ -36,6 +38,9 @@ const ARBITRATION = address('33');
 const EXECUTOR = address('44');
 const PUBLISHER = address('69');
 const VAULT = fixture.payment.input.vault.toLowerCase();
+const BLOCK_HASH = digest('55');
+const INDEX_RUNTIME = '0x608060408181526004361015610013575f80fd5b5f91823560e01c6352bf8ff214610028575f80fd5b3461013c57606036600319011261013c5760443567ffffffffffffffff80821161013857366023830112156101385781600401359281841161013457602483019260248536920101116101345783156101255750601f1980601f85011691855191603f840116820190828210908211176101115785528381526020956060959493929187810190858583378289878301015251902095848795875195338752888b880152818988015283870137840101527f9b8065b31fd378509bae92224c8f432ce836e42765fe48ed19a4c94713cc24a460243592606081600435948101030190a451908152f35b634e487b7160e01b87526041600452602487fd5b6362c3368960e01b8152600490fd5b8580fd5b8480fd5b8280fdfea2646970667358221220ff7c280a44e3bacfe8b95363943ae27fea7bf6fa1781cf7c6c3369397ab20d3164736f6c63430008140033';
+assert.equal(keccak256(INDEX_RUNTIME), AGENT_WORK_INDEX.runtimeCodeKeccak256);
 
 function publishedLog(type, document, parentDigest, blockNumber, logIndex = 0n) {
   const kind = AGENT_WORK_KINDS[type];
@@ -43,6 +48,7 @@ function publishedLog(type, document, parentDigest, blockNumber, logIndex = 0n) 
   return {
     address: INDEX,
     blockNumber: q(blockNumber),
+    blockHash: BLOCK_HASH,
     logIndex: q(logIndex),
     transactionHash: tx((Number(blockNumber) + Number(logIndex)).toString(16).padStart(2, '0')),
     topics: [AGENT_WORK_INDEX.publishedTopic, kind, parentDigest, documentDigest],
@@ -96,45 +102,77 @@ test('bad lineage remains inert and cannot become a payment view', () => {
 test('configured index requires actual matching code and never promotes a predicted address', async () => {
   const request = async (method) => {
     if (method === 'eth_chainId') return q(11155111);
-    if (method === 'eth_getBlockByNumber') return { number: q(10), timestamp: q(20) };
+    if (method === 'eth_getBlockByNumber') return { number: q(10), timestamp: q(20), hash: BLOCK_HASH };
     if (method === 'eth_getCode') return '0x';
     throw new Error(`unexpected ${method}`);
   };
   await assert.rejects(() => readAgentWorkIndex({
     request,
-    config: { address: INDEX, runtimeCodeKeccak256: keccak256('0x6000'), startBlock: '1' },
+    config: { address: INDEX, startBlock: '1' },
     chainId: 11155111,
     vault: VAULT
   }), /predicted address is not a deployment/);
 });
 
 test('index verification pins code and logs to the finalized block', async () => {
-  const code = '0x6000';
+  const code = INDEX_RUNTIME;
   const calls = [];
   const request = async (method, params) => {
     calls.push([method, params]);
     if (method === 'eth_chainId') return q(11155111);
-    if (method === 'eth_getBlockByNumber') return { number: q(10), timestamp: q(20) };
+    if (method === 'eth_getBlockByNumber') return { number: q(25001), timestamp: q(20), hash: BLOCK_HASH };
     if (method === 'eth_getCode') return code;
     if (method === 'eth_getLogs') return [];
     throw new Error(`unexpected ${method}`);
   };
   const view = await readAgentWorkIndex({
     request,
-    config: { address: INDEX, runtimeCodeKeccak256: keccak256(code), startBlock: '1' },
+    config: { address: INDEX, startBlock: '1' },
     chainId: 11155111,
     vault: VAULT
   });
-  assert.equal(view.blockNumber, 10n);
+  assert.equal(view.blockNumber, 25001n);
   assert.deepEqual(calls.find(([method]) => method === 'eth_getBlockByNumber')[1], ['finalized', false]);
-  assert.deepEqual(calls.find(([method]) => method === 'eth_getCode')[1], [INDEX, q(10)]);
-  assert.equal(calls.find(([method]) => method === 'eth_getLogs')[1][0].toBlock, q(10));
+  assert.deepEqual(calls.find(([method]) => method === 'eth_getCode')[1], [INDEX, q(25001)]);
+  assert.deepEqual(
+    calls.filter(([method]) => method === 'eth_getLogs').map(([, [filter]]) => (
+      [filter.fromBlock, filter.toBlock]
+    )),
+    [[q(1), q(10000)], [q(10001), q(20000)], [q(20001), q(25001)]]
+  );
+  assert.equal(view.rangeCompleteness, 'caller-selected-incomplete');
+});
+
+test('log scan rejects out-of-range/conflicting identities and finalized hash changes', async () => {
+  const run = (logs, afterHash = BLOCK_HASH) => {
+    let blockReads = 0;
+    return readAgentWorkIndex({
+      request: async (method) => {
+        if (method === 'eth_chainId') return q(11155111);
+        if (method === 'eth_getBlockByNumber') {
+          blockReads += 1;
+          return { number: q(10), timestamp: q(20), hash: blockReads === 1 ? BLOCK_HASH : afterHash };
+        }
+        if (method === 'eth_getCode') return INDEX_RUNTIME;
+        if (method === 'eth_getLogs') return logs;
+        throw new Error(`unexpected ${method}`);
+      },
+      config: { address: INDEX, startBlock: '1' },
+      chainId: 11155111,
+      vault: VAULT
+    });
+  };
+  const log = publishedLog('task', fixture.task.canonicalHex, digest('00'), 1n);
+  await assert.rejects(run([{ ...log, blockNumber: q(0) }]), /outside the requested range/);
+  await assert.rejects(run([log, { ...log, data: '0x00' }]), /conflicting logs/);
+  await assert.rejects(run([], digest('66')), /Finalized block hash changed/);
 });
 
 function eventLog(address_, topicList, data, blockNumber = 10n, logIndex = 0n) {
   return {
     address: address_, topics: topicList, data,
-    blockNumber: q(blockNumber), logIndex: q(logIndex), transactionHash: tx('77')
+    blockNumber: q(blockNumber), blockHash: BLOCK_HASH,
+    logIndex: q(logIndex), transactionHash: tx('77')
   };
 }
 
@@ -202,6 +240,7 @@ function lifecycleRequest(scenario, {
         }
       }
     }
+    if (method === 'eth_getBlockByNumber') return { hash: BLOCK_HASH };
     throw new Error(`unexpected ${method} ${JSON.stringify(params)}`);
   };
 }
@@ -216,6 +255,7 @@ async function readLifecycle(scenario, options = {}) {
     executor: EXECUTOR,
     startBlock: 1,
     blockNumber: 20,
+    blockHash: BLOCK_HASH,
     timestamp: options.timestamp ?? 150,
     payment: fixture.payment.canonicalHex
   });
@@ -244,11 +284,11 @@ test('expiry and view/log disagreement both fail closed', async () => {
   assert.equal(disagreement.execution.executableNow, false);
 });
 
-test('paid requires exact execution log and exact conserved balance deltas', async () => {
+test('paid requires exact execution proof and block-delta-consistent aggregate balances', async () => {
   const state = await readLifecycle(lifecycleFixture({ queue: 'active', paid: true }));
   assert.equal(state.acceptance.state, 'accepted');
   assert.equal(state.paymentState.state, 'paid');
-  assert.equal(state.paymentState.evidence.exact, true);
+  assert.equal(state.paymentState.evidence.blockDeltaConsistent, true);
   assert.equal(state.execution.state, 'paid');
 
   const ambiguous = await readLifecycle(
@@ -265,10 +305,46 @@ test('payment planner exposes exact calldata only and binds every step to one pr
     gateway: GATEWAY,
     vault: VAULT,
     chainId: 11155111,
-    payment: fixture.payment.canonicalHex
+    payment: fixture.payment.canonicalHex,
+    state: {
+      proposed: true,
+      acceptance: { accepted: true },
+      queue: { executeAfter: 0n },
+      execution: { executableNow: false }
+    }
   });
   assert.equal(plan.actionHash, fixture.payment.actionHash);
   assert.equal(plan.proposalId, fixture.payment.proposalId);
   assert.deepEqual(plan.steps.map(({ target }) => target), [INDEX, GATEWAY, VAULT, VAULT]);
   assert.equal(plan.steps.some((step) => Object.hasOwn(step, 'send')), false);
+  assert.deepEqual(plan.steps.map(({ available }) => available), [false, false, true, false]);
+  assert.match(plan.omissions, /Bond-token approval/);
+});
+
+test('payment selection keeps exact older digests and bounded inspection isolates failures', async () => {
+  const records = Array.from({ length: 120 }, (_, index) => ({
+    documentDigest: `0x${index.toString(16).padStart(64, '0')}`
+  }));
+  const selected = selectAgentPayments(records, { limit: 10, digest: records[0].documentDigest });
+  assert.equal(selected.length, 10);
+  assert.equal(selected.some((record) => record === records[0]), true);
+  assert.throws(
+    () => selectAgentPayments(records, { limit: 10, digest: digest('ff') }),
+    /incomplete range/
+  );
+  let active = 0;
+  let maximum = 0;
+  const inspected = await inspectAgentPayments(records.slice(0, 8), 3, async (record) => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    active -= 1;
+    if (record === records[4]) throw new Error('isolated RPC failure');
+    return { record, state: 'ok' };
+  });
+  assert.ok(maximum <= 3);
+  assert.equal(inspected.length, 8);
+  assert.equal(inspected[4].record, records[4]);
+  assert.match(inspected[4].error, /isolated RPC failure/);
+  assert.equal(inspected[5].state, 'ok');
 });

@@ -5,10 +5,12 @@ binding to `TransferAction`, plus `AgentWorkIndex` publish calldata and log deco
 payments are authorized, executable only while funded, and never partial; the index provides no
 escrow or payment authority. Golden bytes live in `agent-document-golden.json`.
 
-The dashboard accepts an explicit deployed index address, runtime hash, and start block. It
-reconstructs task → receipt → payment lineage at one pinned block while keeping accepted,
-executable-now, paid, and balance-proof-unverified states separate. Plans are calldata only: the
-client neither treats the pinned CREATE2 prediction as deployed nor signs or sends transactions.
+The dashboard accepts an explicit deployed index address and incomplete discovery start block; the
+index runtime hash is embedded. Positive lifecycle status additionally requires the repo-pinned
+ownerless registrar, embedded receipt blob, exact staged receipt provenance, schema-v4 lifecycle
+runtime hashes, and wiring at one finalized block. Accepted, executable-now, paid, and unverified
+remain separate. State-gated calldata references neither sign nor send and explicitly omit ordinary
+bond activation and settlement steps.
 
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed
@@ -25,7 +27,7 @@ ownerless registrar plus the two shared compiler-pinned prerequisites. The FAO
 dashboard never treats governed-site `deployment.json` as registrar authority.
 `fao-creation-codes.json` contains the exact receipt, core, and FLM creation
 blobs; the browser checks all twelve pinned Keccak hashes before using them.
-Each FAO's separate schema-v3 economic manifest supplies its vault, gateway,
+Each FAO's separate schema-v4 economic manifest supplies its vault, gateway,
 arbitration, and treasury executor. The treasury planner rechecks the executor
 runtime hash and bidirectional on-chain wiring before sending any exact typed
 transfer, bounded parameter, or two-round critical-action step.

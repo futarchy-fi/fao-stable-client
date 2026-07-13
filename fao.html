@@ -345,9 +345,10 @@
         <form id="treasury-manifest-form" class="ragequit-card">
           <h3>Verify one active FAO treasury</h3>
           <p>
-            Paste the schema-v3 economic deployment manifest. The client checks the executor's
-            runtime hash and the vault ↔ executor ↔ gateway ↔ arbitration wiring before enabling a
-            planned transaction. This per-instance proof is separate from the shared registrar.
+            Paste the schema-v4 economic deployment manifest. The client checks the vault, gateway,
+            arbitration, and executor runtime hashes plus their wiring before enabling a planned
+            transaction. Positive agent-work lifecycle status additionally requires the shared
+            canonical registrar and receipt provenance below.
           </p>
           <label class="full">Economic deployment manifest JSON
             <textarea name="manifest" rows="6" spellcheck="false" required placeholder="{&quot;schemaVersion&quot;:3,…}"></textarea>
@@ -462,20 +463,22 @@
             <span id="agent-work-verification" class="status unverified">Not configured</span>
           </div>
           <p>
-            Configure an actually deployed, code-verified AgentWorkIndex. A build pin or predicted
-            CREATE2 address is not a deployment. The inspector reads finalized evidence through one
-            pinned Sepolia block and never holds a key or sends a transaction.
+            Configure an actually deployed AgentWorkIndex address and a discovery start block. Its
+            canonical runtime hash is embedded by this stable client; a build prediction is not a
+            deployment. The caller-selected start makes the result explicitly incomplete. Positive
+            lifecycle status additionally requires canonical registrar and receipt provenance.
           </p>
           <form id="agent-work-form">
             <div class="form-grid">
               <label>Deployed index address
                 <input name="address" autocomplete="off" required placeholder="0x…">
               </label>
-              <label>Runtime Keccak-256
-                <input name="runtimeCodeKeccak256" autocomplete="off" required placeholder="0x…">
-              </label>
               <label>Deployment start block
                 <input name="startBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              </label>
+              <label>Exact payment envelope digest (optional)
+                <input name="lookupDigest" autocomplete="off" placeholder="0x…">
+                <span>Find one older envelope even when the rendered lifecycle list is capped.</span>
               </label>
             </div>
             <button type="submit">Verify and reconstruct evidence</button>
@@ -484,16 +487,22 @@
             <div><dt>Pinned block</dt><dd id="agent-work-block">—</dd></div>
             <div><dt>Valid tasks</dt><dd id="agent-work-task-count">—</dd></div>
             <div><dt>Valid receipts</dt><dd id="agent-work-receipt-count">—</dd></div>
-            <div><dt>Valid payments</dt><dd id="agent-work-payment-count">—</dd></div>
+            <div><dt>Valid payment envelopes</dt><dd id="agent-work-payment-count">—</dd></div>
             <div><dt>Rejected inert records</dt><dd id="agent-work-rejected-count">—</dd></div>
           </dl>
           <p id="agent-work-status" class="message" role="status" aria-live="polite"></p>
           <p class="notice">
             Accepted is authorization, not payment. Executable-now requires a successful exact
-            simulation. Paid requires the exact execution event and exact executor decrease plus
-            recipient increase across that execution block. If archive reads fail or unrelated
-            same-block balance changes obscure those deltas, the result remains unverified—not paid
-            and not unpaid.
+            simulation. Paid requires the pinned vault code path, exact execution event and executed
+            view. Aggregate balances from block N-1 to N must also be block-delta-consistent; they
+            are not a transaction-level state diff. If archive reads fail or unrelated same-block
+            changes obscure the delta, the result remains unverified—not paid and not unpaid.
+          </p>
+          <p class="details">
+            This browser verifies hash-sealed registrar and receipt provenance, sealed events,
+            runtime code, and live wiring. It does not claim to revalidate the full economic config
+            preimage because canonical manifests may contain integers above JavaScript's safe range;
+            use FAO's Python manifest verifier for that check.
           </p>
           <div id="agent-work-results" hidden>
             <h4>Tasks and receipts</h4>

@@ -61,7 +61,12 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
   const snapshots = () => Object.freeze(journal.map((operation) => Object.freeze({ ...operation })));
   const trim = () => {
     while (journal.length > limit) {
-      const index = journal.findLastIndex((operation) => !PENDING_OPERATION_STATES.has(operation.state));
+      const index = journal.findLastIndex((operation) => (
+        !PENDING_OPERATION_STATES.has(operation.state)
+        && !(operation.kind === 'buyback'
+          && operation.state === TRACKED_OPERATION_STATES.confirmed
+          && operation.stateReadBlockNumber == null)
+      ));
       if (index === -1) return;
       journal.splice(index, 1);
     }
@@ -107,6 +112,7 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
         key: null,
         receiptStatus: null,
         receiptBlockNumber: null,
+        stateReadBlockNumber: null,
         error: null
       };
       journal.unshift(operation);
@@ -158,6 +164,9 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
       const receiptBlockNumber = receipt?.blockNumber == null
         ? null
         : rpcQuantity(receipt.blockNumber, 'Transaction receipt block number').toString();
+      if (status === 1n && receiptBlockNumber == null && operation.receiptBlockNumber == null) {
+        throw new Error('Successful transaction receipt block number is required.');
+      }
       if (known(operation)
         && [TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
         if (operation.receiptStatus !== status.toString()) {
@@ -178,6 +187,21 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
         status === 1n ? TRACKED_OPERATION_STATES.confirmed : TRACKED_OPERATION_STATES.reverted,
         { receiptStatus: status.toString(), receiptBlockNumber, error: null }
       );
+    },
+    coverConfirmed(id, blockNumber) {
+      const operation = journal.find((entry) => entry.id === id);
+      if (!operation || operation.kind !== 'buyback'
+        || operation.state !== TRACKED_OPERATION_STATES.confirmed
+        || typeof blockNumber !== 'bigint' || blockNumber < 0n
+        || typeof operation.receiptBlockNumber !== 'string') {
+        throw new Error('A confirmed operation and current-state block are required.');
+      }
+      if (blockNumber < BigInt(operation.receiptBlockNumber)) {
+        throw new Error('Current-state read predates the confirmed transaction receipt.');
+      }
+      operation.stateReadBlockNumber = blockNumber.toString();
+      changed();
+      return operation;
     },
     cancel(operation, reason = 'Inputs changed before the wallet request.') {
       return transition(
@@ -282,6 +306,57 @@ export async function reconcileTrackedOperation(controller, operation, readRecei
     return trackedResult(operation, { error });
   }
   return trackedResult(operation, { receipt });
+}
+
+export function applyTrackedBuybackRefresh(controller, identity, model) {
+  if (!controller || typeof controller.entries !== 'function'
+    || typeof controller.coverConfirmed !== 'function'
+    || !identity || typeof identity !== 'object' || Array.isArray(identity)
+    || !model || typeof model.blockNumber !== 'bigint' || model.blockNumber < 0n) {
+    throw new Error('Tracked buyback refresh input is invalid.');
+  }
+  const chainId_ = fao.assertChainId(identity.chainId).toString();
+  const account = fao.normalizeAddress(identity.account);
+  const vault = fao.normalizeAddress(identity.vault);
+  const entries = controller.entries();
+  const matches = (operation) => operation.kind === 'buyback'
+    && operation.chainId === chainId_
+    && operation.account === account
+    && operation.vault === vault;
+  const outcome = (actionState, operation = null, lowerBound = null, reason = null) => Object.freeze({
+    actionState, ready: actionState === BUYBACK_ACTION_STATES.ready,
+    operation, lowerBound, reason
+  });
+  const pending = entries.find((entry) => (
+    entry.kind === 'buyback' && PENDING_OPERATION_STATES.has(entry.state)
+  ));
+  if (pending) {
+    if (!matches(pending)) return outcome(BUYBACK_ACTION_STATES.refreshNeeded);
+    return outcome(
+      pending.state === TRACKED_OPERATION_STATES.submitted
+        ? BUYBACK_ACTION_STATES.submittedUnknown
+        : BUYBACK_ACTION_STATES.inFlight,
+      pending,
+      null,
+      pending.error
+    );
+  }
+  const operation = entries.find((entry) => (
+    matches(entry)
+    && entry.state === TRACKED_OPERATION_STATES.confirmed
+    && entry.stateReadBlockNumber == null
+  ));
+  if (!operation) return outcome(BUYBACK_ACTION_STATES.ready);
+  const lowerBound = BigInt(operation.receiptBlockNumber);
+  if (model.blockNumber < lowerBound) {
+    return outcome(
+      BUYBACK_ACTION_STATES.confirmedRefreshNeeded,
+      operation, lowerBound,
+      `Current-state block ${model.blockNumber} predates receipt block ${lowerBound}.`
+    );
+  }
+  const covered = controller.coverConfirmed(operation.id, model.blockNumber);
+  return outcome(BUYBACK_ACTION_STATES.ready, covered, lowerBound);
 }
 
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
@@ -513,24 +588,6 @@ export async function readBuybackModel(value) {
       buybackMaxTickDeviation, 'executor.BUYBACK_MAX_TICK_DEVIATION', 23
     )
   }) });
-}
-
-function assertBuybackStateCoversReceipt(model, receipt, operation) {
-  if (!model || typeof model.blockNumber !== 'bigint') {
-    throw new Error('Buyback current-state read did not expose its block number.');
-  }
-  let receiptBlock;
-  if (receipt?.blockNumber != null) {
-    receiptBlock = rpcQuantity(receipt.blockNumber, 'Buyback receipt block number');
-  } else if (typeof operation?.receiptBlockNumber === 'string'
-    && /^(?:0|[1-9][0-9]*)$/.test(operation.receiptBlockNumber)) {
-    receiptBlock = BigInt(operation.receiptBlockNumber);
-  } else {
-    throw new Error('Resolved buyback receipt did not expose its block number.');
-  }
-  if (model.blockNumber < receiptBlock) {
-    throw new Error('Buyback current-state read predates the resolved transaction receipt.');
-  }
 }
 
 export async function verifyTreasuryManifest(manifest, request, pinnedBlock = null) {
@@ -1067,6 +1124,14 @@ function buybackOperationOwnsCurrentCard(operation) {
     && operation.vault === state.treasuryRecords.vault;
 }
 
+function applyCurrentBuybackRefresh(model) {
+  return applyTrackedBuybackRefresh(trackedOperations, {
+    chainId: SEPOLIA_CHAIN_ID,
+    account: state.account,
+    vault: state.treasuryRecords?.vault
+  }, model);
+}
+
 function resetBuybackCard(message) {
   setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   setMessage(elements.buybackStatus, message);
@@ -1208,6 +1273,7 @@ function renderOperationJournal() {
     detail.textContent = [
       operation.key,
       operation.receiptBlockNumber == null ? null : `receipt block ${operation.receiptBlockNumber}`,
+      operation.stateReadBlockNumber == null ? null : `state read block ${operation.stateReadBlockNumber}`,
       operation.error
     ].filter(Boolean).join(' · ');
     item.append(title, identity, hash, detail);
@@ -1780,7 +1846,15 @@ async function loadTreasuryManifest(form, request) {
   elements.treasuryVault.textContent = records.vault;
   renderBuybackModel();
   if (!alignBuybackCardWithPending()) {
-    setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+    const outcome = applyCurrentBuybackRefresh(buybackModel);
+    setBuybackActionState(outcome.actionState);
+    if (!outcome.ready) {
+      setMessage(
+        elements.buybackStatus,
+        `${outcome.operation.label} confirmed: ${outcome.operation.hash}. ${outcome.reason}`,
+        true
+      );
+    }
   }
   setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
   renderTreasuryGate();
@@ -1951,8 +2025,18 @@ async function refreshBuybackForUser(request) {
   if (!wasConfirmed) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   const model = await refreshBuybackState(true);
   if (!model || !buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) return null;
-  if (resolved) assertBuybackStateCoversReceipt(model, resolved.receipt, resolved.operation);
-  setBuybackActionState(buybackActionStateAfterRefresh(state.buybackActionState));
+  const outcome = applyCurrentBuybackRefresh(model);
+  setBuybackActionState(outcome.actionState);
+  if (!outcome.ready) {
+    setMessage(
+      elements.buybackStatus,
+      outcome.operation
+        ? `${outcome.operation.label}: ${outcome.reason}`
+        : 'A separately captured buyback operation still blocks a new submission.',
+      true
+    );
+    return model;
+  }
   setMessage(
     elements.buybackStatus,
     resolvedOwnsCard
@@ -2069,8 +2153,16 @@ async function sendBuyback() {
   try {
     const model = await refreshBuybackState(false);
     if (!model || !ownsCard()) return result;
-    assertBuybackStateCoversReceipt(model, result.receipt, operation);
-    setBuybackActionState(BUYBACK_ACTION_STATES.ready);
+    const outcome = applyCurrentBuybackRefresh(model);
+    setBuybackActionState(outcome.actionState);
+    if (!outcome.ready) {
+      setMessage(
+        elements.buybackStatus,
+        `${plan.label} confirmed: ${operation.hash}. ${outcome.reason}`,
+        true
+      );
+      return result;
+    }
     if (operation.state === TRACKED_OPERATION_STATES.reverted) {
       setMessage(
         elements.buybackStatus,

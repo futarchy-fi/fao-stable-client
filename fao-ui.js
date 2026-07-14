@@ -146,7 +146,7 @@ export function trackedOperationController({
   limit = 8, onChange = () => {}, initialEntries = []
 } = {}) {
   if (!Number.isSafeInteger(limit) || limit < 1 || typeof onChange !== 'function'
-    || !Array.isArray(initialEntries) || initialEntries.length > limit) {
+    || !Array.isArray(initialEntries)) {
     throw new Error('Tracked operation controller options are invalid.');
   }
   const journal = initialEntries.map(restoredTrackedOperation);
@@ -157,14 +157,13 @@ export function trackedOperationController({
   }
   let nextId = journal.reduce((maximum, { id }) => Math.max(maximum, id), 0);
   const snapshots = () => Object.freeze(journal.map((operation) => Object.freeze({ ...operation })));
+  const mustRetain = (operation) => PENDING_OPERATION_STATES.has(operation.state)
+    || (operation.kind === 'buyback'
+      && operation.state === TRACKED_OPERATION_STATES.confirmed
+      && operation.stateReadBlockNumber == null);
   const trim = () => {
     while (journal.length > limit) {
-      const index = journal.findLastIndex((operation) => (
-        !PENDING_OPERATION_STATES.has(operation.state)
-        && !(operation.kind === 'buyback'
-          && operation.state === TRACKED_OPERATION_STATES.confirmed
-          && operation.stateReadBlockNumber == null)
-      ));
+      const index = journal.findLastIndex((operation) => !mustRetain(operation));
       if (index === -1) return;
       journal.splice(index, 1);
     }
@@ -182,6 +181,7 @@ export function trackedOperationController({
     changed();
     return operation;
   };
+  trim();
   return Object.freeze({
     begin(context) {
       if (!context || Array.isArray(context) || typeof context !== 'object') {
@@ -191,7 +191,7 @@ export function trackedOperationController({
       const label = String(context.label || '').trim().slice(0, 120);
       if (!TRACKED_OPERATION_KINDS.includes(kind) || !label || journal.some((operation) => (
         operation.kind === kind && PENDING_OPERATION_STATES.has(operation.state)
-      ))) return null;
+      )) || journal.filter(mustRetain).length >= limit) return null;
       const chainId_ = fao.assertChainId(context.chainId).toString();
       const account = fao.normalizeAddress(context.account);
       const vault = context.vault == null ? null : fao.normalizeAddress(context.vault);
@@ -334,7 +334,13 @@ export async function runTrackedTransaction({
     throw new Error('Tracked transaction operations are invalid.');
   }
   const operation = controller.begin(context);
-  if (!operation) return trackedResult(controller.pending(context.kind), { blocked: true });
+  if (!operation) {
+    const pending = controller.pending(context.kind);
+    const error = new Error(pending
+      ? 'A transaction of this kind already has unresolved journal evidence.'
+      : 'The transaction journal is full of unresolved evidence. Reconcile it before retrying.');
+    return trackedResult(pending, { blocked: true, error });
+  }
   const current = () => {
     try {
       return Boolean(stillCurrent());

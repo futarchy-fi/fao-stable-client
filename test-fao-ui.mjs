@@ -537,7 +537,7 @@ test('production buyback refresh retains the confirmed receipt-block lower bound
     kind: 'creation', label: 'Unrelated operation', chainId: 11155111,
     account, target: vaultB
   });
-  controller.cancel(noise);
+  assert.equal(noise, null);
   assert.equal(controller.entries().length, 1);
   assert.equal(controller.entries()[0].hash, hash('73'));
   const identityA = { chainId: 11155111, account, vault: vaultA };
@@ -582,6 +582,52 @@ test('production buyback refresh retains the confirmed receipt-block lower bound
     applyTrackedBuybackRefresh(revertedController, identityA, { blockNumber: 16n }).actionState,
     BUYBACK_ACTION_STATES.ready
   );
+});
+
+test('protected journal capacity survives restoration and shrinks after coverage', async () => {
+  const account = address(9);
+  const source = trackedOperationController({ limit: 2 });
+  for (const [vault, transactionHash] of [[address(1), hash('75')], [address(2), hash('76')]]) {
+    const result = await runTrackedTransaction({
+      controller: source,
+      context: {
+        kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+        account, vault, target: vault
+      },
+      verify: async () => {},
+      stillCurrent: () => true,
+      send: async () => transactionHash,
+      wait: async () => transactionReceipt(transactionHash)
+    });
+    assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  }
+  assert.equal(source.entries().length, 2);
+
+  const restored = trackedOperationController({ limit: 1, initialEntries: source.entries() });
+  assert.equal(restored.entries().length, 2);
+  let sends = 0;
+  const blocked = await runTrackedTransaction({
+    controller: restored,
+    context: {
+      kind: 'creation', label: 'Unrelated operation', chainId: 11155111,
+      account, target: address(3)
+    },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('77'); },
+    wait: async () => transactionReceipt(hash('77'))
+  });
+  assert.equal(blocked.blocked, true);
+  assert.match(blocked.error.message, /journal is full/);
+  assert.equal(sends, 0);
+
+  const covered = restored.entries()[0];
+  const outcome = applyTrackedBuybackRefresh(restored, {
+    chainId: 11155111, account, vault: covered.vault
+  }, { blockNumber: 32n });
+  assert.equal(outcome.ready, true);
+  assert.equal(restored.entries().length, 1);
+  assert.notEqual(restored.entries()[0].vault, covered.vault);
 });
 
 test('completion after a post-hash manifest switch updates only the captured journal', async () => {

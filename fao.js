@@ -1593,12 +1593,7 @@ export function decodeAgentDocumentPublishedLog(log) {
 
 const ZERO_DIGEST = `0x${'00'.repeat(32)}`;
 const MAX_AGENT_DOCUMENT_BYTES = 65_536;
-const AGENT_LOG_BLOCK_CHUNK = 10_000n;
-export const AGENT_SCAN_LIMITS = Object.freeze({
-  blocks: 50_000n,
-  logs: 5_000,
-  bytes: 8 * 1024 * 1024
-});
+const AGENT_RPC_LOG_LIMIT = 64;
 
 function rpcQuantity(value, label) {
   if (typeof value !== 'string' || !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(value)) {
@@ -1657,12 +1652,28 @@ function normalizeEventLog(log, address, topic, topicCount, dataWords, label) {
 }
 
 export function validateAgentWorkIndexConfig(value) {
-  const config = requireRecord(
-    value, ['address', 'startBlock'], 'AgentWorkIndex config'
-  );
+  const config = requireRecord(value, ['address'], 'AgentWorkIndex config');
+  return Object.freeze({ address: normalizeAddress(config.address) });
+}
+
+function optionalLocatorBlock(value, label) {
+  return value == null ? null : unsigned(value, 256, label);
+}
+
+export function validateAgentWorkLocator(value) {
+  const locator = requireRecord(value, [
+    'paymentDigest', 'taskBlock', 'receiptBlock', 'paymentBlock',
+    'proposalBlock', 'settlementBlock', 'queueBlock', 'executionBlock'
+  ], 'Agent-work evidence locator');
   return Object.freeze({
-    address: normalizeAddress(config.address),
-    startBlock: unsigned(config.startBlock, 256, 'AgentWorkIndex start block')
+    paymentDigest: normalizeHex(locator.paymentDigest, 32, 'Payment envelope digest'),
+    taskBlock: unsigned(locator.taskBlock, 256, 'Task publication block'),
+    receiptBlock: unsigned(locator.receiptBlock, 256, 'Receipt publication block'),
+    paymentBlock: unsigned(locator.paymentBlock, 256, 'Payment publication block'),
+    proposalBlock: optionalLocatorBlock(locator.proposalBlock, 'Proposal event block'),
+    settlementBlock: optionalLocatorBlock(locator.settlementBlock, 'Settlement event block'),
+    queueBlock: optionalLocatorBlock(locator.queueBlock, 'Queue event block'),
+    executionBlock: optionalLocatorBlock(locator.executionBlock, 'Execution event block')
   });
 }
 
@@ -1681,8 +1692,8 @@ function agentPublicationMeta(log, indexAddress) {
 
 function verifiedRpcLogs(logs, address, fromBlock, toBlock, label) {
   if (!Array.isArray(logs)) throw new Error(`RPC returned invalid ${label} logs.`);
-  if (logs.length > AGENT_SCAN_LIMITS.logs) {
-    throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.logs}-log client limit.`);
+  if (logs.length > AGENT_RPC_LOG_LIMIT) {
+    throw new Error(`${label} exceeds the ${AGENT_RPC_LOG_LIMIT}-log exact-match limit.`);
   }
   const seen = new Map();
   const verified = [];
@@ -1726,42 +1737,33 @@ function verifiedRpcLogs(logs, address, fromBlock, toBlock, label) {
   return verified;
 }
 
-async function readLogsInChunks(request, { address, fromBlock, toBlock, topics, label }) {
-  if (toBlock < fromBlock || toBlock - fromBlock + 1n > AGENT_SCAN_LIMITS.blocks) {
-    throw new Error(`${label} range exceeds the ${AGENT_SCAN_LIMITS.blocks}-block client limit.`);
-  }
-  const all = [];
-  let footprint = 0;
-  for (let first = fromBlock; first <= toBlock; first += AGENT_LOG_BLOCK_CHUNK) {
-    const last = first + AGENT_LOG_BLOCK_CHUNK - 1n < toBlock
-      ? first + AGENT_LOG_BLOCK_CHUNK - 1n
-      : toBlock;
-    const chunk = await request('eth_getLogs', [{
-      address,
-      fromBlock: rpcTag(first, `${label} chunk start`),
-      toBlock: rpcTag(last, `${label} chunk end`),
-      topics
-    }]);
-    const verified = verifiedRpcLogs(chunk, address, first, last, label);
-    if (all.length + verified.length > AGENT_SCAN_LIMITS.logs) {
-      throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.logs}-log client limit.`);
-    }
-    footprint += verified.reduce((total, log) => (
-      total + (log.data.length - 2) / 2 + log.topics.length * 32
-    ), 0);
-    if (footprint > AGENT_SCAN_LIMITS.bytes) {
-      throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.bytes}-byte client limit.`);
-    }
-    all.push(...verified);
-  }
-  return all;
-}
-
 function agentDocumentProfile(kind) {
   if (kind === AGENT_WORK_KINDS.task) return ['task', validateAgentTask];
   if (kind === AGENT_WORK_KINDS.receipt) return ['receipt', validateAgentReceipt];
   if (kind === AGENT_WORK_KINDS.payment) return ['payment', validateAgentPayment];
   return null;
+}
+
+function agentPublicationRecord(log, { index, chainId, vault }) {
+  const meta = agentPublicationMeta(log, index);
+  if (typeof log.data !== 'string' || (log.data.length - 2) / 2 > MAX_AGENT_DOCUMENT_BYTES + 128) {
+    throw new Error(`Published log exceeds the ${MAX_AGENT_DOCUMENT_BYTES}-byte client limit.`);
+  }
+  const event = decodeAgentDocumentPublishedLog(log);
+  const profile = agentDocumentProfile(event.kind);
+  if (!profile) throw new Error('Published kind is not a v1 agent-work kind.');
+  const [type, validate] = profile;
+  const document = validate(event.document);
+  if (document.chainId !== chainId || document.vault !== vault) {
+    throw new Error('Published document is a cross-chain or cross-vault replay.');
+  }
+  const parentDigest = type === 'task'
+    ? ZERO_DIGEST
+    : document[type === 'receipt' ? 'task' : 'receipt'];
+  if (event.parentDigest !== parentDigest) {
+    throw new Error('Published parent digest disagrees with the canonical document.');
+  }
+  return Object.freeze({ ...event, ...meta, type, value: document });
 }
 
 export function reconstructAgentWorkLogs(logs, value) {
@@ -1775,25 +1777,7 @@ export function reconstructAgentWorkLogs(logs, value) {
 
   for (const log of logs) {
     try {
-      const meta = agentPublicationMeta(log, index);
-      if (typeof log.data !== 'string' || (log.data.length - 2) / 2 > MAX_AGENT_DOCUMENT_BYTES + 128) {
-        throw new Error(`Published log exceeds the ${MAX_AGENT_DOCUMENT_BYTES}-byte client limit.`);
-      }
-      const event = decodeAgentDocumentPublishedLog(log);
-      const profile = agentDocumentProfile(event.kind);
-      if (!profile) throw new Error('Published kind is not a v1 agent-work kind.');
-      const [type, validate] = profile;
-      const document = validate(event.document);
-      if (document.chainId !== chainId || document.vault !== vault) {
-        throw new Error('Published document is a cross-chain or cross-vault replay.');
-      }
-      const parentDigest = type === 'task'
-        ? ZERO_DIGEST
-        : document[type === 'receipt' ? 'task' : 'receipt'];
-      if (event.parentDigest !== parentDigest) {
-        throw new Error('Published parent digest disagrees with the canonical document.');
-      }
-      accepted.push(Object.freeze({ ...event, ...meta, type, value: document }));
+      accepted.push(agentPublicationRecord(log, { index, chainId, vault }));
     } catch (error) {
       rejected.push(Object.freeze({
         transactionHash: typeof log?.transactionHash === 'string' ? log.transactionHash.toLowerCase() : null,
@@ -1857,54 +1841,135 @@ export function reconstructAgentWorkLogs(logs, value) {
   });
 }
 
+const AGENT_EXACT_MATCH_LIMIT = AGENT_RPC_LOG_LIMIT;
+
+async function exactAgentPublication(input, context, blockNumber, topics, expected) {
+  if (blockNumber > context.finalizedNumber) {
+    throw new Error(`${expected.label} is after the finalized head.`);
+  }
+  const blockTag = rpcTag(blockNumber, `${expected.label} block`);
+  const block = await input.request('eth_getBlockByNumber', [blockTag, false]);
+  if (!block || typeof block !== 'object'
+    || rpcQuantity(block.number, `${expected.label} block number`) !== blockNumber) {
+    throw new Error(`${expected.label} block is unavailable.`);
+  }
+  const blockHash = normalizeHex(block.hash, 32, `${expected.label} block hash`);
+  if (blockHash === ZERO_DIGEST) throw new Error(`${expected.label} block hash cannot be zero.`);
+  const code = normalizeHex(
+    await input.request('eth_getCode', [context.index, blockTag]), undefined,
+    `${expected.label} index runtime code`
+  );
+  if (code === '0x' || keccak256(code) !== AGENT_WORK_INDEX.runtimeCodeKeccak256) {
+    throw new Error(`${expected.label} does not reference the canonical deployed AgentWorkIndex.`);
+  }
+  const raw = await input.request('eth_getLogs', [{
+    address: context.index, fromBlock: blockTag, toBlock: blockTag, topics
+  }]);
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > AGENT_EXACT_MATCH_LIMIT) {
+    throw new Error(`${expected.label} must resolve to 1..${AGENT_EXACT_MATCH_LIMIT} exact publications.`);
+  }
+  const logs = verifiedRpcLogs(raw, context.index, blockNumber, blockNumber, expected.label);
+  const records = logs.map((log) => agentPublicationRecord(log, context)).sort((left, right) => (
+    left.logIndex < right.logIndex ? -1 : left.logIndex > right.logIndex ? 1 : 0
+  ));
+  if (records.some((record) => record.blockHash !== blockHash
+    || record.kind !== expected.kind
+    || record.documentDigest !== expected.digest
+    || (expected.parentDigest != null && record.parentDigest !== expected.parentDigest))) {
+    throw new Error(`${expected.label} does not match its exact locator.`);
+  }
+  return Object.freeze({ blockTag, blockHash, logs: Object.freeze(logs), record: records[0] });
+}
+
 export async function readAgentWorkIndex(value) {
-  const input = requireRecord(value, ['request', 'config', 'chainId', 'vault'], 'Agent-work index read');
+  const input = requireRecord(
+    value, ['request', 'config', 'locator', 'chainId', 'vault'], 'Agent-work index read'
+  );
   if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
   const config = validateAgentWorkIndexConfig(input.config);
+  const locator = validateAgentWorkLocator(input.locator);
   const expectedChain = assertChainId(input.chainId);
+  const vault = normalizeAddress(input.vault);
   const actualChain = rpcQuantity(await input.request('eth_chainId', []), 'RPC chain ID');
   if (actualChain !== expectedChain) {
     throw new Error(`AgentWorkIndex RPC chain mismatch: expected ${expectedChain}, received ${actualChain}.`);
   }
-  const block = await input.request('eth_getBlockByNumber', ['finalized', false]);
-  if (!block || typeof block !== 'object') throw new Error('RPC returned no finalized block.');
-  const blockNumber = rpcQuantity(block.number, 'Pinned block number');
-  const blockHash = normalizeHex(block.hash, 32, 'Pinned block hash');
+  const finalized = await input.request('eth_getBlockByNumber', ['finalized', false]);
+  if (!finalized || typeof finalized !== 'object') throw new Error('RPC returned no finalized block.');
+  const blockNumber = rpcQuantity(finalized.number, 'Pinned block number');
+  const blockHash = normalizeHex(finalized.hash, 32, 'Pinned block hash');
   if (blockHash === ZERO_DIGEST) throw new Error('Pinned block hash cannot be zero.');
-  const timestamp = rpcQuantity(block.timestamp, 'Pinned block timestamp');
-  if (config.startBlock > blockNumber) throw new Error('AgentWorkIndex start block is after the pinned block.');
-  const blockTag = rpcTag(blockNumber, 'Pinned block number');
-  const code = normalizeHex(
-    await input.request('eth_getCode', [config.address, blockTag]), undefined,
-    'AgentWorkIndex runtime code'
+  const timestamp = rpcQuantity(finalized.timestamp, 'Pinned block timestamp');
+  const context = Object.freeze({
+    index: config.address,
+    chainId: expectedChain.toString(),
+    vault,
+    finalizedNumber: blockNumber
+  });
+  const payment = await exactAgentPublication(
+    input,
+    context,
+    locator.paymentBlock,
+    [AGENT_WORK_INDEX.publishedTopic, AGENT_WORK_KINDS.payment, null, locator.paymentDigest],
+    { label: 'Payment publication', kind: AGENT_WORK_KINDS.payment, digest: locator.paymentDigest }
   );
-  if (code === '0x') {
-    throw new Error('Configured AgentWorkIndex is not deployed at the pinned block. A predicted address is not a deployment.');
+  const receiptDigest = payment.record.value.receipt;
+  const taskDigest = payment.record.value.task;
+  const receipt = await exactAgentPublication(
+    input,
+    context,
+    locator.receiptBlock,
+    [AGENT_WORK_INDEX.publishedTopic, AGENT_WORK_KINDS.receipt, taskDigest, receiptDigest],
+    {
+      label: 'Receipt publication', kind: AGENT_WORK_KINDS.receipt,
+      digest: receiptDigest, parentDigest: taskDigest
+    }
+  );
+  const task = await exactAgentPublication(
+    input,
+    context,
+    locator.taskBlock,
+    [AGENT_WORK_INDEX.publishedTopic, AGENT_WORK_KINDS.task, ZERO_DIGEST, taskDigest],
+    {
+      label: 'Task publication', kind: AGENT_WORK_KINDS.task,
+      digest: taskDigest, parentDigest: ZERO_DIGEST
+    }
+  );
+  const precedes = (left, right) => left.record.blockNumber < right.record.blockNumber
+    || (left.record.blockNumber === right.record.blockNumber
+      && left.record.logIndex < right.record.logIndex);
+  if (!precedes(task, receipt) || !precedes(receipt, payment)) {
+    throw new Error('Exact AgentWork parents must be published before their children.');
   }
-  if (keccak256(code) !== AGENT_WORK_INDEX.runtimeCodeKeccak256) {
-    throw new Error('Configured AgentWorkIndex runtime bytecode does not match the canonical embedded hash.');
+  const publications = [task, receipt, payment];
+  for (const publication of publications) {
+    const after = await input.request('eth_getBlockByNumber', [publication.blockTag, false]);
+    if (!after || normalizeHex(after.hash, 32, 'Re-read evidence block hash') !== publication.blockHash) {
+      throw new Error('An exact evidence block hash changed during reconstruction.');
+    }
   }
-  const logs = await readLogsInChunks(input.request, {
-    address: config.address,
-    fromBlock: config.startBlock,
-    toBlock: blockNumber,
-    topics: [AGENT_WORK_INDEX.publishedTopic],
-    label: 'AgentWorkIndex Published'
-  });
-  const after = await input.request('eth_getBlockByNumber', [blockTag, false]);
-  if (!after || normalizeHex(after.hash, 32, 'Re-read pinned block hash') !== blockHash) {
-    throw new Error('Finalized block hash changed during AgentWorkIndex reconstruction.');
+  const blockTag = rpcTag(blockNumber, 'Pinned block number');
+  const finalizedAfter = await input.request('eth_getBlockByNumber', [blockTag, false]);
+  if (!finalizedAfter || normalizeHex(finalizedAfter.hash, 32, 'Re-read finalized block hash') !== blockHash) {
+    throw new Error('Finalized block hash changed during exact AgentWork reconstruction.');
   }
-  const reconstructed = reconstructAgentWorkLogs(logs, {
-    index: config.address, chainId: expectedChain, vault: input.vault
-  });
+  const reconstructed = reconstructAgentWorkLogs(
+    publications.flatMap((publication) => publication.logs),
+    { index: config.address, chainId: expectedChain, vault }
+  );
+  if (reconstructed.tasks.length !== 1 || reconstructed.receipts.length !== 1
+    || reconstructed.payments.length !== 1
+    || reconstructed.payments[0].documentDigest !== locator.paymentDigest) {
+    throw new Error('Exact AgentWork lineage reconstruction is incomplete or conflicting.');
+  }
   return Object.freeze({
     config,
+    locator,
     blockNumber,
     blockHash,
     blockTag,
     timestamp,
-    rangeCompleteness: 'caller-selected-incomplete',
+    evidenceMode: 'exact-finalized-locator',
     ...reconstructed
   });
 }
@@ -2049,15 +2114,56 @@ async function executionBalanceConsistency(request, event, executor) {
   });
 }
 
-async function lifecycleLogs(request, address, fromBlock, toBlock, topics) {
-  return readLogsInChunks(request, {
-    address, fromBlock, toBlock, topics, label: 'Agent payment lifecycle'
-  });
+function validateLifecycleBlocks(value) {
+  const blocks = requireRecord(value, [
+    'proposalBlock', 'settlementBlock', 'queueBlock', 'executionBlock'
+  ], 'Agent payment lifecycle locator');
+  return Object.freeze(Object.fromEntries(Object.entries(blocks).map(([key, block]) => [
+    key, optionalLocatorBlock(block, `Agent payment ${key}`)
+  ])));
+}
+
+async function verifyHistoricalRuntime(request, address, blockTag, expectedHash, label) {
+  const code = normalizeHex(await request('eth_getCode', [address, blockTag]), undefined, `${label} code`);
+  if (code === '0x' || keccak256(code) !== expectedHash) {
+    throw new Error(`${label} runtime code does not match the canonical manifest.`);
+  }
+}
+
+async function lifecycleLogs(
+  request, address, expectedHash, pinnedBlock, eventBlock, topics, label
+) {
+  if (eventBlock == null) return [];
+  if (eventBlock > pinnedBlock) throw new Error(`${label} is after the finalized head.`);
+  const blockTag = rpcTag(eventBlock, `${label} block`);
+  const block = await request('eth_getBlockByNumber', [blockTag, false]);
+  if (!block || typeof block !== 'object'
+    || rpcQuantity(block.number, `${label} block number`) !== eventBlock) {
+    throw new Error(`${label} block is unavailable.`);
+  }
+  const blockHash = normalizeHex(block.hash, 32, `${label} block hash`);
+  await verifyHistoricalRuntime(request, address, blockTag, expectedHash, label);
+  const raw = await request('eth_getLogs', [{
+    address, fromBlock: blockTag, toBlock: blockTag, topics
+  }]);
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > AGENT_EXACT_MATCH_LIMIT) {
+    throw new Error(`${label} must resolve to 1..${AGENT_EXACT_MATCH_LIMIT} exact logs.`);
+  }
+  const logs = verifiedRpcLogs(raw, address, eventBlock, eventBlock, label);
+  if (logs.some((log) => normalizeHex(log.blockHash, 32, `${label} log block hash`) !== blockHash)) {
+    throw new Error(`${label} log is not in its canonical locator block.`);
+  }
+  const after = await request('eth_getBlockByNumber', [blockTag, false]);
+  if (!after || normalizeHex(after.hash, 32, `${label} re-read block hash`) !== blockHash) {
+    throw new Error(`${label} block hash changed during inspection.`);
+  }
+  return logs;
 }
 
 export async function readAgentPaymentState(value) {
   const input = requireRecord(value, [
-    'request', 'chainId', 'vault', 'gateway', 'arbitration', 'executor', 'startBlock',
+    'request', 'chainId', 'vault', 'gateway', 'arbitration', 'executor',
+    'runtimeCodeHashes', 'eventBlocks',
     'blockNumber', 'blockHash', 'timestamp', 'payment'
   ], 'Agent payment state read');
   if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
@@ -2065,37 +2171,61 @@ export async function readAgentPaymentState(value) {
   const gateway = normalizeAddress(input.gateway);
   const arbitration = normalizeAddress(input.arbitration);
   const executor = normalizeAddress(input.executor);
+  const runtimeCodeHashes = requireRecord(input.runtimeCodeHashes, [
+    'vault', 'gateway', 'arbitration', 'executor'
+  ], 'Agent payment runtime code hashes');
+  const runtimeHashes = Object.freeze(Object.fromEntries(Object.entries(runtimeCodeHashes).map(
+    ([name, hash]) => [name, normalizeHex(hash, 32, `${name} runtime code hash`)]
+  )));
   const payment = validateAgentPayment(input.payment);
   const action = agentPaymentTransferAction(payment);
   const binding = validateAgentPaymentBinding(payment, { chainId: input.chainId, vault, action });
-  const fromBlock = unsigned(input.startBlock, 256, 'Lifecycle start block');
+  const eventBlocks = validateLifecycleBlocks(input.eventBlocks);
   const blockNumber = unsigned(input.blockNumber, 256, 'Pinned block number');
   const blockHash = normalizeHex(input.blockHash, 32, 'Pinned block hash');
+  if (blockHash === ZERO_DIGEST) throw new Error('Pinned lifecycle block hash cannot be zero.');
   const toBlock = rpcTag(blockNumber, 'Pinned block number');
   const timestamp = unsigned(input.timestamp, 256, 'Pinned block timestamp');
   const idTopic = binding.actionHash;
   const [proposedRaw, settlementRaw, queuedRaw, executedRaw] = await Promise.all([
-    lifecycleLogs(input.request, gateway, fromBlock, blockNumber, [AGENT_WORK_EVENTS.transferProposed, idTopic]),
-    lifecycleLogs(input.request, arbitration, fromBlock, blockNumber, [[
+    lifecycleLogs(input.request, gateway, runtimeHashes.gateway, blockNumber, eventBlocks.proposalBlock,
+      [AGENT_WORK_EVENTS.transferProposed, idTopic], 'Proposal event'),
+    lifecycleLogs(input.request, arbitration, runtimeHashes.arbitration,
+      blockNumber, eventBlocks.settlementBlock, [[
       AGENT_WORK_EVENTS.finalizedByTimeout, AGENT_WORK_EVENTS.evaluationResolved
-    ], idTopic]),
-    lifecycleLogs(input.request, vault, fromBlock, blockNumber, [AGENT_WORK_EVENTS.transferQueued, idTopic]),
-    lifecycleLogs(input.request, vault, fromBlock, blockNumber, [AGENT_WORK_EVENTS.transferExecuted, idTopic])
+    ], idTopic], 'Settlement event'),
+    lifecycleLogs(input.request, vault, runtimeHashes.vault, blockNumber, eventBlocks.queueBlock,
+      [AGENT_WORK_EVENTS.transferQueued, idTopic], 'Queue event'),
+    lifecycleLogs(input.request, vault, runtimeHashes.vault, blockNumber, eventBlocks.executionBlock,
+      [AGENT_WORK_EVENTS.transferExecuted, idTopic], 'Execution event')
   ]);
+  if (eventBlocks.executionBlock != null) {
+    await verifyHistoricalRuntime(
+      input.request,
+      executor,
+      rpcTag(eventBlocks.executionBlock, 'Execution event block'),
+      runtimeHashes.executor,
+      'Treasury executor at execution'
+    );
+  }
   const proposals = proposedRaw.map((log) => decodeTransferProposed(log, gateway));
   const settlements = settlementRaw.map((log) => decodeSettlement(log, arbitration));
   const queues = queuedRaw.map((log) => decodeTransferQueued(log, vault));
   const executions = executedRaw.map((log) => decodeTransferExecuted(log, vault));
   const exactProposals = proposals.filter((event) => exactTransferEvent(event, binding));
   const proposed = proposals.length === 1 && exactProposals.length === 1;
-  const proposal = decodeProposalView(await input.request('eth_call', [{
-    to: arbitration,
-    data: encodeCalldata(AGENT_WORK_VIEWS.getProposal, [uintWord(binding.proposalId)])
-  }, toBlock]));
+  let proposal = null;
+  if (proposals.length || settlements.length) {
+    proposal = decodeProposalView(await input.request('eth_call', [{
+      to: arbitration,
+      data: encodeCalldata(AGENT_WORK_VIEWS.getProposal, [uintWord(binding.proposalId)])
+    }, toBlock]));
+  }
   let acceptance;
-  if (!proposed && (proposals.length || proposal.exists || settlements.length)) {
+  if ((proposed && !proposal)
+    || (!proposed && (proposals.length || proposal || settlements.length))) {
     acceptance = Object.freeze({ state: 'disagreement', accepted: false, route: null });
-  } else if (!proposal.exists && settlements.length === 0) {
+  } else if (!proposal && settlements.length === 0) {
     acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
   } else if (proposal.exists && !proposal.settled && settlements.length === 0) {
     acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
@@ -2160,7 +2290,7 @@ export async function readAgentPaymentState(value) {
       });
     }
   };
-  const proposalCall = !proposed && !proposal.exists && settlements.length === 0
+  const proposalCall = !proposed && !proposal && settlements.length === 0
     ? await simulate(gateway, proposeTransferCalldata(action))
     : Object.freeze({ callable: false, reason: null });
   const queueCall = proposed && acceptance.accepted && queues.length === 0
@@ -2330,7 +2460,7 @@ export function selectAgentPayments(records, value) {
   const selected = records.slice(-limit);
   if (digest && !selected.some((record) => record.documentDigest === digest)) {
     const exact = records.find((record) => record.documentDigest === digest);
-    if (!exact) throw new Error('Exact payment envelope digest was not found in the configured incomplete range.');
+    if (!exact) throw new Error('Exact payment envelope digest was not found in the provided records.');
     if (selected.length === limit) selected.shift();
     selected.push(exact);
   }

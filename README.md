@@ -5,14 +5,13 @@ binding to `TransferAction`, plus `AgentWorkIndex` publish calldata and log deco
 payments are authorized, executable only while funded, and never partial; the index provides no
 escrow or payment authority. Golden bytes live in `agent-document-golden.json`.
 
-The dashboard accepts an explicit deployed index address and incomplete discovery start block; the
-index runtime hash is embedded. Positive lifecycle status additionally requires the repo-pinned
-ownerless registrar, embedded receipt blob, exact staged receipt provenance, schema-v4 lifecycle
-runtime hashes, and wiring at one finalized block. Accepted, executable-now, paid, and unverified
-remain separate. State-gated calldata references neither sign nor send and explicitly omit ordinary
-bond activation and settlement steps. Each read is capped at 50,000 blocks, 5,000 logs, 8 MiB of
-log payload, and ten lifecycle inspections; use the exact-digest lookup or a later start block to
-keep permissionless history bounded.
+The dashboard accepts one exact evidence locator: an index address, payment digest, three
+publication blocks, and optional lifecycle-event blocks. Every log query is fully topic-filtered
+and confined to one supplied block below the finalized head; parent digests, block hashes, index
+runtime, registrar/receipt provenance, schema-v4 lifecycle runtimes, and wiring are independently
+verified. Discovery may be provided by an untrusted indexer, but it is never part of the trust path.
+Accepted, executable-now, paid, and unverified remain separate. State-gated calldata references
+neither sign nor send and explicitly omit ordinary bond activation and settlement steps.
 
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed

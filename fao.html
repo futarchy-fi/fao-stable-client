@@ -457,8 +457,9 @@
           <h3 id="operation-journal-heading">Transaction operation journal</h3>
           <p>
             Wallet requests remain labeled by their captured chain, vault or target, and account.
-            The journal is stored across reloads; changing the current manifest never relabels an
-            earlier transaction. Reconcile any submitted receipt before retrying an action.
+            The journal is stored across reloads and coordinated by an exclusive same-origin tab
+            lock; changing the current manifest never relabels an earlier transaction. Receipts
+            remain submitted until their canonical block is finalized. Reconcile before retrying.
           </p>
           <p id="operation-journal-empty" class="details">No transaction operation has started.</p>
           <ol id="operation-journal" class="stage-list" aria-live="polite"></ol>
@@ -470,25 +471,42 @@
             <span id="agent-work-verification" class="status unverified">Not configured</span>
           </div>
           <p>
-            Configure an actually deployed AgentWorkIndex address and a discovery start block. Its
-            canonical runtime hash is embedded by this stable client; a build prediction is not a
-            deployment. The caller-selected start makes the result explicitly incomplete. Positive
-            lifecycle status additionally requires canonical registrar and receipt provenance.
+            Paste one shareable exact-evidence locator. The stable client reads only its supplied
+            publication and lifecycle blocks with fully indexed topics, verifies every block below
+            the finalized head, and checks the embedded AgentWorkIndex runtime. Discovery services
+            may generate locators, but they are never a trust root.
           </p>
           <form id="agent-work-form">
             <div class="form-grid">
               <label>Deployed index address
                 <input name="address" autocomplete="off" required placeholder="0x…">
               </label>
-              <label>Deployment start block
-                <input name="startBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              <label>Exact payment envelope digest
+                <input name="paymentDigest" autocomplete="off" required placeholder="0x…">
               </label>
-              <label>Exact payment envelope digest (optional)
-                <input name="lookupDigest" autocomplete="off" placeholder="0x…">
-                <span>Find one older envelope even when the rendered lifecycle list is capped.</span>
+              <label>Task publication block
+                <input name="taskBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              </label>
+              <label>Receipt publication block
+                <input name="receiptBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              </label>
+              <label>Payment publication block
+                <input name="paymentBlock" inputmode="numeric" pattern="[0-9]+" required placeholder="0">
+              </label>
+              <label>Proposal event block (optional)
+                <input name="proposalBlock" inputmode="numeric" pattern="[0-9]+" placeholder="No event yet">
+              </label>
+              <label>Settlement event block (optional)
+                <input name="settlementBlock" inputmode="numeric" pattern="[0-9]+" placeholder="No event yet">
+              </label>
+              <label>Queue event block (optional)
+                <input name="queueBlock" inputmode="numeric" pattern="[0-9]+" placeholder="No event yet">
+              </label>
+              <label>Execution event block (optional)
+                <input name="executionBlock" inputmode="numeric" pattern="[0-9]+" placeholder="No event yet">
               </label>
             </div>
-            <button type="submit">Verify and reconstruct evidence</button>
+            <button type="submit">Verify exact evidence</button>
           </form>
           <dl>
             <div><dt>Pinned block</dt><dd id="agent-work-block">—</dd></div>

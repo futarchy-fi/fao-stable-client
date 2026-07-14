@@ -20,9 +20,12 @@ import {
   validateCreationBundle,
   verifyAgentWorkProvenance,
   verifyCanonicalTreasuryManifest,
+  verifyCreationInputTrust,
   verifyTreasuryManifest,
   verifyRuntimeCode,
-  visibleInstances
+  verifyWalletSendContext,
+  visibleInstances,
+  withExclusiveOperationLock
 } from './fao-ui.js';
 import {
   BUYBACK_SELECTORS, addressWord, economicCommitmentHashes, encodeCalldata, keccak256,
@@ -120,6 +123,31 @@ test('latest request gate discards overlapping and input-stale completions', asy
   assert.deepEqual(dependentPlanner, { trustRoot: 'new' });
 });
 
+test('cross-tab operation lock admits only one transaction writer', async () => {
+  let held = false;
+  const locks = {
+    async request(name, options, callback) {
+      assert.equal(name, 'fao-stable-client:transaction-writer:v1');
+      assert.deepEqual(options, { mode: 'exclusive', ifAvailable: true });
+      if (held) return callback(null);
+      held = true;
+      try {
+        return await callback({ name });
+      } finally {
+        held = false;
+      }
+    }
+  };
+  let release;
+  const first = withExclusiveOperationLock(locks, () => new Promise((resolve) => { release = resolve; }));
+  await Promise.resolve();
+  const second = await withExclusiveOperationLock(locks, async () => 'unsafe');
+  assert.deepEqual(second, { acquired: false, value: null });
+  release('safe');
+  assert.deepEqual(await first, { acquired: true, value: 'safe' });
+  await assert.rejects(withExclusiveOperationLock(null, async () => {}), /locking is unavailable/);
+});
+
 test('every async positive-state writer is generation-gated against stale success and error', async () => {
   const source = await readFile(new URL('./fao-ui.js', import.meta.url), 'utf8');
   for (const name of [
@@ -130,9 +158,9 @@ test('every async positive-state writer is generation-gated against stale succes
     assert.match(source, new RegExp(`const ${name} = latestRequestGate\\(\\);`));
     assert.match(source, new RegExp(`${name}\\.current\\(`));
   }
-  assert.equal((source.match(/await runTrackedTransaction\(\{/g) || []).length, 3);
-  assert.equal((source.match(/const outcome = applyCurrentBuybackRefresh\(/g) || []).length, 3);
-  assert.match(source, /await reconcileTrackedOperation\(/);
+  assert.equal((source.match(/await runBrowserTrackedTransaction\(\{/g) || []).length, 3);
+  assert.equal((source.match(/const outcome = await applyCurrentBuybackRefresh\(/g) || []).length, 3);
+  assert.match(source, /await reconcileBrowserOperation\(/);
 
   for (const label of ['treasury', 'creation', 'receipt', 'buyback']) {
     const gate = latestRequestGate();
@@ -276,6 +304,7 @@ test('receipt reads bind status, transaction hash, and canonical block hash', as
       return receipt;
     }
     if (method === 'eth_getBlockByNumber') {
+      if (params[0] === 'finalized') return { number: '0x30', hash: hash('fc') };
       assert.deepEqual(params, ['0x20', false]);
       return { number: '0x20', hash: hash('fe') };
     }
@@ -285,8 +314,15 @@ test('receipt reads bind status, transaction hash, and canonical block hash', as
   await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method, params) => (
     method === 'eth_getTransactionReceipt'
       ? receipt
-      : { number: params[0], hash: hash('fd') }
+      : params[0] === 'finalized'
+        ? { number: '0x30', hash: hash('fc') }
+        : { number: params[0], hash: hash('fd') }
   )), /not anchored in the canonical block/);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method, params) => (
+    method === 'eth_getTransactionReceipt'
+      ? receipt
+      : { number: params[0] === 'finalized' ? '0x1f' : params[0], hash: hash('fe') }
+  )), /not finalized yet/);
   await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method) => (
     method === 'eth_getTransactionReceipt'
       ? { ...receipt, status: '0x01' }
@@ -638,6 +674,26 @@ test('writes fail closed on RPC disagreement, wrong chain, and unverified code',
     deriveNetworkGate({ ...base, walletChainId: '0xaa36a7', rpcChainId: '11155111', codeState: 'verified' }),
     { state: 'ready', canTransact: true, message: 'Sepolia, RPC agreement, and every manifest runtime hash are verified.' }
   );
+});
+
+test('wallet send context re-reads exact chain and account', async () => {
+  const account = address(9);
+  const request = async (method) => (
+    method === 'eth_chainId' ? '0xaa36a7' : [account]
+  );
+  assert.deepEqual(await verifyWalletSendContext({
+    chainId: 11155111, account, request
+  }), { chainId: 11155111n, account });
+  await assert.rejects(verifyWalletSendContext({
+    chainId: 11155111,
+    account,
+    request: async (method) => (method === 'eth_chainId' ? '0x1' : [account])
+  }), /chain mismatch/);
+  await assert.rejects(verifyWalletSendContext({
+    chainId: 11155111,
+    account,
+    request: async (method) => (method === 'eth_chainId' ? '0xaa36a7' : [address(8)])
+  }), /account changed/);
 });
 
 test('runtime verification requires an exact hash map and matches every contract', async () => {
@@ -1040,6 +1096,11 @@ test('draft becomes one frozen canonical registrar input', () => {
   assert.equal(input.coreConfig.bootstrapDeadline, '2000090000');
   assert.equal(input.coreConfig.stackDeployer.target, address(3));
   assert.equal(input.coreConfig.proposalImplementation.target, address(2));
+  assert.equal(verifyCreationInputTrust(input, manifest), true);
+  assert.throws(
+    () => verifyCreationInputTrust({ ...input, registrar: address(8) }, manifest),
+    /not bound to the current canonical manifest/
+  );
   assert.deepEqual(input.coreConfig.assetPolicies, [{
     asset: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
     c1: '10000000000000000', c2: '100000000000000000',
@@ -1122,8 +1183,10 @@ test('semantic shell exposes every requested lane and explicit curation opt-in',
     'captured chain, vault or target, and account',
     'Call buyback',
     'Agent task → receipt → payment evidence',
-    'build prediction is not a',
-    'explicitly incomplete',
+    'shareable exact-evidence locator',
+    'never a trust root',
+    'Payment publication block',
+    'Execution event block',
     'Valid payment envelopes',
     'block-delta-consistent',
     'not a transaction-level state diff',

@@ -458,8 +458,6 @@ export function applyTrackedBuybackRefresh(controller, identity, model) {
 
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
-const MAX_AGENT_PAYMENT_VIEWS = 10;
-const MAX_AGENT_RENDERED_RECORDS = 100;
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
 export const PINNED_DEPENDENCIES = Object.freeze({
@@ -640,6 +638,14 @@ export async function readCanonicalTransactionReceipt(hash, request) {
   const receipt = await request('eth_getTransactionReceipt', [transactionHash]);
   if (!receipt) return null;
   const evidence = validatedReceiptEvidence(receipt, transactionHash);
+  const finalized = await request('eth_getBlockByNumber', ['finalized', false]);
+  if (!finalized || Array.isArray(finalized) || typeof finalized !== 'object') {
+    throw new Error('RPC returned no finalized block for transaction reconciliation.');
+  }
+  const finalizedNumber = rpcQuantity(finalized.number, 'Receipt finalized block number');
+  if (evidence.blockNumber > finalizedNumber) {
+    throw new Error('Transaction receipt is canonical but not finalized yet.');
+  }
   const blockTag = `0x${evidence.blockNumber.toString(16)}`;
   const block = await request('eth_getBlockByNumber', [blockTag, false]);
   if (!block || Array.isArray(block) || typeof block !== 'object'
@@ -648,6 +654,25 @@ export async function readCanonicalTransactionReceipt(hash, request) {
     throw new Error('Transaction receipt is not anchored in the canonical block at its reported height.');
   }
   return receipt;
+}
+
+export async function verifyWalletSendContext(value) {
+  const input = exactRecord(value, ['chainId', 'account', 'request'], 'Wallet send context');
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+  const expectedChain = fao.assertChainId(input.chainId);
+  const expectedAccount = fao.normalizeAddress(input.account);
+  const [rawChain, accounts] = await Promise.all([
+    input.request('eth_chainId', []), input.request('eth_accounts', [])
+  ]);
+  const actualChain = rpcQuantity(rawChain, 'Wallet send chain ID');
+  if (actualChain !== expectedChain) {
+    throw new Error(`Wallet send chain mismatch: expected ${expectedChain}, received ${actualChain}.`);
+  }
+  if (!Array.isArray(accounts) || accounts.length === 0
+    || fao.normalizeAddress(accounts[0]) !== expectedAccount) {
+    throw new Error('Wallet send account changed before the transaction request.');
+  }
+  return Object.freeze({ chainId: actualChain, account: expectedAccount });
 }
 
 export async function readBuybackModel(value) {
@@ -1080,6 +1105,47 @@ export function creationInputFromDraft(draft, manifest, currentTimestamp) {
   });
 }
 
+export function verifyCreationInputTrust(input, manifest) {
+  if (!input || Array.isArray(input) || typeof input !== 'object'
+    || !input.coreConfig || !input.flmConfig || manifest?.status !== 'active') {
+    throw new Error('Prepared creation trust input is invalid.');
+  }
+  const expected = {
+    registrar: manifest.registrar.address,
+    proxyFactory: PINNED_DEPENDENCIES.proxyFactory,
+    spaceImplementation: PINNED_DEPENDENCIES.spaceImplementation,
+    proposalValidationStrategy: PINNED_DEPENDENCIES.proposalValidationStrategy,
+    stackDeployerTarget: manifest.prerequisites.stackDeployer.address,
+    stackDeployerCodehash: manifest.prerequisites.stackDeployer.runtimeCodeKeccak256,
+    proposalImplementationTarget: manifest.prerequisites.proposalImplementation.address,
+    proposalImplementationCodehash: manifest.prerequisites.proposalImplementation.runtimeCodeKeccak256,
+    weth: PINNED_DEPENDENCIES.weth,
+    conditionalTokens: PINNED_DEPENDENCIES.conditionalTokens,
+    wrapped1155Factory: PINNED_DEPENDENCIES.wrapped1155Factory,
+    uniswapV3Factory: PINNED_DEPENDENCIES.uniswapV3Factory,
+    positionManager: PINNED_DEPENDENCIES.positionManager
+  };
+  const actual = {
+    registrar: input.registrar,
+    proxyFactory: input.coreConfig.proxyFactory,
+    spaceImplementation: input.coreConfig.spaceImplementation,
+    proposalValidationStrategy: input.coreConfig.proposalValidationStrategy,
+    stackDeployerTarget: input.coreConfig.stackDeployer?.target,
+    stackDeployerCodehash: input.coreConfig.stackDeployer?.codehash,
+    proposalImplementationTarget: input.coreConfig.proposalImplementation?.target,
+    proposalImplementationCodehash: input.coreConfig.proposalImplementation?.codehash,
+    weth: input.coreConfig.weth,
+    conditionalTokens: input.coreConfig.conditionalTokens,
+    wrapped1155Factory: input.coreConfig.wrapped1155Factory,
+    uniswapV3Factory: input.coreConfig.uniswapV3Factory,
+    positionManager: input.flmConfig.positionManager
+  };
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Prepared creation input is not bound to the current canonical manifest and dependencies.');
+  }
+  return true;
+}
+
 function normalizeInstance(instance) {
   if (!instance || Array.isArray(instance) || typeof instance !== 'object') throw new Error('Invalid registrar instance.');
   const address = fao.normalizeAddress(instance.address);
@@ -1156,6 +1222,7 @@ const receiptStateRequests = latestRequestGate();
 const treasuryFlowRequests = latestRequestGate();
 const treasuryManifestRequests = latestRequestGate();
 const OPERATION_JOURNAL_KEY = 'fao-stable-client:transaction-journal:v1';
+const OPERATION_LOCK_KEY = 'fao-stable-client:transaction-writer:v1';
 let operationJournalError = null;
 
 function storedTrackedOperations() {
@@ -1192,10 +1259,9 @@ try {
   operationJournalError = new Error(`Stored transaction journal rejected: ${errorMessage(error)}`);
 }
 
-let trackedOperations;
-try {
-  trackedOperations = trackedOperationController({
-    initialEntries: initialTrackedOperations,
+function trackedOperationsController(initialEntries) {
+  return trackedOperationController({
+    initialEntries,
     onChange: (entries) => {
       persistTrackedOperations(entries);
       if (!elements?.operationJournal) return;
@@ -1204,14 +1270,61 @@ try {
       if (elements.treasuryForms) renderTreasuryGate();
     }
   });
+}
+
+let trackedOperations;
+try {
+  trackedOperations = trackedOperationsController(initialTrackedOperations);
 } catch (error) {
   operationJournalError = new Error(`Stored transaction journal rejected: ${errorMessage(error)}`);
   trackedOperations = trackedOperationController({ onChange: () => {} });
 }
 
+function synchronizeTrackedOperations() {
+  if (operationJournalError) throw operationJournalError;
+  trackedOperations = trackedOperationsController(storedTrackedOperations());
+  if (!elements?.operationJournal) return;
+  renderOperationJournal();
+  renderStages();
+  renderTreasuryGate();
+}
+
+export async function withExclusiveOperationLock(locks, callback) {
+  if (!locks || typeof locks.request !== 'function' || typeof callback !== 'function') {
+    throw new Error('Cross-tab transaction locking is unavailable.');
+  }
+  return locks.request(
+    OPERATION_LOCK_KEY,
+    { mode: 'exclusive', ifAvailable: true },
+    async (lock) => lock
+      ? Object.freeze({ acquired: true, value: await callback() })
+      : Object.freeze({ acquired: false, value: null })
+  );
+}
+
+async function runBrowserTrackedTransaction(options) {
+  let locked;
+  try {
+    locked = await withExclusiveOperationLock(globalThis.navigator?.locks, async () => {
+      synchronizeTrackedOperations();
+      return runTrackedTransaction({ ...options, controller: trackedOperations });
+    });
+  } catch (error) {
+    return Object.freeze({ operation: null, blocked: true, receipt: null, error });
+  }
+  if (locked.acquired) return locked.value;
+  const error = new Error('Another stable-client tab is handling a transaction. Reconcile it before retrying.');
+  return Object.freeze({ operation: null, blocked: true, receipt: null, error });
+}
+
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
   return window.ethereum.request({ method, params });
+}
+
+async function sendWalletTransaction(account, target, data) {
+  await verifyWalletSendContext({ chainId: SEPOLIA_CHAIN_ID, account, request: rpc });
+  return rpc('eth_sendTransaction', [{ from: account, to: target, data }]);
 }
 
 function currentGate() {
@@ -1222,6 +1335,13 @@ function currentGate() {
     rpcChainId: state.rpcChainId,
     codeState: state.codeState
   });
+  if (gate.canTransact && (typeof navigator === 'undefined' || !navigator.locks?.request)) {
+    return Object.freeze({
+      state: 'transaction-lock-unavailable',
+      canTransact: false,
+      message: 'This browser cannot coordinate transaction truth across tabs. Writes are disabled.'
+    });
+  }
   return operationJournalError && gate.canTransact
     ? Object.freeze({
       state: 'journal-error',
@@ -1320,7 +1440,7 @@ function renderGate() {
 }
 
 function treasuryNetworkReady() {
-  return !operationJournalError && state.account && state.walletChainId === SEPOLIA_CHAIN_ID
+  return currentGate().canTransact && state.account && state.walletChainId === SEPOLIA_CHAIN_ID
     && state.rpcChainId === SEPOLIA_CHAIN_ID && state.treasuryRecords;
 }
 
@@ -1338,12 +1458,17 @@ function buybackOperationOwnsCurrentCard(operation) {
     && operation.vault === state.treasuryRecords.vault;
 }
 
-function applyCurrentBuybackRefresh(model) {
-  return applyTrackedBuybackRefresh(trackedOperations, {
-    chainId: SEPOLIA_CHAIN_ID,
-    account: state.account,
-    vault: state.treasuryRecords?.vault
-  }, model);
+async function applyCurrentBuybackRefresh(model) {
+  const locked = await withExclusiveOperationLock(globalThis.navigator?.locks, async () => {
+    synchronizeTrackedOperations();
+    return applyTrackedBuybackRefresh(trackedOperations, {
+      chainId: SEPOLIA_CHAIN_ID,
+      account: state.account,
+      vault: state.treasuryRecords?.vault
+    }, model);
+  });
+  if (!locked.acquired) throw new Error('Another stable-client tab is handling a transaction.');
+  return locked.value;
 }
 
 function resetBuybackCard(message) {
@@ -1516,16 +1641,26 @@ function renderOperationJournal() {
   }
 }
 
+async function reconcileBrowserOperation(id) {
+  const locked = await withExclusiveOperationLock(globalThis.navigator?.locks, async () => {
+    synchronizeTrackedOperations();
+    const operation = trackedOperations.operation(id);
+    if (!operation || operation.state !== TRACKED_OPERATION_STATES.submitted) return null;
+    if (state.walletChainId?.toString() !== operation.chainId
+      || state.rpcChainId?.toString() !== operation.chainId) {
+      throw new Error(`Reconnect chain ${operation.chainId} before reconciling this transaction.`);
+    }
+    return reconcileTrackedOperation(
+      trackedOperations, operation, (hash) => readCanonicalTransactionReceipt(hash, rpc)
+    );
+  });
+  if (!locked.acquired) throw new Error('Another stable-client tab is handling a transaction.');
+  return locked.value;
+}
+
 async function reconcileJournalOperation(id) {
-  const operation = trackedOperations.operation(id);
-  if (!operation || operation.state !== TRACKED_OPERATION_STATES.submitted) return;
-  if (state.walletChainId?.toString() !== operation.chainId
-    || state.rpcChainId?.toString() !== operation.chainId) {
-    throw new Error(`Reconnect chain ${operation.chainId} before reconciling this transaction.`);
-  }
-  const result = await reconcileTrackedOperation(
-    trackedOperations, operation, (hash) => readCanonicalTransactionReceipt(hash, rpc)
-  );
+  const result = await reconcileBrowserOperation(id);
+  if (!result) return;
   if (result.error || result.operation.state === TRACKED_OPERATION_STATES.submitted) return;
   if (result.operation.kind === 'creation' && state.creationPlan) {
     await refreshReceiptState();
@@ -1845,6 +1980,7 @@ async function refreshReceiptState() {
 async function installPreparedInput(input, { persist = true, request } = {}) {
   const creationBundle = state.creationBundle;
   if (!creationBundle) throw new Error('Creation bytecode is unavailable.');
+  verifyCreationInputTrust(input, state.manifest);
   const plan = fao.createPlan({
     ...input,
     creationCodes: creationBundle.creationCodes
@@ -1923,8 +2059,9 @@ async function sendCreationStage(event) {
   const plan = state.creationPlan;
   const predictedReceipt = state.predictedReceipt;
   const preparedInput = state.preparedInput;
+  const manifest = state.manifest;
   const account = state.account;
-  if (!plan || !predictedReceipt || !preparedInput || !account) {
+  if (!plan || !predictedReceipt || !preparedInput || manifest?.status !== 'active' || !account) {
     setMessage(elements.stageStatus, 'Prepare and review an exact creation plan first.', true);
     return;
   }
@@ -1941,6 +2078,7 @@ async function sendCreationStage(event) {
   const ownsCard = () => state.creationPlan === plan
     && state.predictedReceipt === predictedReceipt
     && state.preparedInput === preparedInput
+    && state.manifest === manifest
     && state.account === account
     && state.walletChainId === SEPOLIA_CHAIN_ID
     && state.rpcChainId === SEPOLIA_CHAIN_ID;
@@ -1967,13 +2105,16 @@ async function sendCreationStage(event) {
       setMessage(elements.stageStatus, operation.error, true);
     }
   };
-  const result = await runTrackedTransaction({
-    controller: trackedOperations,
+  const result = await runBrowserTrackedTransaction({
     context: {
       kind: 'creation', label: `Creation · ${stage}`, chainId: SEPOLIA_CHAIN_ID,
       account, target: step.target
     },
     verify: async () => {
+      const freshRuntime = await verifyRuntimeCode(manifest, rpc);
+      if (freshRuntime.status !== 'verified') {
+        throw new Error('Canonical self-serve runtime verification failed before wallet invocation.');
+      }
       if (!await refreshReceiptState() || !ownsCard() || !currentGate().canTransact) {
         throw new Error('Creation plan or wallet state changed during stage verification.');
       }
@@ -1991,10 +2132,13 @@ async function sendCreationStage(event) {
       }
     },
     stillCurrent: () => ownsCard() && currentGate().canTransact,
-    send: () => rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]),
+    send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,
     onUpdate
   });
+  if (result.blocked && result.error) {
+    setMessage(elements.stageStatus, result.error.message, true);
+  }
   if (result.operation?.state === TRACKED_OPERATION_STATES.confirmed && ownsCard()) {
     try {
       if (await refreshReceiptState() && ownsCard()) {
@@ -2072,8 +2216,8 @@ function prepareRagequit(event) {
 }
 
 async function loadTreasuryManifest(form, request) {
-  if (!state.account || state.walletChainId !== SEPOLIA_CHAIN_ID || state.rpcChainId !== SEPOLIA_CHAIN_ID) {
-    throw new Error('Connect a wallet with matching Sepolia wallet and RPC chain IDs first.');
+  if (!currentGate().canTransact) {
+    throw new Error('Verify the canonical self-serve deployment and matching Sepolia wallet state first.');
   }
   state.treasuryManifest = null;
   state.treasuryRecords = null;
@@ -2106,7 +2250,7 @@ async function loadTreasuryManifest(form, request) {
   elements.treasuryVault.textContent = records.vault;
   renderBuybackModel();
   if (!alignBuybackCardWithPending()) {
-    const outcome = applyCurrentBuybackRefresh(buybackModel);
+    const outcome = await applyCurrentBuybackRefresh(buybackModel);
     setBuybackActionState(outcome.actionState);
     if (!outcome.ready) {
       setMessage(
@@ -2128,9 +2272,20 @@ async function loadAgentWork(form, request) {
   renderAgentWork();
   const values = Object.fromEntries(new FormData(form).entries());
   const manifest = validateTreasuryManifest(state.treasuryManifest);
+  const optionalBlock = (name) => values[name] ? values[name] : null;
   const view = await fao.readAgentWorkIndex({
     request: rpc,
-    config: { address: values.address, startBlock: values.startBlock },
+    config: { address: values.address },
+    locator: {
+      paymentDigest: values.paymentDigest,
+      taskBlock: values.taskBlock,
+      receiptBlock: values.receiptBlock,
+      paymentBlock: values.paymentBlock,
+      proposalBlock: optionalBlock('proposalBlock'),
+      settlementBlock: optionalBlock('settlementBlock'),
+      queueBlock: optionalBlock('queueBlock'),
+      executionBlock: optionalBlock('executionBlock')
+    },
     chainId: SEPOLIA_CHAIN_ID,
     vault: manifest.contracts.vault
   });
@@ -2141,11 +2296,7 @@ async function loadAgentWork(form, request) {
     indexView: view,
     request: rpc
   });
-  const inspectedPayments = fao.selectAgentPayments(view.payments, {
-    limit: MAX_AGENT_PAYMENT_VIEWS,
-    digest: values.lookupDigest
-  });
-  const paymentViews = await fao.inspectAgentPayments(inspectedPayments, 3, async (record) => {
+  const paymentViews = await fao.inspectAgentPayments(view.payments, 1, async (record) => {
     const payment = await fao.readAgentPaymentState({
       request: rpc,
       chainId: SEPOLIA_CHAIN_ID,
@@ -2153,7 +2304,18 @@ async function loadAgentWork(form, request) {
       gateway: fresh.gateway,
       arbitration: fresh.arbitration,
       executor: fresh.executor,
-      startBlock: view.config.startBlock,
+      runtimeCodeHashes: {
+        vault: fresh.vaultRuntimeCodeKeccak256,
+        gateway: fresh.gatewayRuntimeCodeKeccak256,
+        arbitration: fresh.arbitrationRuntimeCodeKeccak256,
+        executor: fresh.executorRuntimeCodeKeccak256
+      },
+      eventBlocks: {
+        proposalBlock: view.locator.proposalBlock,
+        settlementBlock: view.locator.settlementBlock,
+        queueBlock: view.locator.queueBlock,
+        executionBlock: view.locator.executionBlock
+      },
       blockNumber: view.blockNumber,
       blockHash: view.blockHash,
       timestamp: view.timestamp,
@@ -2172,37 +2334,19 @@ async function loadAgentWork(form, request) {
       })
     });
   });
-  const exactPayment = values.lookupDigest
-    ? view.payments.find((record) => record.documentDigest === values.lookupDigest.toLowerCase())
-    : null;
-  const exactReceipt = exactPayment
-    ? view.receipts.find((record) => record.documentDigest === exactPayment.value.receipt)
-    : null;
-  const exactTask = exactPayment
-    ? view.tasks.find((record) => record.documentDigest === exactPayment.value.task)
-    : null;
-  const cappedWith = (records, exact) => {
-    const selected = records.slice(-MAX_AGENT_RENDERED_RECORDS);
-    if (exact && !selected.some((record) => record.documentDigest === exact.documentDigest)) {
-      if (selected.length === MAX_AGENT_RENDERED_RECORDS) selected.shift();
-      selected.push(exact);
-    }
-    return Object.freeze(selected);
-  };
-  const omittedPayments = view.payments.length - inspectedPayments.length;
   if (!agentWorkRequests.current(request, agentWorkInputSnapshot())) return;
   state.agentWork = Object.freeze({
     ...view,
     paymentViews,
-    renderedTasks: cappedWith(view.tasks, exactTask),
-    renderedReceipts: cappedWith(view.receipts, exactReceipt),
-    renderedRejected: Object.freeze(view.rejected.slice(-MAX_AGENT_RENDERED_RECORDS)),
-    omittedPayments
+    renderedTasks: view.tasks,
+    renderedReceipts: view.receipts,
+    renderedRejected: view.rejected,
+    omittedPayments: 0
   });
   renderAgentWork();
   setMessage(
     elements.agentWorkStatus,
-    `Verified canonical registrar provenance, receipt, lifecycle code, wiring, and index code through finalized Sepolia block ${view.blockNumber}. The caller-selected start block makes this an explicitly incomplete discovery range; rejected records remain inert. Rendered record lists are capped at ${MAX_AGENT_RENDERED_RECORDS}.${omittedPayments ? ` Lifecycle reads show ${inspectedPayments.length} of ${view.payments.length} envelopes; use exact digest lookup for an older envelope.` : ''}`
+    `Verified one exact task → receipt → payment lineage, canonical registrar provenance, lifecycle code, wiring, and index code through finalized Sepolia block ${view.blockNumber}. Supplied event blocks are exact trust inputs; omitted event blocks remain unverified.`
   );
 }
 
@@ -2248,11 +2392,8 @@ async function refreshBuybackForUser(request) {
       alignBuybackCardWithPending();
       return null;
     }
-    resolved = await reconcileTrackedOperation(
-      trackedOperations,
-      pending,
-      (hash) => rpc('eth_getTransactionReceipt', [hash])
-    );
+    resolved = await reconcileBrowserOperation(pending.id);
+    if (!resolved) return null;
     if (!buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) return null;
     const ownsResolvedCard = buybackOperationOwnsCurrentCard(resolved.operation);
     if (resolved.operation.state === TRACKED_OPERATION_STATES.submitted) {
@@ -2260,7 +2401,7 @@ async function refreshBuybackForUser(request) {
         setBuybackActionState(BUYBACK_ACTION_STATES.submittedUnknown);
         setMessage(
           elements.buybackStatus,
-          `Transaction ${pending.hash} remains submitted with no canonical receipt yet. No new buyback can be sent. ${pending.error || ''}`,
+          `Transaction ${resolved.operation.hash} remains submitted with no finalized receipt yet. No new buyback can be sent. ${resolved.operation.error || ''}`,
           true
         );
       } else {
@@ -2285,7 +2426,7 @@ async function refreshBuybackForUser(request) {
   if (!wasConfirmed) setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
   const model = await refreshBuybackState(true);
   if (!model || !buybackRefreshRequests.current(request, buybackRefreshInputSnapshot())) return null;
-  const outcome = applyCurrentBuybackRefresh(model);
+  const outcome = await applyCurrentBuybackRefresh(model);
   setBuybackActionState(outcome.actionState);
   if (!outcome.ready) {
     setMessage(
@@ -2370,8 +2511,7 @@ async function sendBuyback() {
     }
   };
   setBuybackActionState(BUYBACK_ACTION_STATES.inFlight);
-  const result = await runTrackedTransaction({
-    controller: trackedOperations,
+  const result = await runBrowserTrackedTransaction({
     context: {
       kind: 'buyback', label: plan.label, chainId: SEPOLIA_CHAIN_ID,
       account, vault: records.vault, target: plan.target
@@ -2386,10 +2526,14 @@ async function sendBuyback() {
       }
     },
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
-    send: () => rpc('eth_sendTransaction', [{ from: account, to: plan.target, data: plan.data }]),
+    send: () => sendWalletTransaction(account, plan.target, plan.data),
     wait: waitForReceipt,
     onUpdate
   });
+  if (result.blocked && result.error) {
+    setBuybackActionState(BUYBACK_ACTION_STATES.refreshNeeded);
+    setMessage(elements.buybackStatus, result.error.message, true);
+  }
   const operation = result.operation;
   if (!operation || !ownsCard()
     || ![TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
@@ -2413,7 +2557,7 @@ async function sendBuyback() {
   try {
     const model = await refreshBuybackState(false);
     if (!model || !ownsCard()) return result;
-    const outcome = applyCurrentBuybackRefresh(model);
+    const outcome = await applyCurrentBuybackRefresh(model);
     setBuybackActionState(outcome.actionState);
     if (!outcome.ready) {
       setMessage(
@@ -2575,8 +2719,7 @@ async function sendTreasuryStep(index, flow, form, request) {
       setMessage(elements.treasuryStatus, operation.error, true);
     }
   };
-  await runTrackedTransaction({
-    controller: trackedOperations,
+  const result = await runBrowserTrackedTransaction({
     context: {
       kind: 'treasury', label: step.label, chainId: SEPOLIA_CHAIN_ID,
       account, vault: records.vault, target: step.target
@@ -2588,10 +2731,13 @@ async function sendTreasuryStep(index, flow, form, request) {
       }
     },
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
-    send: () => rpc('eth_sendTransaction', [{ from: account, to: step.target, data: step.data }]),
+    send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,
     onUpdate
   });
+  if (result.blocked && result.error) {
+    setMessage(elements.treasuryStatus, result.error.message, true);
+  }
 }
 
 function unavailableAction(event) {
@@ -2654,6 +2800,17 @@ function bindElements() {
 async function initialize() {
   bindElements();
   renderOperationJournal();
+  window.addEventListener('storage', (event) => {
+    if (event.storageArea !== localStorage || event.key !== OPERATION_JOURNAL_KEY) return;
+    try {
+      if (event.newValue == null) throw new Error('Transaction journal was removed in another tab.');
+      synchronizeTrackedOperations();
+    } catch (error) {
+      operationJournalError = new Error(`Cross-tab transaction journal rejected: ${errorMessage(error)}`);
+      renderOperationJournal();
+    }
+    renderGate();
+  });
   elements.createForm.addEventListener('submit', saveDraft);
   elements.createForm.addEventListener('input', () => invalidatePreparedPlan('Draft changed. Prepare a new exact plan before staging.'));
   elements.preparePlan.addEventListener('click', () => {

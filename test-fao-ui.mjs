@@ -13,11 +13,13 @@ import {
   latestRequestGate,
   parseExtraAssetInput,
   readBuybackModel,
+  readCanonicalTransactionReceipt,
   reconcileTrackedOperation,
   runTrackedTransaction,
   trackedOperationController,
   validateCreationBundle,
   verifyAgentWorkProvenance,
+  verifyCanonicalTreasuryManifest,
   verifyTreasuryManifest,
   verifyRuntimeCode,
   visibleInstances
@@ -31,6 +33,9 @@ import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-man
 const address = (value) => `0x${value.toString(16).padStart(40, '0')}`;
 const hash = (byte) => `0x${byte.repeat(32)}`;
 const word = (value) => `0x${'0'.repeat(24)}${value.slice(2)}`;
+const transactionReceipt = (transactionHash, status = '0x1', blockNumber = '0x20') => ({
+  status, transactionHash, blockHash: hash('fe'), blockNumber
+});
 
 function treasuryManifest() {
   const contractNames = [
@@ -166,8 +171,8 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
   };
   for (const [receipt, expected] of [
     [new Error('receipt RPC timeout'), TRACKED_OPERATION_STATES.submitted],
-    [{ status: '0x0' }, TRACKED_OPERATION_STATES.reverted],
-    [{ status: '0x1', blockNumber: '0x20' }, TRACKED_OPERATION_STATES.confirmed]
+    [transactionReceipt(hash('71'), '0x0'), TRACKED_OPERATION_STATES.reverted],
+    [transactionReceipt(hash('71')), TRACKED_OPERATION_STATES.confirmed]
   ]) {
     const controller = trackedOperationController();
     const result = await runTrackedTransaction({
@@ -195,6 +200,7 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
       assert.equal(controller.pending('buyback'), result.operation);
     } else {
       assert.equal(result.operation.receiptStatus, expected === TRACKED_OPERATION_STATES.confirmed ? '1' : '0');
+      assert.equal(result.operation.receiptBlockHash, hash('fe'));
       assert.equal(controller.pending('buyback'), null);
     }
   }
@@ -212,7 +218,7 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
     verify: async () => verification,
     stillCurrent: () => true,
     send: async () => { transitionSends += 1; return hash('70'); },
-    wait: async () => ({ status: '0x1', blockNumber: '0x20' })
+    wait: async () => transactionReceipt(hash('70'))
   });
   const duplicateBeforeWallet = await runTrackedTransaction({
     controller: transitionController,
@@ -220,7 +226,7 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
     verify: async () => {},
     stillCurrent: () => true,
     send: async () => { transitionSends += 1; return hash('70'); },
-    wait: async () => ({ status: '0x1', blockNumber: '0x20' })
+    wait: async () => transactionReceipt(hash('70'))
   });
   assert.equal(duplicateBeforeWallet.blocked, true);
   assert.deepEqual(transitions, [TRACKED_OPERATION_STATES.preBroadcast]);
@@ -259,6 +265,33 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
   });
   assert.equal(rejectedResult.operation.state, TRACKED_OPERATION_STATES.failed);
   assert.equal(rejectedController.pending('buyback'), null);
+});
+
+test('receipt reads bind status, transaction hash, and canonical block hash', async () => {
+  const transactionHash = hash('77');
+  const receipt = transactionReceipt(transactionHash);
+  const request = async (method, params) => {
+    if (method === 'eth_getTransactionReceipt') {
+      assert.deepEqual(params, [transactionHash]);
+      return receipt;
+    }
+    if (method === 'eth_getBlockByNumber') {
+      assert.deepEqual(params, ['0x20', false]);
+      return { number: '0x20', hash: hash('fe') };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  assert.equal(await readCanonicalTransactionReceipt(transactionHash, request), receipt);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method, params) => (
+    method === 'eth_getTransactionReceipt'
+      ? receipt
+      : { number: params[0], hash: hash('fd') }
+  )), /not anchored in the canonical block/);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method) => (
+    method === 'eth_getTransactionReceipt'
+      ? { ...receipt, status: '0x01' }
+      : { number: '0x20', hash: hash('fe') }
+  )), /status must be canonical/);
 });
 
 test('production journal survives manifest switches and reconciliation owns liveness', async () => {
@@ -318,8 +351,15 @@ test('production journal survives manifest switches and reconciliation owns live
   );
   assert.equal(unknown.operation.state, TRACKED_OPERATION_STATES.submitted);
   assert.equal(controller.pending('buyback'), submitted.operation);
+  const wrongReceipt = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => transactionReceipt(hash('99'))
+  );
+  assert.match(wrongReceipt.operation.error, /does not match/);
+  assert.equal(controller.pending('buyback'), submitted.operation);
+  const missingBlockReceipt = transactionReceipt(hash('72'));
+  delete missingBlockReceipt.blockNumber;
   const missingBlock = await reconcileTrackedOperation(
-    controller, submitted.operation, async () => ({ status: '0x1' })
+    controller, submitted.operation, async () => missingBlockReceipt
   );
   assert.equal(missingBlock.operation.state, TRACKED_OPERATION_STATES.submitted);
   assert.match(missingBlock.operation.error, /block number is required/);
@@ -333,7 +373,7 @@ test('production journal survives manifest switches and reconciliation owns live
   assert.equal(missingRefresh.ready, false);
   assert.equal(missingRefresh.operation.hash, hash('72'));
   const confirmed = await reconcileTrackedOperation(
-    controller, submitted.operation, async () => ({ status: '0x1', blockNumber: '0x20' })
+    controller, submitted.operation, async () => transactionReceipt(hash('72'))
   );
   assert.equal(confirmed.operation.state, TRACKED_OPERATION_STATES.confirmed);
   assert.equal(cardStatus, 'manifest B');
@@ -345,10 +385,64 @@ test('production journal survives manifest switches and reconciliation owns live
     verify: async () => {},
     stillCurrent: () => true,
     send: async () => { sends += 1; return hash('73'); },
-    wait: async () => ({ status: '0x0' })
+    wait: async () => transactionReceipt(hash('73'), '0x0')
   });
   assert.equal(retry.operation.state, TRACKED_OPERATION_STATES.reverted);
   assert.equal(sends, 2);
+});
+
+test('submitted journal entries survive controller restoration and still block duplicates', async () => {
+  const context = {
+    kind: 'treasury', label: 'Treasury action', chainId: 11155111,
+    account: address(9), vault: address(1), target: address(2)
+  };
+  const original = trackedOperationController();
+  const submitted = await runTrackedTransaction({
+    controller: original,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('7a'),
+    wait: async () => { throw new Error('receipt unavailable'); }
+  });
+  const restored = trackedOperationController({ initialEntries: original.entries() });
+  assert.equal(restored.pending('treasury').hash, submitted.operation.hash);
+  let sends = 0;
+  const duplicate = await runTrackedTransaction({
+    controller: restored,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('7b'); },
+    wait: async () => transactionReceipt(hash('7b'))
+  });
+  assert.equal(duplicate.blocked, true);
+  assert.equal(sends, 0);
+  const reconciled = await reconcileTrackedOperation(
+    restored, restored.pending('treasury'), async () => transactionReceipt(hash('7a'))
+  );
+  assert.equal(reconciled.operation.state, TRACKED_OPERATION_STATES.confirmed);
+
+  const unknown = trackedOperationController();
+  await runTrackedTransaction({
+    controller: unknown,
+    context: { ...context, kind: 'creation' },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw new Error('wallet disconnected after invocation'); },
+    wait: async () => transactionReceipt(hash('7c'))
+  });
+  const restoredUnknown = trackedOperationController({ initialEntries: unknown.entries() });
+  assert.equal(restoredUnknown.pending('creation').state, TRACKED_OPERATION_STATES.walletRequested);
+  const blocked = await runTrackedTransaction({
+    controller: restoredUnknown,
+    context: { ...context, kind: 'creation' },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('7c'),
+    wait: async () => transactionReceipt(hash('7c'))
+  });
+  assert.equal(blocked.blocked, true);
 });
 
 test('production buyback refresh retains the confirmed receipt-block lower bound', async () => {
@@ -365,7 +459,7 @@ test('production buyback refresh retains the confirmed receipt-block lower bound
     verify: async () => {},
     stillCurrent: () => true,
     send: async () => hash('73'),
-    wait: async () => ({ status: '0x1', blockNumber: '0x20' })
+    wait: async () => transactionReceipt(hash('73'))
   });
   assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
   const noise = controller.begin({
@@ -409,10 +503,10 @@ test('production buyback refresh retains the confirmed receipt-block lower bound
     verify: async () => {},
     stillCurrent: () => true,
     send: async () => hash('74'),
-    wait: async () => ({ status: '0x0' })
+    wait: async () => transactionReceipt(hash('74'), '0x0')
   });
   assert.equal(reverted.operation.state, TRACKED_OPERATION_STATES.reverted);
-  assert.equal(reverted.operation.receiptBlockNumber, null);
+  assert.equal(reverted.operation.receiptBlockNumber, '32');
   assert.equal(
     applyTrackedBuybackRefresh(revertedController, identityA, { blockNumber: 16n }).actionState,
     BUYBACK_ACTION_STATES.ready
@@ -449,11 +543,11 @@ test('completion after a post-hash manifest switch updates only the captured jou
   const reconciled = await reconcileTrackedOperation(
     controller,
     controller.pending('buyback'),
-    async () => ({ status: '0x1', blockNumber: '0x20' })
+    async () => transactionReceipt(hash('74'))
   );
   assert.equal(reconciled.operation.state, TRACKED_OPERATION_STATES.confirmed);
   assert.equal(reconciled.operation.receiptBlockNumber, '32');
-  finishReceipt({ status: '0x1', blockNumber: '0x20' });
+  finishReceipt(transactionReceipt(hash('74')));
   const result = await resultPromise;
   assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
   assert.equal(result.operation.vault, vaultA);
@@ -488,7 +582,7 @@ test('real treasury plan edits cancel before verification but not after wallet i
       verify: async () => { await verification; assert.ok(flow.steps[0].data.startsWith('0x')); },
       stillCurrent: () => JSON.stringify(input) === captured,
       send: async () => { sends += 1; return hash('75'); },
-      wait: async () => ({ status: '0x1', blockNumber: '0x20' })
+      wait: async () => transactionReceipt(hash('75'))
     });
     input[field] = next;
     finishVerification();
@@ -519,7 +613,7 @@ test('real treasury plan edits cancel before verification but not after wallet i
       walletInvoked();
       return wallet;
     },
-    wait: async () => ({ status: '0x1', blockNumber: '0x20' }),
+    wait: async () => transactionReceipt(hash('76')),
     onUpdate: (operation) => {
       cardStatus = operation.state;
     }
@@ -572,6 +666,7 @@ test('schema-v4 treasury manifest verifies four runtimes and wiring at one final
   const manifest = treasuryManifest();
   const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
   const request = async (method, params) => {
+    if (method === 'eth_chainId') return '0xaa36a7';
     if (method === 'eth_getCode') return '0x6001';
     if (method === 'eth_getBlockByNumber') {
       return { number: '0x10', timestamp: '0x20', hash: hash('44') };
@@ -598,6 +693,12 @@ test('schema-v4 treasury manifest verifies four runtimes and wiring at one final
       }
     }, request),
     /runtime bytecode/
+  );
+  await assert.rejects(
+    verifyTreasuryManifest(manifest, async (method, params) => (
+      method === 'eth_chainId' ? '0x1' : request(method, params)
+    )),
+    /RPC chain mismatch/
   );
   assert.throws(() => validateTreasuryManifest({ ...manifest, schemaVersion: 3 }), /version 4/);
   assert.throws(() => validateTreasuryManifest({
@@ -635,7 +736,6 @@ test('agent lifecycle roots self-consistent stacks without unsafe JSON-number pr
   const cid = `ipfs://b${'a'.repeat(58)}`;
   const input = creationInputFromDraft({
     tokenName: 'Evidence FAO', tokenSymbol: 'EFAO',
-    governedRepository: 'https://github.com/example/fao', governedSite: 'https://example.test',
     saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
     initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
     tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',
@@ -747,6 +847,7 @@ test('agent lifecycle roots self-consistent stacks without unsafe JSON-number pr
     ].map((value) => addressWord(value)).join('')}`
   };
   const request = async (method, params) => {
+    if (method === 'eth_chainId') return '0xaa36a7';
     if (method === 'eth_getCode') {
       const target = params[0];
       if (target === shared.registrar.address) return registrarCode;
@@ -762,6 +863,9 @@ test('agent lifecycle roots self-consistent stacks without unsafe JSON-number pr
       if (filter.topics[0] === flmLog.topics[0]) return [flmLog];
     }
     if (method === 'eth_getBlockByNumber') {
+      if (params[0] === 'finalized') {
+        return { number: '0x64', hash: pinnedHash, timestamp: '0x77359464' };
+      }
       return { hash: {
         '0x5': stageHash, '0x6': coreBlockHash, '0x7': flmBlockHash
       }[params[0]] || pinnedHash };
@@ -795,6 +899,20 @@ test('agent lifecycle roots self-consistent stacks without unsafe JSON-number pr
   });
   assert.equal(verified.receipt, receiptAddress);
   assert.equal(verified.vault, manifest.contracts.vault);
+
+  const canonicalTreasury = await verifyCanonicalTreasuryManifest({
+    manifest,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    request
+  });
+  assert.equal(canonicalTreasury.receipt, receiptAddress);
+  await assert.rejects(verifyCanonicalTreasuryManifest({
+    manifest: base,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    request
+  }), /requires canonical registrar provenance/);
 
   const lossyDisplayOnly = structuredClone(manifest);
   lossyDisplayOnly.coreConfig.saleCap = Number.MAX_SAFE_INTEGER + 2;
@@ -909,7 +1027,6 @@ test('draft becomes one frozen canonical registrar input', () => {
   const cid = `ipfs://b${'a'.repeat(58)}`;
   const draft = {
     tokenName: 'Example FAO', tokenSymbol: 'EFAO',
-    governedRepository: 'https://github.com/example/fao', governedSite: 'https://example.pages.dev',
     saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
     initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
     tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',

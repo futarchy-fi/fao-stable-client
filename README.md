@@ -10,7 +10,9 @@ index runtime hash is embedded. Positive lifecycle status additionally requires 
 ownerless registrar, embedded receipt blob, exact staged receipt provenance, schema-v4 lifecycle
 runtime hashes, and wiring at one finalized block. Accepted, executable-now, paid, and unverified
 remain separate. State-gated calldata references neither sign nor send and explicitly omit ordinary
-bond activation and settlement steps.
+bond activation and settlement steps. Each read is capped at 50,000 blocks, 5,000 logs, 8 MiB of
+log payload, and ten lifecycle inspections; use the exact-digest lookup or a later start block to
+keep permissionless history bounded.
 
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed

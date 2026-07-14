@@ -66,7 +66,7 @@
         </p>
         <form id="create-form">
           <fieldset>
-            <legend>Identity and governed surface</legend>
+            <legend>On-chain identity</legend>
             <div class="form-grid">
               <label>FAO name
                 <input name="tokenName" autocomplete="organization" required maxlength="80" placeholder="Example FAO">
@@ -74,14 +74,11 @@
               <label>Token symbol
                 <input name="tokenSymbol" autocomplete="off" required maxlength="16" placeholder="EXFAO">
               </label>
-              <label class="full">Governed repository
-                <input name="governedRepository" type="url" inputmode="url" required placeholder="https://github.com/owner/repository">
-                <span>An accepted proposal may replace everything in this repository and its governed site.</span>
-              </label>
-              <label class="full">Governed site
-                <input name="governedSite" type="url" inputmode="url" required placeholder="https://example.pages.dev">
-              </label>
             </div>
+            <p class="details">
+              A repository, domain, and release publisher are external resources. The registrar
+              does not provision or commit them; configure those resources explicitly after creation.
+            </p>
           </fieldset>
 
           <fieldset>
@@ -345,10 +342,9 @@
         <form id="treasury-manifest-form" class="ragequit-card">
           <h3>Verify one active FAO treasury</h3>
           <p>
-            Paste the schema-v4 economic deployment manifest. The client checks the vault, gateway,
-            arbitration, and executor runtime hashes plus their wiring before enabling a planned
-            transaction. Positive agent-work lifecycle status additionally requires the shared
-            canonical registrar and receipt provenance below.
+            Paste the schema-v4 economic deployment manifest. The client first proves its shared
+            canonical registrar and receipt provenance, then checks the vault, gateway, arbitration,
+            and executor runtime hashes plus their wiring before enabling a planned transaction.
           </p>
           <label class="full">Economic deployment manifest JSON
             <textarea name="manifest" rows="6" spellcheck="false" required placeholder="{&quot;schemaVersion&quot;:4,…}"></textarea>
@@ -461,8 +457,8 @@
           <h3 id="operation-journal-heading">Transaction operation journal</h3>
           <p>
             Wallet requests remain labeled by their captured chain, vault or target, and account.
-            Changing the current manifest never relabels an earlier transaction. Refresh buyback
-            state reconciles a submitted buyback receipt before any retry can be enabled.
+            The journal is stored across reloads; changing the current manifest never relabels an
+            earlier transaction. Reconcile any submitted receipt before retrying an action.
           </p>
           <p id="operation-journal-empty" class="details">No transaction operation has started.</p>
           <ol id="operation-journal" class="stage-list" aria-live="polite"></ol>

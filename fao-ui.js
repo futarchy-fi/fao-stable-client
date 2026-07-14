@@ -51,13 +51,111 @@ const PENDING_OPERATION_STATES = new Set([
   TRACKED_OPERATION_STATES.walletRequested,
   TRACKED_OPERATION_STATES.submitted
 ]);
+const ZERO_TRANSACTION_HASH = `0x${'0'.repeat(64)}`;
+const TRACKED_OPERATION_KINDS = Object.freeze(['creation', 'treasury', 'buyback']);
+const TRACKED_OPERATION_KEYS = Object.freeze([
+  'id', 'kind', 'label', 'chainId', 'account', 'vault', 'target', 'state', 'hash',
+  'key', 'receiptStatus', 'receiptBlockNumber', 'receiptBlockHash',
+  'stateReadBlockNumber', 'error'
+]);
 
-export function trackedOperationController({ limit = 8, onChange = () => {} } = {}) {
-  if (!Number.isSafeInteger(limit) || limit < 1 || typeof onChange !== 'function') {
+function validatedReceiptEvidence(receipt, expectedHash) {
+  if (!receipt || Array.isArray(receipt) || typeof receipt !== 'object') {
+    throw new Error('Transaction receipt is invalid.');
+  }
+  if (receipt.status !== '0x0' && receipt.status !== '0x1') {
+    throw new Error('Transaction receipt status must be canonical 0x0 or 0x1.');
+  }
+  const transactionHash = fao.normalizeHex(receipt.transactionHash, 32, 'Receipt transaction hash');
+  if (transactionHash !== expectedHash) {
+    throw new Error('Transaction receipt hash does not match the submitted operation.');
+  }
+  const blockHash = fao.normalizeHex(receipt.blockHash, 32, 'Transaction receipt block hash');
+  if (blockHash === ZERO_TRANSACTION_HASH) {
+    throw new Error('Transaction receipt block hash cannot be zero.');
+  }
+  if (receipt.blockNumber == null) throw new Error('Transaction receipt block number is required.');
+  return Object.freeze({
+    status: BigInt(receipt.status),
+    transactionHash,
+    blockHash,
+    blockNumber: rpcQuantity(receipt.blockNumber, 'Transaction receipt block number')
+  });
+}
+
+function restoredTrackedOperation(value) {
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== TRACKED_OPERATION_KEYS.length
+    || TRACKED_OPERATION_KEYS.some((key) => !Object.hasOwn(value, key))) {
+    throw new Error('Stored tracked operation fields are invalid.');
+  }
+  if (!Number.isSafeInteger(value.id) || value.id < 1
+    || !TRACKED_OPERATION_KINDS.includes(value.kind)
+    || typeof value.label !== 'string' || !value.label.trim() || value.label.length > 120
+    || !Object.values(TRACKED_OPERATION_STATES).includes(value.state)) {
+    throw new Error('Stored tracked operation identity is invalid.');
+  }
+  const chainId = fao.assertChainId(value.chainId).toString();
+  if (chainId !== value.chainId) throw new Error('Stored tracked operation chain ID is not canonical.');
+  const account = fao.normalizeAddress(value.account);
+  const vault = value.vault == null ? null : fao.normalizeAddress(value.vault);
+  const target = value.target == null ? null : fao.normalizeAddress(value.target);
+  if ((!vault && !target) || account !== value.account || vault !== value.vault || target !== value.target) {
+    throw new Error('Stored tracked operation addresses are not canonical.');
+  }
+  const hash = value.hash == null ? null : fao.normalizeHex(value.hash, 32, 'Stored transaction hash');
+  const subject = vault || target;
+  const key = hash == null ? null : `${chainId}:${subject}:${hash}`;
+  const decimal = (item) => item == null
+    || (typeof item === 'string' && /^(?:0|[1-9][0-9]*)$/.test(item));
+  const receiptBlockHash = value.receiptBlockHash == null
+    ? null
+    : fao.normalizeHex(value.receiptBlockHash, 32, 'Stored receipt block hash');
+  if (hash !== value.hash || value.key !== key || !decimal(value.receiptBlockNumber)
+    || !decimal(value.stateReadBlockNumber)
+    || receiptBlockHash !== value.receiptBlockHash
+    || (value.error != null && (typeof value.error !== 'string' || value.error.length > 240))) {
+    throw new Error('Stored tracked operation evidence is invalid.');
+  }
+  const unresolvedWithoutHash = [
+    TRACKED_OPERATION_STATES.preBroadcast,
+    TRACKED_OPERATION_STATES.walletRequested,
+    TRACKED_OPERATION_STATES.cancelled,
+    TRACKED_OPERATION_STATES.failed
+  ].includes(value.state);
+  if ((unresolvedWithoutHash && (hash || value.receiptStatus != null
+      || value.receiptBlockNumber != null || receiptBlockHash != null))
+    || (value.state === TRACKED_OPERATION_STATES.submitted
+      && (!hash || value.receiptStatus != null
+        || value.receiptBlockNumber != null || receiptBlockHash != null))
+    || (value.state === TRACKED_OPERATION_STATES.confirmed
+      && (!hash || value.receiptStatus !== '1'
+        || value.receiptBlockNumber == null || receiptBlockHash == null))
+    || (value.state === TRACKED_OPERATION_STATES.reverted
+      && (!hash || value.receiptStatus !== '0'
+        || value.receiptBlockNumber == null || receiptBlockHash == null))
+    || (value.stateReadBlockNumber != null
+      && (value.kind !== 'buyback' || value.state !== TRACKED_OPERATION_STATES.confirmed
+        || BigInt(value.stateReadBlockNumber) < BigInt(value.receiptBlockNumber)))) {
+    throw new Error('Stored tracked operation state is incoherent.');
+  }
+  return { ...value, chainId, account, vault, target, hash, key, receiptBlockHash };
+}
+
+export function trackedOperationController({
+  limit = 8, onChange = () => {}, initialEntries = []
+} = {}) {
+  if (!Number.isSafeInteger(limit) || limit < 1 || typeof onChange !== 'function'
+    || !Array.isArray(initialEntries) || initialEntries.length > limit) {
     throw new Error('Tracked operation controller options are invalid.');
   }
-  let nextId = 0;
-  const journal = [];
+  const journal = initialEntries.map(restoredTrackedOperation);
+  if (new Set(journal.map(({ id }) => id)).size !== journal.length
+    || new Set(journal.filter(({ state }) => PENDING_OPERATION_STATES.has(state)).map(({ kind }) => kind)).size
+      !== journal.filter(({ state }) => PENDING_OPERATION_STATES.has(state)).length) {
+    throw new Error('Stored tracked operations contain duplicate identities.');
+  }
+  let nextId = journal.reduce((maximum, { id }) => Math.max(maximum, id), 0);
   const snapshots = () => Object.freeze(journal.map((operation) => Object.freeze({ ...operation })));
   const trim = () => {
     while (journal.length > limit) {
@@ -91,7 +189,7 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
       }
       const kind = String(context.kind || '').trim();
       const label = String(context.label || '').trim().slice(0, 120);
-      if (!kind || !label || journal.some((operation) => (
+      if (!TRACKED_OPERATION_KINDS.includes(kind) || !label || journal.some((operation) => (
         operation.kind === kind && PENDING_OPERATION_STATES.has(operation.state)
       ))) return null;
       const chainId_ = fao.assertChainId(context.chainId).toString();
@@ -112,6 +210,7 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
         key: null,
         receiptStatus: null,
         receiptBlockNumber: null,
+        receiptBlockHash: null,
         stateReadBlockNumber: null,
         error: null
       };
@@ -123,6 +222,9 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
       return journal.find((operation) => (
         operation.kind === kind && PENDING_OPERATION_STATES.has(operation.state)
       )) || null;
+    },
+    operation(id) {
+      return journal.find((entry) => entry.id === id) || null;
     },
     isPending(operation) {
       return known(operation) && PENDING_OPERATION_STATES.has(operation.state);
@@ -159,33 +261,26 @@ export function trackedOperationController({ limit = 8, onChange = () => {} } = 
       return operation;
     },
     settle(operation, receipt) {
-      const status = BigInt(receipt?.status);
-      if (status !== 0n && status !== 1n) throw new Error('Transaction receipt status is invalid.');
-      const receiptBlockNumber = receipt?.blockNumber == null
-        ? null
-        : rpcQuantity(receipt.blockNumber, 'Transaction receipt block number').toString();
-      if (status === 1n && receiptBlockNumber == null && operation.receiptBlockNumber == null) {
-        throw new Error('Successful transaction receipt block number is required.');
-      }
-      if (known(operation)
-        && [TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
-        if (operation.receiptStatus !== status.toString()) {
+      if (!known(operation) || !operation.hash) throw new Error('Transaction receipt is invalid.');
+      const evidence = validatedReceiptEvidence(receipt, operation.hash);
+      const receiptBlockNumber = evidence.blockNumber.toString();
+      if ([TRACKED_OPERATION_STATES.confirmed, TRACKED_OPERATION_STATES.reverted].includes(operation.state)) {
+        if (operation.receiptStatus !== evidence.status.toString()) {
           throw new Error('Resolved transaction receipts disagree.');
         }
-        if (operation.receiptBlockNumber != null && receiptBlockNumber != null
-          && operation.receiptBlockNumber !== receiptBlockNumber) {
+        if (operation.receiptBlockNumber !== receiptBlockNumber
+          || operation.receiptBlockHash !== evidence.blockHash) {
           throw new Error('Resolved transaction receipt blocks disagree.');
-        }
-        if (operation.receiptBlockNumber == null && receiptBlockNumber != null) {
-          operation.receiptBlockNumber = receiptBlockNumber;
-          changed();
         }
         return operation;
       }
       return transition(
         operation, [TRACKED_OPERATION_STATES.submitted],
-        status === 1n ? TRACKED_OPERATION_STATES.confirmed : TRACKED_OPERATION_STATES.reverted,
-        { receiptStatus: status.toString(), receiptBlockNumber, error: null }
+        evidence.status === 1n ? TRACKED_OPERATION_STATES.confirmed : TRACKED_OPERATION_STATES.reverted,
+        {
+          receiptStatus: evidence.status.toString(), receiptBlockNumber,
+          receiptBlockHash: evidence.blockHash, error: null
+        }
       );
     },
     coverConfirmed(id, blockNumber) {
@@ -268,8 +363,10 @@ export async function runTrackedTransaction({
     hash = await send(operation);
     controller.submitted(operation, hash);
   } catch (error) {
-    if (error?.code === 4001) controller.fail(operation, error);
-    else controller.noteWalletUnknown(operation, error);
+    if (operation.state === TRACKED_OPERATION_STATES.walletRequested) {
+      if (error?.code === 4001) controller.fail(operation, error);
+      else controller.noteWalletUnknown(operation, error);
+    }
     update();
     return trackedResult(operation, { error });
   }
@@ -361,7 +458,7 @@ export function applyTrackedBuybackRefresh(controller, identity, model) {
 
 const DRAFT_KEY = 'fao-stable-client:create-draft:v1';
 const PREPARED_KEY = 'fao-stable-client:create-plan:v1';
-const MAX_AGENT_PAYMENT_VIEWS = 100;
+const MAX_AGENT_PAYMENT_VIEWS = 10;
 const MAX_AGENT_RENDERED_RECORDS = 100;
 // Display curation is intentionally independent from permissionless registrar state.
 const CURATED_INSTANCES = Object.freeze([]);
@@ -537,6 +634,22 @@ function rpcQuantity(value, label) {
   return BigInt(value);
 }
 
+export async function readCanonicalTransactionReceipt(hash, request) {
+  const transactionHash = fao.normalizeHex(hash, 32, 'Transaction hash');
+  if (typeof request !== 'function') throw new Error('An RPC request function is required.');
+  const receipt = await request('eth_getTransactionReceipt', [transactionHash]);
+  if (!receipt) return null;
+  const evidence = validatedReceiptEvidence(receipt, transactionHash);
+  const blockTag = `0x${evidence.blockNumber.toString(16)}`;
+  const block = await request('eth_getBlockByNumber', [blockTag, false]);
+  if (!block || Array.isArray(block) || typeof block !== 'object'
+    || rpcQuantity(block.number, 'Receipt canonical block number') !== evidence.blockNumber
+    || fao.normalizeHex(block.hash, 32, 'Receipt canonical block hash') !== evidence.blockHash) {
+    throw new Error('Transaction receipt is not anchored in the canonical block at its reported height.');
+  }
+  return receipt;
+}
+
 export async function readBuybackModel(value) {
   const input = exactRecord(value, ['chainId', 'vault', 'executor', 'request'], 'Buyback read input');
   fao.assertChainId(input.chainId, fao.BUYBACK_CHAIN_ID);
@@ -593,6 +706,10 @@ export async function readBuybackModel(value) {
 export async function verifyTreasuryManifest(manifest, request, pinnedBlock = null) {
   if (typeof request !== 'function') throw new Error('An RPC request function is required.');
   const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
+  const chainId_ = rpcQuantity(await request('eth_chainId', []), 'Treasury RPC chain ID');
+  if (chainId_ !== SEPOLIA_CHAIN_ID) {
+    throw new Error(`Treasury RPC chain mismatch: expected ${SEPOLIA_CHAIN_ID}, received ${chainId_}.`);
+  }
   const block = pinnedBlock || await request('eth_getBlockByNumber', ['finalized', false]);
   if (!block || typeof block !== 'object') throw new Error('RPC returned no pinned finalized block.');
   const blockNumber = rpcQuantity(block.number, 'Treasury pinned block number');
@@ -638,10 +755,10 @@ export async function verifyTreasuryManifest(manifest, request, pinnedBlock = nu
   });
 }
 
-export async function verifyAgentWorkProvenance(value) {
+export async function verifyRegistrarTreasuryProvenance(value) {
   const input = exactRecord(value, [
-    'manifest', 'selfServeManifest', 'creationBundle', 'indexView', 'request'
-  ], 'Agent-work provenance input');
+    'manifest', 'selfServeManifest', 'creationBundle', 'pinnedBlock', 'request'
+  ], 'Registrar treasury provenance input');
   if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
   const manifest = validateTreasuryManifest(input.manifest);
   if (manifest.creationRoute !== 'registrar') {
@@ -654,11 +771,17 @@ export async function verifyAgentWorkProvenance(value) {
   const shared = validateSelfServeManifest(sharedInput);
   if (shared.status !== 'active') throw new Error('The canonical ownerless registrar is not deployed.');
   const bundle = validateCreationBundle(input.creationBundle);
-  const view = input.indexView;
-  if (!view || typeof view !== 'object') throw new Error('A pinned AgentWorkIndex view is required.');
-  const blockNumber = BigInt(view.blockNumber);
+  const pinnedBlock = exactRecord(
+    input.pinnedBlock, ['blockNumber', 'blockHash', 'timestamp'], 'Pinned provenance block'
+  );
+  if (typeof pinnedBlock.blockNumber !== 'bigint' || pinnedBlock.blockNumber < 0n
+    || typeof pinnedBlock.timestamp !== 'bigint' || pinnedBlock.timestamp < 0n) {
+    throw new Error('Pinned provenance block numbers must be nonnegative bigint values.');
+  }
+  const blockNumber = pinnedBlock.blockNumber;
   const blockTag = `0x${blockNumber.toString(16)}`;
-  const blockHash = fao.normalizeHex(view.blockHash, 32, 'Agent-work pinned block hash');
+  const blockHash = fao.normalizeHex(pinnedBlock.blockHash, 32, 'Provenance pinned block hash');
+  if (blockHash === ZERO_TRANSACTION_HASH) throw new Error('Provenance pinned block hash cannot be zero.');
   const receipt = manifest.receipt;
   const registrar = shared.registrar;
   if (receipt.registrar.target !== registrar.address
@@ -850,7 +973,7 @@ export async function verifyAgentWorkProvenance(value) {
   const verified = await verifyTreasuryManifest(manifest, input.request, {
     number: blockTag,
     hash: blockHash,
-    timestamp: `0x${BigInt(view.timestamp).toString(16)}`
+    timestamp: `0x${pinnedBlock.timestamp.toString(16)}`
   });
   const after = await input.request('eth_getBlockByNumber', [blockTag, false]);
   if (!after || fao.normalizeHex(after.hash, 32, 'Re-read provenance block hash') !== blockHash) {
@@ -859,10 +982,49 @@ export async function verifyAgentWorkProvenance(value) {
   return Object.freeze({ ...verified, receipt: receipt.address, registrar: registrar.address });
 }
 
+export async function verifyAgentWorkProvenance(value) {
+  const input = exactRecord(value, [
+    'manifest', 'selfServeManifest', 'creationBundle', 'indexView', 'request'
+  ], 'Agent-work provenance input');
+  const view = input.indexView;
+  if (!view || typeof view !== 'object') throw new Error('A pinned AgentWorkIndex view is required.');
+  return verifyRegistrarTreasuryProvenance({
+    manifest: input.manifest,
+    selfServeManifest: input.selfServeManifest,
+    creationBundle: input.creationBundle,
+    pinnedBlock: {
+      blockNumber: view.blockNumber,
+      blockHash: view.blockHash,
+      timestamp: view.timestamp
+    },
+    request: input.request
+  });
+}
+
+export async function verifyCanonicalTreasuryManifest(value) {
+  const input = exactRecord(value, [
+    'manifest', 'selfServeManifest', 'creationBundle', 'request'
+  ], 'Canonical treasury verification input');
+  if (typeof input.request !== 'function') throw new Error('An RPC request function is required.');
+  const block = await input.request('eth_getBlockByNumber', ['finalized', false]);
+  if (!block || typeof block !== 'object') throw new Error('RPC returned no finalized block.');
+  return verifyRegistrarTreasuryProvenance({
+    manifest: input.manifest,
+    selfServeManifest: input.selfServeManifest,
+    creationBundle: input.creationBundle,
+    pinnedBlock: {
+      blockNumber: rpcQuantity(block.number, 'Canonical treasury block number'),
+      blockHash: fao.normalizeHex(block.hash, 32, 'Canonical treasury block hash'),
+      timestamp: rpcQuantity(block.timestamp, 'Canonical treasury block timestamp')
+    },
+    request: input.request
+  });
+}
+
 export function creationInputFromDraft(draft, manifest, currentTimestamp) {
   if (manifest.status !== 'active') throw new Error('The canonical self-serve registrar is not deployed.');
   exactRecord(draft, [
-    'tokenName', 'tokenSymbol', 'governedRepository', 'governedSite', 'saleDuration',
+    'tokenName', 'tokenSymbol', 'saleDuration',
     'bootstrapDuration', 'saleCap', 'initialPrice', 'slope', 'minimumRaise',
     'tokenMaxSupply', 'bootstrapBps', 'daoURI', 'metadataURI',
     'votingStrategyMetadataURI', 'proposalValidationStrategyMetadataURI'
@@ -993,14 +1155,59 @@ const creationPlanRequests = latestRequestGate();
 const receiptStateRequests = latestRequestGate();
 const treasuryFlowRequests = latestRequestGate();
 const treasuryManifestRequests = latestRequestGate();
-const trackedOperations = trackedOperationController({
-  onChange: () => {
-    if (!elements?.operationJournal) return;
-    renderOperationJournal();
-    if (elements.stageButtons) renderStages();
-    if (elements.treasuryForms) renderTreasuryGate();
+const OPERATION_JOURNAL_KEY = 'fao-stable-client:transaction-journal:v1';
+let operationJournalError = null;
+
+function storedTrackedOperations() {
+  if (typeof localStorage === 'undefined') return [];
+  const raw = localStorage.getItem(OPERATION_JOURNAL_KEY);
+  if (!raw) return [];
+  const value = JSON.parse(raw);
+  if (!value || Array.isArray(value) || typeof value !== 'object'
+    || Object.keys(value).length !== 2 || value.schemaVersion !== 1
+    || !Array.isArray(value.operations)) {
+    throw new Error('Stored transaction journal is invalid.');
   }
-});
+  return value.operations;
+}
+
+function persistTrackedOperations(entries) {
+  if (typeof localStorage === 'undefined') return;
+  if (operationJournalError) throw operationJournalError;
+  const operations = entries.filter(({ state: operationState }) => (
+    operationState !== TRACKED_OPERATION_STATES.preBroadcast
+  ));
+  try {
+    localStorage.setItem(OPERATION_JOURNAL_KEY, JSON.stringify({ schemaVersion: 1, operations }));
+  } catch (error) {
+    operationJournalError = new Error(`Transaction journal could not be saved: ${errorMessage(error)}`);
+    throw operationJournalError;
+  }
+}
+
+let initialTrackedOperations = [];
+try {
+  initialTrackedOperations = storedTrackedOperations();
+} catch (error) {
+  operationJournalError = new Error(`Stored transaction journal rejected: ${errorMessage(error)}`);
+}
+
+let trackedOperations;
+try {
+  trackedOperations = trackedOperationController({
+    initialEntries: initialTrackedOperations,
+    onChange: (entries) => {
+      persistTrackedOperations(entries);
+      if (!elements?.operationJournal) return;
+      renderOperationJournal();
+      if (elements.stageButtons) renderStages();
+      if (elements.treasuryForms) renderTreasuryGate();
+    }
+  });
+} catch (error) {
+  operationJournalError = new Error(`Stored transaction journal rejected: ${errorMessage(error)}`);
+  trackedOperations = trackedOperationController({ onChange: () => {} });
+}
 
 function rpc(method, params = []) {
   if (!window.ethereum) throw new Error('No injected wallet was detected.');
@@ -1008,13 +1215,20 @@ function rpc(method, params = []) {
 }
 
 function currentGate() {
-  return deriveNetworkGate({
+  const gate = deriveNetworkGate({
     deploymentStatus: state.manifest?.status,
     account: state.account,
     walletChainId: state.walletChainId,
     rpcChainId: state.rpcChainId,
     codeState: state.codeState
   });
+  return operationJournalError && gate.canTransact
+    ? Object.freeze({
+      state: 'journal-error',
+      canTransact: false,
+      message: `${operationJournalError.message} Writes are disabled; preserve and inspect browser storage before recovery.`
+    })
+    : gate;
 }
 
 function setMessage(element, message, isError = false) {
@@ -1106,7 +1320,7 @@ function renderGate() {
 }
 
 function treasuryNetworkReady() {
-  return state.account && state.walletChainId === SEPOLIA_CHAIN_ID
+  return !operationJournalError && state.account && state.walletChainId === SEPOLIA_CHAIN_ID
     && state.rpcChainId === SEPOLIA_CHAIN_ID && state.treasuryRecords;
 }
 
@@ -1258,7 +1472,10 @@ function renderOperationJournal() {
   };
   const entries = trackedOperations.entries();
   elements.operationJournal.replaceChildren();
-  elements.operationJournalEmpty.hidden = entries.length !== 0;
+  elements.operationJournalEmpty.hidden = entries.length !== 0 && !operationJournalError;
+  elements.operationJournalEmpty.textContent = operationJournalError
+    ? operationJournalError.message
+    : 'No transaction operation has started.';
   for (const operation of entries) {
     const item = document.createElement('li');
     item.className = 'stage-card';
@@ -1273,11 +1490,49 @@ function renderOperationJournal() {
     detail.textContent = [
       operation.key,
       operation.receiptBlockNumber == null ? null : `receipt block ${operation.receiptBlockNumber}`,
+      operation.receiptBlockHash == null ? null : `block hash ${operation.receiptBlockHash}`,
       operation.stateReadBlockNumber == null ? null : `state read block ${operation.stateReadBlockNumber}`,
       operation.error
     ].filter(Boolean).join(' · ');
     item.append(title, identity, hash, detail);
+    if (operation.state === TRACKED_OPERATION_STATES.submitted) {
+      const reconcile = document.createElement('button');
+      reconcile.type = 'button';
+      reconcile.textContent = 'Reconcile receipt';
+      reconcile.addEventListener('click', async () => {
+        reconcile.disabled = true;
+        try {
+          await reconcileJournalOperation(operation.id);
+        } catch (error) {
+          detail.textContent = errorMessage(error);
+          detail.classList.add('error');
+        } finally {
+          if (reconcile.isConnected) reconcile.disabled = false;
+        }
+      });
+      item.append(reconcile);
+    }
     elements.operationJournal.append(item);
+  }
+}
+
+async function reconcileJournalOperation(id) {
+  const operation = trackedOperations.operation(id);
+  if (!operation || operation.state !== TRACKED_OPERATION_STATES.submitted) return;
+  if (state.walletChainId?.toString() !== operation.chainId
+    || state.rpcChainId?.toString() !== operation.chainId) {
+    throw new Error(`Reconnect chain ${operation.chainId} before reconciling this transaction.`);
+  }
+  const result = await reconcileTrackedOperation(
+    trackedOperations, operation, (hash) => readCanonicalTransactionReceipt(hash, rpc)
+  );
+  if (result.error || result.operation.state === TRACKED_OPERATION_STATES.submitted) return;
+  if (result.operation.kind === 'creation' && state.creationPlan) {
+    await refreshReceiptState();
+  } else if (result.operation.kind === 'treasury') {
+    invalidateTreasuryFlow('Treasury transaction reconciled. Re-read lifecycle state before preparing another step.');
+  } else if (result.operation.kind === 'buyback') {
+    await refreshBuybackForUserEvent();
   }
 }
 
@@ -1656,7 +1911,7 @@ async function restorePreparedPlan() {
 
 async function waitForReceipt(hash) {
   for (let attempt = 0; attempt < 200; attempt += 1) {
-    const receipt = await rpc('eth_getTransactionReceipt', [hash]);
+    const receipt = await readCanonicalTransactionReceipt(hash, rpc);
     if (receipt) return receipt;
     await new Promise((resolve) => setTimeout(resolve, 1_500));
   }
@@ -1830,8 +2085,13 @@ async function loadTreasuryManifest(form, request) {
   resetBuybackCard('Treasury manifest verification changed this card identity. Earlier operations remain in the journal.');
   renderBuybackModel();
   renderAgentWork();
-  const manifest = JSON.parse(form.elements.manifest.value);
-  const records = await verifyTreasuryManifest(manifest, rpc);
+  const manifest = validateTreasuryManifest(JSON.parse(form.elements.manifest.value));
+  const records = await verifyCanonicalTreasuryManifest({
+    manifest,
+    selfServeManifest: state.manifest,
+    creationBundle: state.creationBundle,
+    request: rpc
+  });
   const buybackModel = await readBuybackModel({
     chainId: SEPOLIA_CHAIN_ID,
     vault: records.vault,
@@ -1856,7 +2116,7 @@ async function loadTreasuryManifest(form, request) {
       );
     }
   }
-  setMessage(elements.treasuryStatus, 'Four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
+  setMessage(elements.treasuryStatus, 'Canonical registrar receipt, four lifecycle runtimes, custody wiring, and buyback state verified on finalized Sepolia.');
   renderTreasuryGate();
 }
 
@@ -2398,6 +2658,7 @@ async function initialize() {
   elements.createForm.addEventListener('input', () => invalidatePreparedPlan('Draft changed. Prepare a new exact plan before staging.'));
   elements.preparePlan.addEventListener('click', () => {
     if (!elements.createForm.reportValidity()) return;
+    invalidatePreparedPlan('Preparing a new exact plan; no prior stage remains actionable.');
     const request = creationPlanRequests.begin(creationPlanInputSnapshot());
     prepareCreationPlan(request).catch((error) => {
       if (!creationPlanRequests.current(request, creationPlanInputSnapshot())) return;

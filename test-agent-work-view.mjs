@@ -153,6 +153,32 @@ test('index verification pins code and logs to the finalized block', async () =>
   assert.equal(view.rangeCompleteness, 'caller-selected-incomplete');
 });
 
+test('permissionless history fails closed at the block and log resource bounds', async () => {
+  const request = (logs, blockNumber) => async (method) => {
+    if (method === 'eth_chainId') return q(11155111);
+    if (method === 'eth_getBlockByNumber') {
+      return { number: q(blockNumber), timestamp: q(20), hash: BLOCK_HASH };
+    }
+    if (method === 'eth_getCode') return INDEX_RUNTIME;
+    if (method === 'eth_getLogs') return logs;
+    throw new Error(`unexpected ${method}`);
+  };
+  await assert.rejects(readAgentWorkIndex({
+    request: request([], 50_000n),
+    config: { address: INDEX, startBlock: '0' },
+    chainId: 11155111,
+    vault: VAULT
+  }), /50000-block client limit/);
+
+  const log = publishedLog('task', fixture.task.canonicalHex, digest('00'), 1n);
+  await assert.rejects(readAgentWorkIndex({
+    request: request(Array(5_001).fill(log), 1n),
+    config: { address: INDEX, startBlock: '1' },
+    chainId: 11155111,
+    vault: VAULT
+  }), /5000-log client limit/);
+});
+
 test('log scan rejects out-of-range/conflicting identities and finalized hash changes', async () => {
   const run = (logs, afterHash = BLOCK_HASH) => {
     let blockReads = 0;
@@ -221,11 +247,12 @@ function lifecycleRequest(scenario, {
   proposalAccepted = true, proposalSettled = true, proposalState = 5n,
   queueExpiresAt = scenario.expiresAt, timestamp = 150n, staticError = null,
   balanceMismatch = false, queueExecuted = scenario.executed.length !== 0,
-  queueExpired = false
+  queueExpired = false, proposalExists = true, proposalLogs = true, settlementLogs = true,
+  proposalStaticError = null
 } = {}) {
   const proposalWords = [
     0n, 0n, 0n, 0n, 0n, proposalState, 3n,
-    proposalSettled ? 1n : 0n, proposalAccepted ? 1n : 0n, 0n, 1n
+    proposalSettled ? 1n : 0n, proposalAccepted ? 1n : 0n, 0n, proposalExists ? 1n : 0n
   ];
   const hasQueue = scenario.queued.length === 1;
   const queueWords = [
@@ -237,14 +264,18 @@ function lifecycleRequest(scenario, {
   return async (method, params) => {
     if (method === 'eth_getLogs') {
       const { address: target, topics } = params[0];
-      if (target === GATEWAY) return [scenario.proposal];
-      if (target === ARBITRATION) return [scenario.settlement];
+      if (target === GATEWAY) return proposalLogs ? [scenario.proposal] : [];
+      if (target === ARBITRATION) return settlementLogs ? [scenario.settlement] : [];
       if (topics[0] === AGENT_WORK_EVENTS.transferQueued) return scenario.queued;
       if (topics[0] === AGENT_WORK_EVENTS.transferExecuted) return scenario.executed;
     }
     if (method === 'eth_call') {
       const [{ to, data }, block] = params;
       if (to === ARBITRATION) return words(...proposalWords);
+      if (to === GATEWAY) {
+        if (proposalStaticError) throw new Error(proposalStaticError);
+        return '0x';
+      }
       if (to === VAULT && data.startsWith('0xf3df92bf')) return words(...queueWords);
       if (to === VAULT) {
         if (staticError) throw new Error(staticError);
@@ -301,6 +332,12 @@ test('expiry and view/log disagreement both fail closed', async () => {
   const disagreement = await readLifecycle(lifecycleFixture(), { proposalAccepted: false });
   assert.equal(disagreement.acceptance.state, 'disagreement');
   assert.equal(disagreement.execution.executableNow, false);
+
+  const omittedHistory = await readLifecycle(lifecycleFixture(), {
+    proposalLogs: false, settlementLogs: false
+  });
+  assert.equal(omittedHistory.acceptance.state, 'disagreement');
+  assert.equal(omittedHistory.proposalCall.callable, false);
 });
 
 test('proposal flags and queue widths must match canonical lifecycle states', async () => {
@@ -359,6 +396,7 @@ test('payment planner exposes exact calldata only and binds every step to one pr
       proposed: true,
       acceptance: { state: 'accepted', accepted: true, route: 'timeout' },
       queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
+      queueCall: { callable: true, reason: null },
       execution: { state: 'not-queued', executableNow: false },
       paymentState: { state: 'not-paid', paid: false }
     })
@@ -379,6 +417,7 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
   const pending = plan({
     proposed: false,
     acceptance: { state: 'pending', accepted: false, route: null },
+    proposalCall: { callable: true, reason: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
     paymentState: { state: 'not-paid', paid: false }
@@ -386,6 +425,7 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
   const proposalDisagreement = plan({
     proposed: false,
     acceptance: { state: 'disagreement', accepted: false, route: null },
+    proposalCall: { callable: false, reason: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
     paymentState: { state: 'not-paid', paid: false }
@@ -452,6 +492,7 @@ test('payment planner fails closed on lifecycle disagreement or unverified evide
   const identity = boundPaymentState({
     proposed: false,
     acceptance: { state: 'pending', accepted: false, route: null },
+    proposalCall: { callable: true, reason: null },
     queue: { executeAfter: 0n, expiresAt: 0n, executed: false, expired: false },
     execution: { state: 'not-accepted', executableNow: false },
     paymentState: { state: 'not-paid', paid: false }

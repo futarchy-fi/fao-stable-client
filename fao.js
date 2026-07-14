@@ -1594,6 +1594,11 @@ export function decodeAgentDocumentPublishedLog(log) {
 const ZERO_DIGEST = `0x${'00'.repeat(32)}`;
 const MAX_AGENT_DOCUMENT_BYTES = 65_536;
 const AGENT_LOG_BLOCK_CHUNK = 10_000n;
+export const AGENT_SCAN_LIMITS = Object.freeze({
+  blocks: 50_000n,
+  logs: 5_000,
+  bytes: 8 * 1024 * 1024
+});
 
 function rpcQuantity(value, label) {
   if (typeof value !== 'string' || !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/.test(value)) {
@@ -1676,6 +1681,9 @@ function agentPublicationMeta(log, indexAddress) {
 
 function verifiedRpcLogs(logs, address, fromBlock, toBlock, label) {
   if (!Array.isArray(logs)) throw new Error(`RPC returned invalid ${label} logs.`);
+  if (logs.length > AGENT_SCAN_LIMITS.logs) {
+    throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.logs}-log client limit.`);
+  }
   const seen = new Map();
   const verified = [];
   for (const log of logs) {
@@ -1719,7 +1727,11 @@ function verifiedRpcLogs(logs, address, fromBlock, toBlock, label) {
 }
 
 async function readLogsInChunks(request, { address, fromBlock, toBlock, topics, label }) {
+  if (toBlock < fromBlock || toBlock - fromBlock + 1n > AGENT_SCAN_LIMITS.blocks) {
+    throw new Error(`${label} range exceeds the ${AGENT_SCAN_LIMITS.blocks}-block client limit.`);
+  }
   const all = [];
+  let footprint = 0;
   for (let first = fromBlock; first <= toBlock; first += AGENT_LOG_BLOCK_CHUNK) {
     const last = first + AGENT_LOG_BLOCK_CHUNK - 1n < toBlock
       ? first + AGENT_LOG_BLOCK_CHUNK - 1n
@@ -1730,9 +1742,19 @@ async function readLogsInChunks(request, { address, fromBlock, toBlock, topics, 
       toBlock: rpcTag(last, `${label} chunk end`),
       topics
     }]);
-    all.push(...verifiedRpcLogs(chunk, address, first, last, label));
+    const verified = verifiedRpcLogs(chunk, address, first, last, label);
+    if (all.length + verified.length > AGENT_SCAN_LIMITS.logs) {
+      throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.logs}-log client limit.`);
+    }
+    footprint += verified.reduce((total, log) => (
+      total + (log.data.length - 2) / 2 + log.topics.length * 32
+    ), 0);
+    if (footprint > AGENT_SCAN_LIMITS.bytes) {
+      throw new Error(`${label} exceeds the ${AGENT_SCAN_LIMITS.bytes}-byte client limit.`);
+    }
+    all.push(...verified);
   }
-  return verifiedRpcLogs(all, address, fromBlock, toBlock, label);
+  return all;
 }
 
 function agentDocumentProfile(kind) {
@@ -2066,19 +2088,16 @@ export async function readAgentPaymentState(value) {
   const executions = executedRaw.map((log) => decodeTransferExecuted(log, vault));
   const exactProposals = proposals.filter((event) => exactTransferEvent(event, binding));
   const proposed = proposals.length === 1 && exactProposals.length === 1;
-  let proposal = null;
-  if (proposals.length || settlements.length) {
-    proposal = decodeProposalView(await input.request('eth_call', [{
-      to: arbitration,
-      data: encodeCalldata(AGENT_WORK_VIEWS.getProposal, [uintWord(binding.proposalId)])
-    }, toBlock]));
-  }
+  const proposal = decodeProposalView(await input.request('eth_call', [{
+    to: arbitration,
+    data: encodeCalldata(AGENT_WORK_VIEWS.getProposal, [uintWord(binding.proposalId)])
+  }, toBlock]));
   let acceptance;
-  if (!proposed && (proposals.length || proposal || settlements.length)) {
+  if (!proposed && (proposals.length || proposal.exists || settlements.length)) {
     acceptance = Object.freeze({ state: 'disagreement', accepted: false, route: null });
-  } else if (!proposal && settlements.length === 0) {
+  } else if (!proposal.exists && settlements.length === 0) {
     acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
-  } else if (proposal?.exists && !proposal.settled && settlements.length === 0) {
+  } else if (proposal.exists && !proposal.settled && settlements.length === 0) {
     acceptance = Object.freeze({ state: 'pending', accepted: false, route: null });
   } else if (!proposal?.exists || !proposal.settled || settlements.length !== 1
     || settlements[0].proposalId !== BigInt(binding.proposalId)
@@ -2130,6 +2149,25 @@ export async function readAgentPaymentState(value) {
     }
   }
 
+  const simulate = async (target, data) => {
+    try {
+      await input.request('eth_call', [{ to: target, data }, toBlock]);
+      return Object.freeze({ callable: true, reason: null });
+    } catch (error) {
+      return Object.freeze({
+        callable: false,
+        reason: String(error?.message || error).slice(0, 240)
+      });
+    }
+  };
+  const proposalCall = !proposed && !proposal.exists && settlements.length === 0
+    ? await simulate(gateway, proposeTransferCalldata(action))
+    : Object.freeze({ callable: false, reason: null });
+  const queueCall = proposed && acceptance.accepted && queues.length === 0
+    && queueView.executeAfter === 0n && !queueView.executed && !queueView.expired
+    ? await simulate(vault, queueTreasuryTransferCalldata(action))
+    : Object.freeze({ callable: false, reason: null });
+
   let execution;
   if (paymentState.state === 'paid') {
     execution = Object.freeze({ state: 'paid', executableNow: false });
@@ -2174,6 +2212,8 @@ export async function readAgentPaymentState(value) {
     proposed,
     acceptance,
     queue: queueView,
+    proposalCall,
+    queueCall,
     execution,
     paymentState,
     copy: AGENT_PAYMENT_COPY
@@ -2224,12 +2264,14 @@ export function prepareAgentPaymentTransactions(value) {
     && state.queue.expired === false;
   const proposalAvailable = state.proposed === false
     && pendingAcceptance
+    && state.proposalCall?.callable === true
     && state.execution?.state === 'not-accepted'
     && state.execution.executableNow === false
     && notPaid
     && queueEmpty;
   const queueAvailable = state.proposed === true
     && acceptedAcceptance
+    && state.queueCall?.callable === true
     && state.execution?.state === 'not-queued'
     && state.execution.executableNow === false
     && notPaid
@@ -2256,13 +2298,14 @@ export function prepareAgentPaymentTransactions(value) {
           ? 'Exact proposal already observed.'
           : proposalAvailable
             ? 'Available; ordinary bond activation still follows.'
-            : 'Unavailable because proposal lifecycle evidence is not an exact pending state.'
+            : state.proposalCall?.reason || 'Unavailable because proposal lifecycle evidence is not an exact pending state.'
       }),
       Object.freeze({
         ...transaction(vault, queueTreasuryTransferCalldata(action), 'Accepted transfer queue reference'),
         available: queueAvailable,
         gate: state.acceptance?.state === 'accepted' && state.acceptance.accepted === true
-          ? queueAvailable ? 'Accepted and not queued.' : 'Queue exists or its lifecycle evidence is not exact.'
+          ? queueAvailable ? 'Accepted, not queued, and exact queue simulation succeeded.'
+            : state.queueCall?.reason || 'Queue exists or its lifecycle evidence is not exact.'
           : 'Unavailable until exact acceptance.'
       }),
       Object.freeze({

@@ -538,7 +538,7 @@ test('payment selection keeps exact older digests and bounded inspection isolate
   assert.equal(selected.some((record) => record === records[0]), true);
   assert.throws(
     () => selectAgentPayments(records, { limit: 10, digest: digest('ff') }),
-    /incomplete range/
+    /provided records/
   );
   let active = 0;
   let maximum = 0;

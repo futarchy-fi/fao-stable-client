@@ -1,0 +1,1282 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+
+import {
+  BUYBACK_ACTION_STATES,
+  TRACKED_OPERATION_STATES,
+  applyTrackedBuybackRefresh,
+  buybackActionStateAfterRefresh,
+  creationInputFromDraft,
+  deriveNetworkGate,
+  instanceTrustLabel,
+  latestRequestGate,
+  parseExtraAssetInput,
+  readBuybackModel,
+  readCanonicalTransactionReceipt,
+  reconcileTrackedOperation,
+  runTrackedTransaction,
+  trackedOperationController,
+  validateCreationBundle,
+  verifyAgentWorkProvenance,
+  verifyCanonicalTreasuryManifest,
+  verifyCreationInputTrust,
+  verifyTreasuryManifest,
+  verifyRuntimeCode,
+  verifyWalletSendContext,
+  visibleInstances,
+  withExclusiveOperationLock
+} from './fao-ui.js';
+import {
+  BUYBACK_SELECTORS, addressWord, economicCommitmentHashes, encodeCalldata, keccak256,
+  prepareTreasuryFlow, uintWord
+} from './fao.js';
+import { treasuryRuntimeRecords, validateTreasuryManifest } from './economic-manifest.mjs';
+
+const address = (value) => `0x${value.toString(16).padStart(40, '0')}`;
+const hash = (byte) => `0x${byte.repeat(32)}`;
+const word = (value) => `0x${'0'.repeat(24)}${value.slice(2)}`;
+const transactionReceipt = (transactionHash, status = '0x1', blockNumber = '0x20') => ({
+  status, transactionHash, blockHash: hash('fe'), blockNumber
+});
+
+function treasuryManifest() {
+  const contractNames = [
+    'space', 'arbitration', 'vault', 'treasuryExecutor', 'companyToken', 'proposalGateway',
+    'releaseStrategy', 'votingStrategy', 'evaluator', 'orchestrator', 'resolver',
+    'futarchyFactory', 'spotPool', 'relay', 'spotAdapter', 'conditionalAdapter', 'guard',
+    'router', 'manager'
+  ];
+  const contracts = Object.fromEntries(contractNames.map((name, index) => [name, address(index + 1)]));
+  contracts.vestingWallets = [];
+  return {
+    schemaVersion: 4, creationRoute: 'create', status: 'live', network: 'sepolia',
+    chainId: 11155111, transactions: {}, receipt: {}, prerequisites: {}, coreConfig: {},
+    grants: [], flmConfig: {}, feeTier: 500, poolInitCodeHash: hash('aa'),
+    observationCardinality: 120, contracts, codeBlobs: {},
+    runtimeCodeHashes: {
+      vault: keccak256('0x6001'), proposalGateway: keccak256('0x6001'),
+      arbitration: keccak256('0x6001'), treasuryExecutor: keccak256('0x6001')
+    }, finalization: {}
+  };
+}
+
+test('pre-deployment is a deliberate read-only state', async () => {
+  const gate = deriveNetworkGate({ deploymentStatus: 'pre-deployment' });
+  assert.equal(gate.state, 'pre-deployment');
+  assert.equal(gate.canTransact, false);
+
+  let calls = 0;
+  const result = await verifyRuntimeCode({ status: 'pre-deployment' }, async () => { calls += 1; });
+  assert.equal(result.status, 'unavailable');
+  assert.equal(calls, 0);
+});
+
+test('latest request gate discards overlapping and input-stale completions', async () => {
+  const gate = latestRequestGate();
+  const committed = [];
+  const errors = [];
+  let finishOld;
+  let finishNew;
+  const run = async (request, promise, snapshot) => {
+    try {
+      const value = await promise;
+      if (gate.current(request, snapshot)) committed.push(value);
+    } catch (error) {
+      if (gate.current(request, snapshot)) errors.push(error.message);
+    }
+  };
+  const oldPromise = new Promise((resolve) => { finishOld = resolve; });
+  const oldRequest = gate.begin('same-input');
+  const oldRun = run(oldRequest, oldPromise, 'same-input');
+  const newPromise = new Promise((resolve) => { finishNew = resolve; });
+  const newRequest = gate.begin('same-input');
+  const newRun = run(newRequest, newPromise, 'same-input');
+  finishNew('new');
+  await newRun;
+  finishOld('old');
+  await oldRun;
+  assert.deepEqual(committed, ['new']);
+
+  const changed = gate.begin('before-input');
+  assert.equal(gate.current(changed, 'after-input'), false);
+  gate.invalidate();
+  assert.equal(gate.current(changed, 'before-input'), false);
+
+  let failOld;
+  const oldFailure = new Promise((_, reject) => { failOld = reject; });
+  const failedRequest = gate.begin('manifest-a');
+  const failedRun = run(failedRequest, oldFailure, 'manifest-a');
+  gate.invalidate();
+  failOld(new Error('stale verification failure'));
+  await failedRun;
+  assert.deepEqual(errors, []);
+
+  let finishChanged;
+  const changedPromise = new Promise((resolve) => { finishChanged = resolve; });
+  const changedRequest = gate.begin('manifest-a');
+  const changedRun = run(changedRequest, changedPromise, 'manifest-b');
+  finishChanged('stale-trust-root');
+  await changedRun;
+  assert.deepEqual(committed, ['new']);
+  const dependentPlanner = { trustRoot: committed.at(-1) };
+  assert.deepEqual(dependentPlanner, { trustRoot: 'new' });
+});
+
+test('cross-tab operation lock admits only one transaction writer', async () => {
+  let held = false;
+  const locks = {
+    async request(name, options, callback) {
+      assert.equal(name, 'fao-stable-client:transaction-writer:v1');
+      assert.deepEqual(options, { mode: 'exclusive', ifAvailable: true });
+      if (held) return callback(null);
+      held = true;
+      try {
+        return await callback({ name });
+      } finally {
+        held = false;
+      }
+    }
+  };
+  let release;
+  const first = withExclusiveOperationLock(locks, () => new Promise((resolve) => { release = resolve; }));
+  await Promise.resolve();
+  const second = await withExclusiveOperationLock(locks, async () => 'unsafe');
+  assert.deepEqual(second, { acquired: false, value: null });
+  release('safe');
+  assert.deepEqual(await first, { acquired: true, value: 'safe' });
+  await assert.rejects(withExclusiveOperationLock(null, async () => {}), /locking is unavailable/);
+});
+
+test('every async positive-state writer is generation-gated against stale success and error', async () => {
+  const source = await readFile(new URL('./fao-ui.js', import.meta.url), 'utf8');
+  for (const name of [
+    'agentWorkRequests', 'buybackRefreshRequests', 'buybackRequests',
+    'connectionRequests', 'creationPlanRequests',
+    'receiptStateRequests', 'treasuryFlowRequests', 'treasuryManifestRequests'
+  ]) {
+    assert.match(source, new RegExp(`const ${name} = latestRequestGate\\(\\);`));
+    assert.match(source, new RegExp(`${name}\\.current\\(`));
+  }
+  assert.equal((source.match(/await runBrowserTrackedTransaction\(\{/g) || []).length, 3);
+  assert.equal((source.match(/const outcome = await applyCurrentBuybackRefresh\(/g) || []).length, 3);
+  assert.match(source, /await reconcileBrowserOperation\(/);
+
+  for (const label of ['treasury', 'creation', 'receipt', 'buyback']) {
+    const gate = latestRequestGate();
+    const positive = [];
+    const errors = [];
+    const run = async (request, promise, snapshot) => {
+      try {
+        const value = await promise;
+        if (gate.current(request, snapshot)) positive.push(value);
+      } catch (error) {
+        if (gate.current(request, snapshot)) errors.push(error.message);
+      }
+    };
+    let finish;
+    const staleSuccess = new Promise((resolve) => { finish = resolve; });
+    const successRequest = gate.begin(`${label}-a`);
+    const successRun = run(successRequest, staleSuccess, `${label}-b`);
+    finish('unsafe-positive-state');
+    await successRun;
+
+    let fail;
+    const staleError = new Promise((_, reject) => { fail = reject; });
+    const errorRequest = gate.begin(`${label}-a`);
+    const errorRun = run(errorRequest, staleError, `${label}-a`);
+    gate.invalidate();
+    fail(new Error('obsolete failure'));
+    await errorRun;
+    assert.deepEqual({ positive, errors }, { positive: [], errors: [] }, label);
+  }
+});
+
+test('production transaction runner preserves timeout, status-0, and status-1 truth', async () => {
+  const context = {
+    kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+    account: address(9), vault: address(1), target: address(2)
+  };
+  for (const [receipt, expected] of [
+    [new Error('receipt RPC timeout'), TRACKED_OPERATION_STATES.submitted],
+    [transactionReceipt(hash('71'), '0x0'), TRACKED_OPERATION_STATES.reverted],
+    [transactionReceipt(hash('71')), TRACKED_OPERATION_STATES.confirmed]
+  ]) {
+    const controller = trackedOperationController();
+    const result = await runTrackedTransaction({
+      controller,
+      context,
+      verify: async () => {},
+      stillCurrent: () => true,
+      send: async () => hash('71'),
+      wait: async () => {
+        if (receipt instanceof Error) throw receipt;
+        return receipt;
+      }
+    });
+    assert.equal(result.operation.state, expected);
+    assert.equal(result.operation.hash, hash('71'));
+    assert.equal(result.operation.vault, address(1));
+    assert.equal(result.operation.account, address(9));
+    assert.equal(result.operation.chainId, '11155111');
+    assert.equal(
+      result.operation.key,
+      `11155111:${address(1)}:${hash('71')}`
+    );
+    if (expected === TRACKED_OPERATION_STATES.submitted) {
+      assert.match(result.operation.error, /timeout/);
+      assert.equal(controller.pending('buyback'), result.operation);
+    } else {
+      assert.equal(result.operation.receiptStatus, expected === TRACKED_OPERATION_STATES.confirmed ? '1' : '0');
+      assert.equal(result.operation.receiptBlockHash, hash('fe'));
+      assert.equal(controller.pending('buyback'), null);
+    }
+  }
+
+  const transitions = [];
+  const transitionController = trackedOperationController({
+    onChange: (entries) => transitions.push(entries[0].state)
+  });
+  let finishVerification;
+  const verification = new Promise((resolve) => { finishVerification = resolve; });
+  let transitionSends = 0;
+  const transitionRun = runTrackedTransaction({
+    controller: transitionController,
+    context,
+    verify: async () => verification,
+    stillCurrent: () => true,
+    send: async () => { transitionSends += 1; return hash('70'); },
+    wait: async () => transactionReceipt(hash('70'))
+  });
+  const duplicateBeforeWallet = await runTrackedTransaction({
+    controller: transitionController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { transitionSends += 1; return hash('70'); },
+    wait: async () => transactionReceipt(hash('70'))
+  });
+  assert.equal(duplicateBeforeWallet.blocked, true);
+  assert.deepEqual(transitions, [TRACKED_OPERATION_STATES.preBroadcast]);
+  finishVerification();
+  await transitionRun;
+  assert.equal(transitionSends, 1);
+  assert.deepEqual(transitions, [
+    TRACKED_OPERATION_STATES.preBroadcast,
+    TRACKED_OPERATION_STATES.walletRequested,
+    TRACKED_OPERATION_STATES.submitted,
+    TRACKED_OPERATION_STATES.confirmed
+  ]);
+
+  const unknownController = trackedOperationController();
+  const unknownHash = await runTrackedTransaction({
+    controller: unknownController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw new Error('provider disconnected after wallet invocation'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(unknownHash.operation.state, TRACKED_OPERATION_STATES.walletRequested);
+  assert.equal(unknownHash.operation.hash, null);
+  assert.ok(unknownController.pending('buyback'));
+
+  const rejectedController = trackedOperationController();
+  const rejected = Object.assign(new Error('user rejected request'), { code: 4001 });
+  const rejectedResult = await runTrackedTransaction({
+    controller: rejectedController,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw rejected; },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(rejectedResult.operation.state, TRACKED_OPERATION_STATES.failed);
+  assert.equal(rejectedController.pending('buyback'), null);
+});
+
+test('wallet preflight failures terminate before wallet invocation', async () => {
+  const transitions = [];
+  const controller = trackedOperationController({
+    onChange: (entries) => transitions.push(entries[0].state)
+  });
+  let walletCalls = 0;
+  const result = await runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account: address(9), vault: address(1), target: address(2)
+    },
+    verify: async () => {},
+    preflight: () => verifyWalletSendContext({
+      chainId: 11155111,
+      account: address(9),
+      request: async (method) => method === 'eth_chainId' ? '0x1' : [address(9)]
+    }),
+    stillCurrent: () => true,
+    send: async () => {
+      walletCalls += 1;
+      return hash('70');
+    },
+    wait: async () => transactionReceipt(hash('70'))
+  });
+  assert.match(result.error.message, /Wallet send chain mismatch/);
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.failed);
+  assert.equal(controller.pending('buyback'), null);
+  assert.equal(walletCalls, 0);
+  assert.deepEqual(transitions, [
+    TRACKED_OPERATION_STATES.preBroadcast,
+    TRACKED_OPERATION_STATES.failed
+  ]);
+});
+
+test('receipt reads bind status, transaction hash, and canonical block hash', async () => {
+  const transactionHash = hash('77');
+  const receipt = transactionReceipt(transactionHash);
+  const request = async (method, params) => {
+    if (method === 'eth_getTransactionReceipt') {
+      assert.deepEqual(params, [transactionHash]);
+      return receipt;
+    }
+    if (method === 'eth_getBlockByNumber') {
+      if (params[0] === 'finalized') return { number: '0x30', hash: hash('fc') };
+      assert.deepEqual(params, ['0x20', false]);
+      return { number: '0x20', hash: hash('fe') };
+    }
+    throw new Error(`unexpected ${method}`);
+  };
+  assert.equal(await readCanonicalTransactionReceipt(transactionHash, request), receipt);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method, params) => (
+    method === 'eth_getTransactionReceipt'
+      ? receipt
+      : params[0] === 'finalized'
+        ? { number: '0x30', hash: hash('fc') }
+        : { number: params[0], hash: hash('fd') }
+  )), /not anchored in the canonical block/);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method, params) => (
+    method === 'eth_getTransactionReceipt'
+      ? receipt
+      : { number: params[0] === 'finalized' ? '0x1f' : params[0], hash: hash('fe') }
+  )), /not finalized yet/);
+  await assert.rejects(readCanonicalTransactionReceipt(transactionHash, async (method) => (
+    method === 'eth_getTransactionReceipt'
+      ? { ...receipt, status: '0x01' }
+      : { number: '0x20', hash: hash('fe') }
+  )), /status must be canonical/);
+});
+
+test('production journal survives manifest switches and reconciliation owns liveness', async () => {
+  const controller = trackedOperationController();
+  const vaultA = address(1);
+  const vaultB = address(2);
+  let currentVault = vaultA;
+  let cardStatus = 'manifest A';
+  let sends = 0;
+  let announceSend;
+  const sendStarted = new Promise((resolve) => { announceSend = resolve; });
+  let returnHash;
+  const wallet = new Promise((resolve) => { returnHash = resolve; });
+  const context = {
+    kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+    account: address(9), vault: vaultA, target: address(3)
+  };
+  const updateCard = (operation) => {
+    cardStatus = operation.state;
+  };
+  const first = runTrackedTransaction({
+    controller,
+    context,
+    verify: async () => {},
+    stillCurrent: () => currentVault === vaultA,
+    send: async () => {
+      sends += 1;
+      announceSend();
+      return wallet;
+    },
+    wait: async () => { throw new Error('receipt timeout'); },
+    onUpdate: updateCard
+  });
+  await sendStarted;
+  currentVault = vaultB;
+  cardStatus = 'manifest B';
+  returnHash(hash('72'));
+  const submitted = await first;
+  assert.equal(submitted.operation.state, TRACKED_OPERATION_STATES.submitted);
+  assert.equal(submitted.operation.vault, vaultA);
+  assert.equal(submitted.operation.hash, hash('72'));
+  assert.equal(cardStatus, 'manifest B');
+
+  const duplicate = await runTrackedTransaction({
+    controller,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('73'); },
+    wait: async () => ({ status: '0x1' })
+  });
+  assert.equal(duplicate.blocked, true);
+  assert.equal(sends, 1);
+
+  const unknown = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => null
+  );
+  assert.equal(unknown.operation.state, TRACKED_OPERATION_STATES.submitted);
+  assert.equal(controller.pending('buyback'), submitted.operation);
+  const wrongReceipt = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => transactionReceipt(hash('99'))
+  );
+  assert.match(wrongReceipt.operation.error, /does not match/);
+  assert.equal(controller.pending('buyback'), submitted.operation);
+  const missingBlockReceipt = transactionReceipt(hash('72'));
+  delete missingBlockReceipt.blockNumber;
+  const missingBlock = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => missingBlockReceipt
+  );
+  assert.equal(missingBlock.operation.state, TRACKED_OPERATION_STATES.submitted);
+  assert.match(missingBlock.operation.error, /block number is required/);
+  assert.equal(controller.pending('buyback'), submitted.operation);
+  const missingRefresh = applyTrackedBuybackRefresh(
+    controller,
+    { chainId: 11155111, account: address(9), vault: vaultA },
+    { blockNumber: 32n }
+  );
+  assert.equal(missingRefresh.actionState, BUYBACK_ACTION_STATES.submittedUnknown);
+  assert.equal(missingRefresh.ready, false);
+  assert.equal(missingRefresh.operation.hash, hash('72'));
+  const confirmed = await reconcileTrackedOperation(
+    controller, submitted.operation, async () => transactionReceipt(hash('72'))
+  );
+  assert.equal(confirmed.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(cardStatus, 'manifest B');
+  assert.equal(controller.pending('buyback'), null);
+
+  const retry = await runTrackedTransaction({
+    controller,
+    context: { ...context, vault: vaultB },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('73'); },
+    wait: async () => transactionReceipt(hash('73'), '0x0')
+  });
+  assert.equal(retry.operation.state, TRACKED_OPERATION_STATES.reverted);
+  assert.equal(sends, 2);
+});
+
+test('submitted journal entries survive controller restoration and still block duplicates', async () => {
+  const context = {
+    kind: 'treasury', label: 'Treasury action', chainId: 11155111,
+    account: address(9), vault: address(1), target: address(2)
+  };
+  const original = trackedOperationController();
+  const submitted = await runTrackedTransaction({
+    controller: original,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('7a'),
+    wait: async () => { throw new Error('receipt unavailable'); }
+  });
+  const restored = trackedOperationController({ initialEntries: original.entries() });
+  assert.equal(restored.pending('treasury').hash, submitted.operation.hash);
+  let sends = 0;
+  const duplicate = await runTrackedTransaction({
+    controller: restored,
+    context,
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('7b'); },
+    wait: async () => transactionReceipt(hash('7b'))
+  });
+  assert.equal(duplicate.blocked, true);
+  assert.equal(sends, 0);
+  const reconciled = await reconcileTrackedOperation(
+    restored, restored.pending('treasury'), async () => transactionReceipt(hash('7a'))
+  );
+  assert.equal(reconciled.operation.state, TRACKED_OPERATION_STATES.confirmed);
+
+  const unknown = trackedOperationController();
+  await runTrackedTransaction({
+    controller: unknown,
+    context: { ...context, kind: 'creation' },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { throw new Error('wallet disconnected after invocation'); },
+    wait: async () => transactionReceipt(hash('7c'))
+  });
+  const restoredUnknown = trackedOperationController({ initialEntries: unknown.entries() });
+  assert.equal(restoredUnknown.pending('creation').state, TRACKED_OPERATION_STATES.walletRequested);
+  const blocked = await runTrackedTransaction({
+    controller: restoredUnknown,
+    context: { ...context, kind: 'creation' },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('7c'),
+    wait: async () => transactionReceipt(hash('7c'))
+  });
+  assert.equal(blocked.blocked, true);
+});
+
+test('production buyback refresh retains the confirmed receipt-block lower bound', async () => {
+  const account = address(9);
+  const vaultA = address(1);
+  const vaultB = address(2);
+  const controller = trackedOperationController({ limit: 1 });
+  const result = await runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account, vault: vaultA, target: vaultA
+    },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('73'),
+    wait: async () => transactionReceipt(hash('73'))
+  });
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  const noise = controller.begin({
+    kind: 'creation', label: 'Unrelated operation', chainId: 11155111,
+    account, target: vaultB
+  });
+  assert.equal(noise, null);
+  assert.equal(controller.entries().length, 1);
+  assert.equal(controller.entries()[0].hash, hash('73'));
+  const identityA = { chainId: 11155111, account, vault: vaultA };
+  for (const attempt of [1, 2]) {
+    const stale = applyTrackedBuybackRefresh(controller, identityA, { blockNumber: 16n });
+    assert.equal(stale.actionState, BUYBACK_ACTION_STATES.confirmedRefreshNeeded, attempt);
+    assert.equal(stale.ready, false, attempt);
+    assert.equal(stale.lowerBound, 32n, attempt);
+    assert.equal(controller.entries()[0].stateReadBlockNumber, null, attempt);
+  }
+
+  const otherManifest = applyTrackedBuybackRefresh(
+    controller,
+    { chainId: 11155111, account, vault: vaultB },
+    { blockNumber: 16n }
+  );
+  assert.equal(otherManifest.ready, true);
+  assert.equal(controller.entries()[0].vault, vaultA);
+  assert.equal(controller.entries()[0].receiptBlockNumber, '32');
+  assert.equal(controller.entries()[0].stateReadBlockNumber, null);
+
+  const current = applyTrackedBuybackRefresh(controller, identityA, { blockNumber: 32n });
+  assert.equal(current.actionState, BUYBACK_ACTION_STATES.ready);
+  assert.equal(current.ready, true);
+  assert.equal(controller.entries()[0].stateReadBlockNumber, '32');
+
+  const revertedController = trackedOperationController();
+  const reverted = await runTrackedTransaction({
+    controller: revertedController,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account, vault: vaultA, target: vaultA
+    },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => hash('74'),
+    wait: async () => transactionReceipt(hash('74'), '0x0')
+  });
+  assert.equal(reverted.operation.state, TRACKED_OPERATION_STATES.reverted);
+  assert.equal(reverted.operation.receiptBlockNumber, '32');
+  assert.equal(
+    applyTrackedBuybackRefresh(revertedController, identityA, { blockNumber: 16n }).actionState,
+    BUYBACK_ACTION_STATES.ready
+  );
+});
+
+test('protected journal capacity survives restoration and shrinks after coverage', async () => {
+  const account = address(9);
+  const source = trackedOperationController({ limit: 2 });
+  for (const [vault, transactionHash] of [[address(1), hash('75')], [address(2), hash('76')]]) {
+    const result = await runTrackedTransaction({
+      controller: source,
+      context: {
+        kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+        account, vault, target: vault
+      },
+      verify: async () => {},
+      stillCurrent: () => true,
+      send: async () => transactionHash,
+      wait: async () => transactionReceipt(transactionHash)
+    });
+    assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  }
+  assert.equal(source.entries().length, 2);
+
+  const restored = trackedOperationController({ limit: 1, initialEntries: source.entries() });
+  assert.equal(restored.entries().length, 2);
+  let sends = 0;
+  const blocked = await runTrackedTransaction({
+    controller: restored,
+    context: {
+      kind: 'creation', label: 'Unrelated operation', chainId: 11155111,
+      account, target: address(3)
+    },
+    verify: async () => {},
+    stillCurrent: () => true,
+    send: async () => { sends += 1; return hash('77'); },
+    wait: async () => transactionReceipt(hash('77'))
+  });
+  assert.equal(blocked.blocked, true);
+  assert.match(blocked.error.message, /journal is full/);
+  assert.equal(sends, 0);
+
+  const covered = restored.entries()[0];
+  const outcome = applyTrackedBuybackRefresh(restored, {
+    chainId: 11155111, account, vault: covered.vault
+  }, { blockNumber: 32n });
+  assert.equal(outcome.ready, true);
+  assert.equal(restored.entries().length, 1);
+  assert.notEqual(restored.entries()[0].vault, covered.vault);
+});
+
+test('completion after a post-hash manifest switch updates only the captured journal', async () => {
+  const controller = trackedOperationController();
+  const vaultA = address(1);
+  let currentVault = vaultA;
+  let cardStatus = 'manifest A';
+  let submitted;
+  const submittedSignal = new Promise((resolve) => { submitted = resolve; });
+  let finishReceipt;
+  const receipt = new Promise((resolve) => { finishReceipt = resolve; });
+  const resultPromise = runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account: address(9), vault: vaultA, target: address(3)
+    },
+    verify: async () => {},
+    stillCurrent: () => currentVault === vaultA,
+    send: async () => hash('74'),
+    wait: async () => receipt,
+    onUpdate: (operation) => {
+      if (operation.state === TRACKED_OPERATION_STATES.submitted) submitted();
+      cardStatus = operation.state;
+    }
+  });
+  await submittedSignal;
+  currentVault = address(2);
+  cardStatus = 'manifest B';
+  const reconciled = await reconcileTrackedOperation(
+    controller,
+    controller.pending('buyback'),
+    async () => transactionReceipt(hash('74'))
+  );
+  assert.equal(reconciled.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(reconciled.operation.receiptBlockNumber, '32');
+  finishReceipt(transactionReceipt(hash('74')));
+  const result = await resultPromise;
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(result.operation.vault, vaultA);
+  assert.equal(cardStatus, 'manifest B');
+});
+
+test('real treasury plan edits cancel before verification but not after wallet invocation', async () => {
+  for (const [field, next] of [
+    ['recipient', address(8)], ['amount', '2'], ['route', 'evaluated'], ['type', 'param']
+  ]) {
+    const input = {
+      type: 'transfer', route: 'timeout', asset: address(4), recipient: address(5),
+      amount: '1', salt: hash('11')
+    };
+    const captured = JSON.stringify(input);
+    const flow = prepareTreasuryFlow({
+      chainId: 11155111, vault: address(1), gateway: address(2), executor: address(3),
+      type: 'transfer', route: input.route,
+      action: {
+        asset: input.asset, recipient: input.recipient, amount: input.amount, salt: input.salt
+      }
+    });
+    let finishVerification;
+    const verification = new Promise((resolve) => { finishVerification = resolve; });
+    let sends = 0;
+    const pending = runTrackedTransaction({
+      controller: trackedOperationController(),
+      context: {
+        kind: 'treasury', label: flow.steps[0].label, chainId: 11155111,
+        account: address(9), vault: address(1), target: flow.steps[0].target
+      },
+      verify: async () => { await verification; assert.ok(flow.steps[0].data.startsWith('0x')); },
+      stillCurrent: () => JSON.stringify(input) === captured,
+      send: async () => { sends += 1; return hash('75'); },
+      wait: async () => transactionReceipt(hash('75'))
+    });
+    input[field] = next;
+    finishVerification();
+    const result = await pending;
+    assert.equal(result.operation.state, TRACKED_OPERATION_STATES.cancelled, field);
+    assert.equal(sends, 0, field);
+  }
+
+  const input = { recipient: address(5), amount: '1', type: 'transfer' };
+  const captured = JSON.stringify(input);
+  const controller = trackedOperationController();
+  let cardStatus = 'prepared';
+  let sends = 0;
+  let walletInvoked;
+  const invoked = new Promise((resolve) => { walletInvoked = resolve; });
+  let returnHash;
+  const wallet = new Promise((resolve) => { returnHash = resolve; });
+  const pending = runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'treasury', label: 'Transfer proposal', chainId: 11155111,
+      account: address(9), vault: address(1), target: address(2)
+    },
+    verify: async () => {},
+    stillCurrent: () => JSON.stringify(input) === captured,
+    send: async () => {
+      sends += 1;
+      walletInvoked();
+      return wallet;
+    },
+    wait: async () => transactionReceipt(hash('76')),
+    onUpdate: (operation) => {
+      cardStatus = operation.state;
+    }
+  });
+  await invoked;
+  input.amount = '2';
+  cardStatus = 'new form';
+  returnHash(hash('76'));
+  const result = await pending;
+  assert.equal(sends, 1);
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.confirmed);
+  assert.equal(result.operation.hash, hash('76'));
+  assert.equal(cardStatus, 'new form');
+});
+
+test('writes fail closed on RPC disagreement, wrong chain, and unverified code', () => {
+  const base = { deploymentStatus: 'active', account: address(1) };
+  assert.equal(deriveNetworkGate({ ...base, walletChainId: 11155111, rpcChainId: 1 }).state, 'rpc-disagreement');
+  assert.equal(deriveNetworkGate({ ...base, walletChainId: 1, rpcChainId: 1 }).state, 'wrong-chain');
+  assert.equal(deriveNetworkGate({ ...base, walletChainId: 11155111, rpcChainId: 11155111 }).state, 'code-unchecked');
+  assert.deepEqual(
+    deriveNetworkGate({ ...base, walletChainId: '0xaa36a7', rpcChainId: '11155111', codeState: 'verified' }),
+    { state: 'ready', canTransact: true, message: 'Sepolia, RPC agreement, and every manifest runtime hash are verified.' }
+  );
+});
+
+test('wallet send context re-reads exact chain and account', async () => {
+  const account = address(9);
+  const request = async (method) => (
+    method === 'eth_chainId' ? '0xaa36a7' : [account]
+  );
+  assert.deepEqual(await verifyWalletSendContext({
+    chainId: 11155111, account, request
+  }), { chainId: 11155111n, account });
+  await assert.rejects(verifyWalletSendContext({
+    chainId: 11155111,
+    account,
+    request: async (method) => (method === 'eth_chainId' ? '0x1' : [account])
+  }), /chain mismatch/);
+  await assert.rejects(verifyWalletSendContext({
+    chainId: 11155111,
+    account,
+    request: async (method) => (method === 'eth_chainId' ? '0xaa36a7' : [address(8)])
+  }), /account changed/);
+});
+
+test('runtime verification requires an exact hash map and matches every contract', async () => {
+  const manifest = {
+    status: 'active',
+    registrar: { address: address(1), runtimeCodeKeccak256: keccak256('0x6001') },
+    prerequisites: {
+      proposalImplementation: { address: address(2), runtimeCodeKeccak256: keccak256('0x6002') },
+      stackDeployer: { address: address(3), runtimeCodeKeccak256: keccak256('0x6003') }
+    }
+  };
+  const codes = new Map([[address(1), '0x6001'], [address(2), '0x6002'], [address(3), '0x6003']]);
+  const request = async (method, params) => {
+    assert.equal(method, 'eth_getCode');
+    return codes.get(params[0]);
+  };
+  assert.deepEqual((await verifyRuntimeCode(manifest, request, {})).checked, ['registrar', 'proposalImplementation', 'stackDeployer']);
+
+  await assert.rejects(
+    verifyRuntimeCode({ ...manifest, registrar: { ...manifest.registrar, runtimeCodeKeccak256: hash('33') } }, request, {}),
+    /does not match/
+  );
+});
+
+test('schema-v4 treasury manifest verifies four runtimes and wiring at one finalized block', async () => {
+  const manifest = treasuryManifest();
+  const records = treasuryRuntimeRecords(validateTreasuryManifest(manifest));
+  const request = async (method, params) => {
+    if (method === 'eth_chainId') return '0xaa36a7';
+    if (method === 'eth_getCode') return '0x6001';
+    if (method === 'eth_getBlockByNumber') {
+      return { number: '0x10', timestamp: '0x20', hash: hash('44') };
+    }
+    assert.equal(method, 'eth_call');
+    const [{ to, data }] = params;
+    if (to === records.vault && data === '0x0d618c81') return word(records.executor);
+    if (to === records.executor && data === '0x411557d1') return word(records.vault);
+    if (to === records.gateway && data === '0xfbfa77cf') return word(records.vault);
+    if (to === records.gateway && data === '0x9b732350') return word(records.arbitration);
+    throw new Error('unexpected call');
+  };
+  assert.deepEqual(await verifyTreasuryManifest(manifest, request), {
+    status: 'verified', ...records,
+    blockNumber: 16n,
+    blockHash: hash('44'),
+    timestamp: 32n,
+    blockTag: '0x10'
+  });
+  await assert.rejects(
+    verifyTreasuryManifest({
+      ...manifest, runtimeCodeHashes: {
+        ...manifest.runtimeCodeHashes, treasuryExecutor: hash('11')
+      }
+    }, request),
+    /runtime bytecode/
+  );
+  await assert.rejects(
+    verifyTreasuryManifest(manifest, async (method, params) => (
+      method === 'eth_chainId' ? '0x1' : request(method, params)
+    )),
+    /RPC chain mismatch/
+  );
+  assert.throws(() => validateTreasuryManifest({ ...manifest, schemaVersion: 3 }), /version 4/);
+  assert.throws(() => validateTreasuryManifest({
+    ...manifest,
+    runtimeCodeHashes: {
+      treasuryExecutor: manifest.runtimeCodeHashes.treasuryExecutor,
+      vault: manifest.runtimeCodeHashes.vault,
+      proposalGateway: manifest.runtimeCodeHashes.proposalGateway,
+      arbitration: manifest.runtimeCodeHashes.arbitration
+    }
+  }), /canonical order/);
+});
+
+test('agent lifecycle roots self-consistent stacks without unsafe JSON-number preimage claims', async () => {
+  const bundle = JSON.parse(await readFile(new URL('./fao-creation-codes.json', import.meta.url), 'utf8'));
+  const deploymentRecord = (id, source, contract, code) => ({
+    address: address(id), source, contract,
+    transaction: { hash: hash(id.toString(16).padStart(2, '0')), block: id, nonce: id, from: address(id + 100) },
+    creationCodeBytes: 1, creationCodeKeccak256: keccak256(code),
+    runtimeCodeBytes: (code.length - 2) / 2, runtimeCodeKeccak256: keccak256(code)
+  });
+  const registrarCode = '0x600a';
+  const shared = {
+    schemaVersion: 1, network: 'sepolia', chainId: 11155111,
+    registrar: deploymentRecord(40, 'src/FaoGenesisRegistrar.sol', 'FaoGenesisRegistrar', registrarCode),
+    prerequisites: {
+      proposalImplementation: deploymentRecord(
+        41, 'src/FAOFutarchyProposal.sol', 'FAOFutarchyProposal', '0x600b'
+      ),
+      stackDeployer: deploymentRecord(
+        42, 'src/FAOSiteStackDeployer.sol', 'FAOSiteStackDeployer', '0x600c'
+      )
+    }
+  };
+  const cid = `ipfs://b${'a'.repeat(58)}`;
+  const input = creationInputFromDraft({
+    tokenName: 'Evidence FAO', tokenSymbol: 'EFAO',
+    saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
+    initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
+    tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',
+    daoURI: cid, metadataURI: cid, votingStrategyMetadataURI: cid,
+    proposalValidationStrategyMetadataURI: cid
+  }, { ...shared, status: 'active' }, 2_000_000_000n);
+  const commitments = economicCommitmentHashes(input.coreConfig, input.grants, input.flmConfig);
+  const dependencyKeys = [
+    'proxyFactory', 'spaceImplementation', 'proposalValidationStrategy', 'stackDeployer',
+    'proposalImplementation', 'weth', 'conditionalTokens', 'wrapped1155Factory',
+    'uniswapV3Factory'
+  ];
+  const economicCoreConfig = { ...input.coreConfig };
+  for (const key of dependencyKeys) {
+    economicCoreConfig[key] = {
+      target: input.coreConfig[key].target,
+      runtimeCodeKeccak256: input.coreConfig[key].codehash
+    };
+  }
+  const economicFlmConfig = {
+    positionManager: {
+      target: input.flmConfig.positionManager.target,
+      runtimeCodeKeccak256: input.flmConfig.positionManager.codehash
+    }
+  };
+  const base = treasuryManifest();
+  const receiptAddress = address(30);
+  const stager = address(31);
+  const lifecycleCodes = {
+    [base.contracts.vault]: '0x6101',
+    [base.contracts.proposalGateway]: '0x6102',
+    [base.contracts.arbitration]: '0x6103',
+    [base.contracts.treasuryExecutor]: '0x6104'
+  };
+  const manifest = {
+    ...base,
+    creationRoute: 'registrar',
+    transactions: {
+      receiptCreate: { hash: hash('77'), block: 5, nonce: 1, from: stager },
+      deployCore: { hash: hash('78'), block: 6, nonce: 2, from: stager },
+      deployFlm: { hash: hash('79'), block: 7, nonce: 3, from: stager }
+    },
+    receipt: {
+      address: receiptAddress,
+      source: 'src/FaoGenesisDeployment.sol',
+      contract: 'FaoGenesisDeployment',
+      stageNonce: 1,
+      creationCodeBytes: (bundle.creationCodes.receipt.length - 2) / 2,
+      creationCodeKeccak256: keccak256(bundle.creationCodes.receipt),
+      coreConfigHash: commitments.core,
+      flmConfigHash: commitments.flm,
+      registrar: {
+        target: shared.registrar.address,
+        runtimeCodeKeccak256: shared.registrar.runtimeCodeKeccak256
+      }
+    },
+    coreConfig: economicCoreConfig,
+    grants: input.grants,
+    flmConfig: economicFlmConfig,
+    runtimeCodeHashes: {
+      vault: keccak256(lifecycleCodes[base.contracts.vault]),
+      proposalGateway: keccak256(lifecycleCodes[base.contracts.proposalGateway]),
+      arbitration: keccak256(lifecycleCodes[base.contracts.arbitration]),
+      treasuryExecutor: keccak256(lifecycleCodes[base.contracts.treasuryExecutor])
+    }
+  };
+  const pinnedHash = hash('88');
+  const stageHash = hash('66');
+  const coreBlockHash = hash('67');
+  const flmBlockHash = hash('68');
+  const stageLog = {
+    address: shared.registrar.address,
+    blockNumber: '0x5',
+    blockHash: stageHash,
+    transactionHash: manifest.transactions.receiptCreate.hash,
+    logIndex: '0x0',
+    topics: [
+      '0x8973a01bba3f334d825bf89174c5a81d41623a8065f3217205ab1a3e59a104f4',
+      `0x${addressWord(receiptAddress)}`,
+      commitments.core,
+      commitments.flm
+    ],
+    data: word(stager)
+  };
+  const coreLog = {
+    address: receiptAddress,
+    blockNumber: '0x6', blockHash: coreBlockHash,
+    transactionHash: manifest.transactions.deployCore.hash, logIndex: '0x0',
+    topics: [
+      '0x14ff846bb4cfd1fc5532bfd1985c0eb4c21898c217d598c527e99057d0a37e4c',
+      `0x${addressWord(manifest.contracts.vault)}`,
+      `0x${addressWord(manifest.contracts.companyToken)}`,
+      `0x${addressWord(manifest.contracts.space)}`
+    ],
+    data: `0x${[
+      manifest.contracts.arbitration, manifest.contracts.evaluator, manifest.contracts.spotPool
+    ].map((value) => addressWord(value)).join('')}`
+  };
+  const flmLog = {
+    address: receiptAddress,
+    blockNumber: '0x7', blockHash: flmBlockHash,
+    transactionHash: manifest.transactions.deployFlm.hash, logIndex: '0x0',
+    topics: [
+      '0xaddc5fbefc27baeeb76557046cf0702c071bbfb91d131ff9312e6e401d6fe4e1',
+      `0x${addressWord(manifest.contracts.manager)}`
+    ],
+    data: `0x${[
+      manifest.contracts.relay, manifest.contracts.spotAdapter
+    ].map((value) => addressWord(value)).join('')}`
+  };
+  const request = async (method, params) => {
+    if (method === 'eth_chainId') return '0xaa36a7';
+    if (method === 'eth_getCode') {
+      const target = params[0];
+      if (target === shared.registrar.address) return registrarCode;
+      if (target === shared.prerequisites.proposalImplementation.address) return '0x600b';
+      if (target === shared.prerequisites.stackDeployer.address) return '0x600c';
+      if (target === receiptAddress) return '0x6010';
+      return lifecycleCodes[target] || '0x';
+    }
+    if (method === 'eth_getLogs') {
+      const filter = params[0];
+      if (filter.address === shared.registrar.address) return [stageLog];
+      if (filter.topics[0] === coreLog.topics[0]) return [coreLog];
+      if (filter.topics[0] === flmLog.topics[0]) return [flmLog];
+    }
+    if (method === 'eth_getBlockByNumber') {
+      if (params[0] === 'finalized') {
+        return { number: '0x64', hash: pinnedHash, timestamp: '0x77359464' };
+      }
+      return { hash: {
+        '0x5': stageHash, '0x6': coreBlockHash, '0x7': flmBlockHash
+      }[params[0]] || pinnedHash };
+    }
+    if (method === 'eth_call') {
+      const [{ to, data }] = params;
+      if (to === shared.registrar.address && data === '0x831c4e7b') {
+        return keccak256(bundle.creationCodes.receipt);
+      }
+      if (to === shared.registrar.address && data.startsWith('0x5421831b')) return word(receiptAddress);
+      if (to === receiptAddress && data === '0xb1b4fc36') return commitments.core;
+      if (to === receiptAddress && data === '0x1092769f') return commitments.flm;
+      if (to === receiptAddress && ['0x73797f98', '0xe05abb68'].includes(data)) return `0x${uintWord(1)}`;
+      if (to === receiptAddress && data === '0xfbfa77cf') return word(manifest.contracts.vault);
+      if (to === receiptAddress && data === '0x04e31dfb') return word(manifest.contracts.proposalGateway);
+      if (to === receiptAddress && data === '0x9b732350') return word(manifest.contracts.arbitration);
+      if (to === manifest.contracts.vault && data === '0x0d618c81') return word(manifest.contracts.treasuryExecutor);
+      if (to === manifest.contracts.treasuryExecutor && data === '0x411557d1') return word(manifest.contracts.vault);
+      if (to === manifest.contracts.proposalGateway && data === '0xfbfa77cf') return word(manifest.contracts.vault);
+      if (to === manifest.contracts.proposalGateway && data === '0x9b732350') return word(manifest.contracts.arbitration);
+    }
+    throw new Error(`unexpected ${method} ${JSON.stringify(params)}`);
+  };
+  const repoLoadedShared = { ...shared, status: 'active', explorer: 'https://sepolia.etherscan.io' };
+  const verified = await verifyAgentWorkProvenance({
+    manifest,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  });
+  assert.equal(verified.receipt, receiptAddress);
+  assert.equal(verified.vault, manifest.contracts.vault);
+
+  const canonicalTreasury = await verifyCanonicalTreasuryManifest({
+    manifest,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    request
+  });
+  assert.equal(canonicalTreasury.receipt, receiptAddress);
+  await assert.rejects(verifyCanonicalTreasuryManifest({
+    manifest: base,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    request
+  }), /requires canonical registrar provenance/);
+
+  const lossyDisplayOnly = structuredClone(manifest);
+  lossyDisplayOnly.coreConfig.saleCap = Number.MAX_SAFE_INTEGER + 2;
+  const hashSealed = await verifyAgentWorkProvenance({
+    manifest: lossyDisplayOnly,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  });
+  assert.equal(hashSealed.receipt, receiptAddress);
+
+  const malicious = structuredClone(manifest);
+  malicious.contracts.vault = address(50);
+  malicious.contracts.proposalGateway = address(51);
+  malicious.contracts.arbitration = address(52);
+  malicious.contracts.treasuryExecutor = address(53);
+  malicious.runtimeCodeHashes = {
+    vault: keccak256('0x6201'), proposalGateway: keccak256('0x6202'),
+    arbitration: keccak256('0x6203'), treasuryExecutor: keccak256('0x6204')
+  };
+  await assert.rejects(verifyAgentWorkProvenance({
+    manifest: malicious,
+    selfServeManifest: repoLoadedShared,
+    creationBundle: bundle,
+    indexView: { blockNumber: 100n, blockHash: pinnedHash, timestamp: 2_000_000_100n },
+    request
+  }), /CoreSealed|receipt lifecycle wiring/);
+});
+
+test('buyback read is one-block, chain/address-bound, and rejects malformed ABI words', async () => {
+  const vault = address(2);
+  const executor = address(3);
+  const weth = address(4);
+  const values = new Map([
+    [BUYBACK_SELECTORS.weth, word(weth)],
+    [BUYBACK_SELECTORS.phase, `0x${uintWord(2)}`],
+    [BUYBACK_SELECTORS.effectiveSupply, `0x${uintWord(100n * 10n ** 18n)}`],
+    [BUYBACK_SELECTORS.window, `0x${uintWord(86_400)}`],
+    [BUYBACK_SELECTORS.dailyCap, `0x${uintWord(10n ** 16n)}`],
+    [BUYBACK_SELECTORS.dailyBps, `0x${uintWord(100)}`],
+    [BUYBACK_SELECTORS.navBps, `0x${uintWord(9_500)}`],
+    [BUYBACK_SELECTORS.twapWindow, `0x${uintWord(1_800)}`],
+    [BUYBACK_SELECTORS.maxTickDeviation, `0x${uintWord(50)}`],
+    [BUYBACK_SELECTORS.windowStart, `0x${uintWord(1_000)}`],
+    [BUYBACK_SELECTORS.wethSpent, `0x${uintWord(2n * 10n ** 15n)}`]
+  ]);
+  const balanceData = encodeCalldata(BUYBACK_SELECTORS.balanceOf, [addressWord(executor)]);
+  const request = async (method, params) => {
+    if (method === 'eth_getBlockByNumber') return { number: '0x10', timestamp: '0x7d0' };
+    assert.equal(method, 'eth_call');
+    const [{ to, data }, blockTag] = params;
+    assert.equal(blockTag, '0x10');
+    if (to === weth && data === balanceData) return `0x${uintWord(5n * 10n ** 17n)}`;
+    assert.ok(to === vault || to === executor);
+    if (!values.has(data)) throw new Error(`unexpected selector ${data}`);
+    return values.get(data);
+  };
+  const model = await readBuybackModel({
+    chainId: 11155111, vault, executor, request
+  });
+  assert.equal(model.blockNumber, 16n);
+  assert.equal(model.executorWeth, 5n * 10n ** 17n);
+  assert.equal(model.effectiveSupply, 100n * 10n ** 18n);
+  assert.equal(model.available, 3n * 10n ** 15n);
+  assert.equal(model.isLive, true);
+
+  await assert.rejects(
+    readBuybackModel({ chainId: 1, vault, executor, request }),
+    /wrong chain/
+  );
+  await assert.rejects(
+    readBuybackModel({ chainId: 11155111, vault: '0x1234', executor, request }),
+    /address/
+  );
+  await assert.rejects(
+    readBuybackModel({
+      chainId: 11155111,
+      vault,
+      executor,
+      request: async (method, params) => {
+        if (method === 'eth_getBlockByNumber') return { number: '0x10', timestamp: '0x7d0' };
+        if (params[0].data === BUYBACK_SELECTORS.phase) return '0x01';
+        return request(method, params);
+      }
+    }),
+    /exactly 32 bytes/
+  );
+});
+
+test('only a resolved buyback state can become ready after a current-state read', () => {
+  assert.equal(
+    buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.confirmedRefreshNeeded),
+    BUYBACK_ACTION_STATES.ready
+  );
+  assert.throws(
+    () => buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.inFlight),
+    /cannot be cleared/
+  );
+  assert.throws(
+    () => buybackActionStateAfterRefresh(BUYBACK_ACTION_STATES.submittedUnknown),
+    /cannot be cleared/
+  );
+});
+
+test('draft becomes one frozen canonical registrar input', () => {
+  const record = (id) => ({ address: address(id), runtimeCodeKeccak256: hash(id.toString(16).padStart(2, '0')) });
+  const manifest = {
+    status: 'active', registrar: record(1),
+    prerequisites: { proposalImplementation: record(2), stackDeployer: record(3) }
+  };
+  const cid = `ipfs://b${'a'.repeat(58)}`;
+  const draft = {
+    tokenName: 'Example FAO', tokenSymbol: 'EFAO',
+    saleDuration: '3600', bootstrapDuration: '86400', saleCap: '100000000000000000000',
+    initialPrice: '10000000000000', slope: '0', minimumRaise: '500000000000000',
+    tokenMaxSupply: '201000000000000000000', bootstrapBps: '5000',
+    daoURI: cid, metadataURI: cid, votingStrategyMetadataURI: cid,
+    proposalValidationStrategyMetadataURI: cid
+  };
+  const input = creationInputFromDraft(draft, manifest, 2_000_000_000n);
+  assert.equal(input.registrar, address(1));
+  assert.equal(input.currentTimestamp, '2000000000');
+  assert.equal(input.coreConfig.saleEnd, '2000003600');
+  assert.equal(input.coreConfig.bootstrapDeadline, '2000090000');
+  assert.equal(input.coreConfig.stackDeployer.target, address(3));
+  assert.equal(input.coreConfig.proposalImplementation.target, address(2));
+  assert.equal(verifyCreationInputTrust(input, manifest), true);
+  assert.throws(
+    () => verifyCreationInputTrust({ ...input, registrar: address(8) }, manifest),
+    /not bound to the current canonical manifest/
+  );
+  assert.deepEqual(input.coreConfig.assetPolicies, [{
+    asset: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14',
+    c1: '10000000000000000', c2: '100000000000000000',
+    tapBudget: '10000000000000000', tapBudgetMax: '100000000000000000'
+  }]);
+  assert.deepEqual(input.grants, []);
+});
+
+test('creation bundle verifies every receipt, core, and FLM blob', () => {
+  const codes = {
+    receipt: '0x6000',
+    core: Object.fromEntries(['ARBITRATION', 'VAULT', 'RELEASE_STRATEGY', 'ZERO_VOTING', 'ECON_GATEWAY', 'ECON_EVALUATOR'].map((key, index) => [key, `0x60${(index + 1).toString(16).padStart(2, '0')}`])),
+    flm: Object.fromEntries(['RELAY', 'ADAPTER', 'GUARD', 'ROUTER', 'MANAGER'].map((key, index) => [key, `0x61${(index + 1).toString(16).padStart(2, '0')}`]))
+  };
+  const hashes = {
+    receipt: keccak256(codes.receipt),
+    core: Object.fromEntries(Object.entries(codes.core).map(([key, code]) => [key, keccak256(code)])),
+    flm: Object.fromEntries(Object.entries(codes.flm).map(([key, code]) => [key, keccak256(code)]))
+  };
+  const bundle = {
+    schemaVersion: 1,
+    evidence: {
+      economicManifestPath: 'metadata/economic-core-code-hashes.json',
+      economicManifestKeccak256: hash('11'),
+      flmManifestPath: 'metadata/sepolia-flm-code-hashes.json',
+      flmManifestKeccak256: hash('22')
+    },
+    codeHashes: hashes,
+    creationCodes: codes
+  };
+  assert.equal(validateCreationBundle(bundle), bundle);
+  bundle.creationCodes.core.VAULT = '0x6009';
+  assert.throws(() => validateCreationBundle(bundle), /pinned hash/);
+});
+
+test('instance browser defaults to curated or code-verified records', () => {
+  const records = [
+    { address: address(1), name: 'Curated', curated: true },
+    { address: address(2), name: 'Verified code', codeVerified: true },
+    { address: address(3), name: 'Caller claim' }
+  ];
+  const defaults = visibleInstances(records);
+  assert.deepEqual(defaults.map((item) => item.address), [address(1), address(2)]);
+  assert.equal(visibleInstances(records, true).length, 3);
+  assert.match(instanceTrustLabel(visibleInstances(records, true)[2]), /Unverified registrar record/);
+  assert.match(instanceTrustLabel(defaults[0]), /not organization endorsement/);
+});
+
+test('ragequit extra assets are exact, sorted, and unique', () => {
+  assert.deepEqual(
+    parseExtraAssetInput(`${address(2)}\n${address(0)}, ${address(1)} ${address(2)}`),
+    [address(0), address(1), address(2)]
+  );
+});
+
+test('semantic shell exposes every requested lane and explicit curation opt-in', async () => {
+  const html = await readFile(new URL('./fao.html', import.meta.url), 'utf8');
+  for (const text of [
+    'Create or resume an FAO',
+    'Stage 1',
+    'Stage 2',
+    'Stage 3',
+    'Show unverified registrar instances',
+    'Launch sale',
+    'Deposit to spot FLM',
+    'Permissionless sync',
+    'Exact additional assets',
+    'Release and treasury dashboard',
+    'Verify one active FAO treasury',
+    'Executor custody',
+    'Low transfer · unchallenged YES',
+    'Bounded parameter',
+    'Round 1 evaluated YES',
+    'Exact treasury transaction flow',
+    'Fixed-policy buyback',
+    'controls timing only',
+    'Accepted queued WETH payments are not reserved',
+    'Transaction state',
+    'Transaction operation journal',
+    'captured chain, vault or target, and account',
+    'Call buyback',
+    'Agent task → receipt → payment evidence',
+    'shareable exact-evidence locator',
+    'never a trust root',
+    'Payment publication block',
+    'Execution event block',
+    'Valid payment envelopes',
+    'block-delta-consistent',
+    'not a transaction-level state diff',
+    'does not claim to revalidate the full economic config',
+    'Accepted is authorization, not payment',
+    'unverified—not paid'
+  ]) assert.match(html, new RegExp(text));
+  assert.match(html, /schemaVersion&quot;:4/);
+  assert.doesNotMatch(html, /schemaVersion&quot;:3/);
+  assert.match(html, /role="status" aria-live="polite"/);
+  assert.match(html, /data-write[^>]*disabled/);
+});

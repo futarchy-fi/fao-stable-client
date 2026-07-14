@@ -1,13 +1,37 @@
 # FAO stable client
 
+`fao.js` includes dependency-free canonical agent task, receipt, and payment builders, exact payment
+binding to `TransferAction`, plus `AgentWorkIndex` publish calldata and log decoding. Accepted agent
+payments are authorized, executable only while funded, and never partial; the index provides no
+escrow or payment authority. Golden bytes live in `agent-document-golden.json`.
+
+The dashboard accepts one exact evidence locator: an index address, payment digest, three
+publication blocks, and optional lifecycle-event blocks. Every log query is fully topic-filtered
+and confined to one supplied block below the finalized head; parent digests, block hashes, index
+runtime, registrar/receipt provenance, schema-v4 lifecycle runtimes, and wiring are independently
+verified. Discovery may be provided by an untrusted indexer, but it is never part of the trust path.
+Accepted, executable-now, paid, and unverified remain separate. State-gated calldata references
+neither sign nor send and explicitly omit ordinary bond activation and settlement steps.
+
 Out-of-band inspector for the FAO testnet deployment. This repository and its
 deployment are deliberately outside the release authority of the FAO-governed
 site.
 
-`deployment.json` is the only FAO/Sepolia deployment manifest. Until the fresh
-FAO contracts are deployed it remains in `pre-deployment` state; the UI refuses
+`deployment.json` is the governed-site FAO/Sepolia deployment manifest. Until
+the fresh FAO contracts are deployed it remains in `pre-deployment` state; the UI refuses
 to invent or reuse legacy addresses. `flm-deployment.json` separately pins the
 reviewed Gnosis factory and limited-funds canary used by `flm.html`.
+
+`selfserve-deployment.json` is a separate trust root for permissionless Sepolia
+FAO creation. Once deployed, it is the exact canonical registrar manifest: the
+ownerless registrar plus the two shared compiler-pinned prerequisites. The FAO
+dashboard never treats governed-site `deployment.json` as registrar authority.
+`fao-creation-codes.json` contains the exact receipt, core, and FLM creation
+blobs; the browser checks all twelve pinned Keccak hashes before using them.
+Each FAO's separate schema-v4 economic manifest supplies its vault, gateway,
+arbitration, and treasury executor. The treasury planner rechecks the executor
+runtime hash and bidirectional on-chain wiring before sending any exact typed
+transfer, bounded parameter, or two-round critical-action step.
 
 The site is dependency-free static HTML, CSS, and JavaScript.
 

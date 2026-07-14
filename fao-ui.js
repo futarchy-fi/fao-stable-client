@@ -1328,7 +1328,11 @@ async function runBrowserTrackedTransaction(options) {
   try {
     locked = await withExclusiveOperationLock(globalThis.navigator?.locks, async () => {
       synchronizeTrackedOperations();
-      return runTrackedTransaction({ ...options, controller: trackedOperations });
+      return runTrackedTransaction({
+        ...options,
+        controller: trackedOperations,
+        preflight: () => preflightWalletTransaction(options.context?.account)
+      });
     });
   } catch (error) {
     return Object.freeze({ operation: null, blocked: true, receipt: null, error });
@@ -2155,7 +2159,6 @@ async function sendCreationStage(event) {
         }
       }
     },
-    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && currentGate().canTransact,
     send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,
@@ -2550,7 +2553,6 @@ async function sendBuyback() {
         throw new Error(model.deterministicReasons.join(' ') || 'Buyback is not currently callable.');
       }
     },
-    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
     send: () => sendWalletTransaction(account, plan.target, plan.data),
     wait: waitForReceipt,
@@ -2756,7 +2758,6 @@ async function sendTreasuryStep(index, flow, form, request) {
         throw new Error('Treasury manifest wiring changed.');
       }
     },
-    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
     send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,

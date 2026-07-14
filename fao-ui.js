@@ -324,9 +324,11 @@ function trackedResult(operation, { blocked = false, receipt = null, error = nul
 }
 
 export async function runTrackedTransaction({
-  controller, context, verify, stillCurrent, send, wait, onUpdate = () => {}
+  controller, context, verify, preflight = async () => {}, stillCurrent, send, wait,
+  onUpdate = () => {}
 }) {
   if (!controller || typeof controller.begin !== 'function' || typeof verify !== 'function'
+    || typeof preflight !== 'function'
     || typeof stillCurrent !== 'function' || typeof send !== 'function'
     || typeof wait !== 'function' || typeof onUpdate !== 'function') {
     throw new Error('Tracked transaction operations are invalid.');
@@ -345,6 +347,19 @@ export async function runTrackedTransaction({
   };
   try {
     await verify(operation);
+  } catch (error) {
+    if (current()) controller.fail(operation, error);
+    else controller.cancel(operation);
+    update();
+    return trackedResult(operation, { error });
+  }
+  if (!current()) {
+    controller.cancel(operation);
+    update();
+    return trackedResult(operation);
+  }
+  try {
+    await preflight(operation);
   } catch (error) {
     if (current()) controller.fail(operation, error);
     else controller.cancel(operation);
@@ -1322,8 +1337,11 @@ function rpc(method, params = []) {
   return window.ethereum.request({ method, params });
 }
 
-async function sendWalletTransaction(account, target, data) {
-  await verifyWalletSendContext({ chainId: SEPOLIA_CHAIN_ID, account, request: rpc });
+function preflightWalletTransaction(account) {
+  return verifyWalletSendContext({ chainId: SEPOLIA_CHAIN_ID, account, request: rpc });
+}
+
+function sendWalletTransaction(account, target, data) {
   return rpc('eth_sendTransaction', [{ from: account, to: target, data }]);
 }
 
@@ -2131,6 +2149,7 @@ async function sendCreationStage(event) {
         }
       }
     },
+    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && currentGate().canTransact,
     send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,
@@ -2525,6 +2544,7 @@ async function sendBuyback() {
         throw new Error(model.deterministicReasons.join(' ') || 'Buyback is not currently callable.');
       }
     },
+    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
     send: () => sendWalletTransaction(account, plan.target, plan.data),
     wait: waitForReceipt,
@@ -2730,6 +2750,7 @@ async function sendTreasuryStep(index, flow, form, request) {
         throw new Error('Treasury manifest wiring changed.');
       }
     },
+    preflight: () => preflightWalletTransaction(account),
     stillCurrent: () => ownsCard() && treasuryNetworkReady(),
     send: () => sendWalletTransaction(account, step.target, step.data),
     wait: waitForReceipt,

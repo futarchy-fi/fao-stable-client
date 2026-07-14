@@ -295,6 +295,41 @@ test('production transaction runner preserves timeout, status-0, and status-1 tr
   assert.equal(rejectedController.pending('buyback'), null);
 });
 
+test('wallet preflight failures terminate before wallet invocation', async () => {
+  const transitions = [];
+  const controller = trackedOperationController({
+    onChange: (entries) => transitions.push(entries[0].state)
+  });
+  let walletCalls = 0;
+  const result = await runTrackedTransaction({
+    controller,
+    context: {
+      kind: 'buyback', label: 'Fixed-policy buyback', chainId: 11155111,
+      account: address(9), vault: address(1), target: address(2)
+    },
+    verify: async () => {},
+    preflight: () => verifyWalletSendContext({
+      chainId: 11155111,
+      account: address(9),
+      request: async (method) => method === 'eth_chainId' ? '0x1' : [address(9)]
+    }),
+    stillCurrent: () => true,
+    send: async () => {
+      walletCalls += 1;
+      return hash('70');
+    },
+    wait: async () => transactionReceipt(hash('70'))
+  });
+  assert.match(result.error.message, /Wallet send chain mismatch/);
+  assert.equal(result.operation.state, TRACKED_OPERATION_STATES.failed);
+  assert.equal(controller.pending('buyback'), null);
+  assert.equal(walletCalls, 0);
+  assert.deepEqual(transitions, [
+    TRACKED_OPERATION_STATES.preBroadcast,
+    TRACKED_OPERATION_STATES.failed
+  ]);
+});
+
 test('receipt reads bind status, transaction hash, and canonical block hash', async () => {
   const transactionHash = hash('77');
   const receipt = transactionReceipt(transactionHash);

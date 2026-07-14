@@ -48,3 +48,14 @@ test('rejects contracts in pre-deployment state', () => {
     /pre-deployment contracts must be empty/
   );
 });
+
+test('rejects noncanonical top-level fields in either state', () => {
+  assert.throws(
+    () => validateDeploymentManifest({ ...preDeployment, deploymentTransaction: `0x${'ab'.repeat(32)}` }),
+    /top level must contain exactly/
+  );
+  assert.throws(
+    () => validateDeploymentManifest({ ...active, unexpected: true }),
+    /top level must contain exactly/
+  );
+});

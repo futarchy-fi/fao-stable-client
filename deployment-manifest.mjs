@@ -23,6 +23,12 @@ const IDENTITY = Object.freeze({
   governedSite: 'https://testnet.futarchy.ai',
   governedRepository: 'https://github.com/futarchy-fi/fao-governed-site'
 });
+const PRE_DEPLOYMENT_KEYS = Object.freeze([
+  ...Object.keys(IDENTITY), 'status', 'contracts'
+]);
+const ACTIVE_KEYS = Object.freeze([
+  ...PRE_DEPLOYMENT_KEYS, 'deploymentTransaction', 'deploymentBlock', 'currencyToken'
+]);
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const TRANSACTION = /^0x[0-9a-fA-F]{64}$/;
 const ZERO_ADDRESS = /^0x0{40}$/i;
@@ -33,6 +39,13 @@ function invalid(reason) {
 
 function isNonzeroAddress(value) {
   return typeof value === 'string' && ADDRESS.test(value) && !ZERO_ADDRESS.test(value);
+}
+
+function exactKeys(value, expected) {
+  const actual = Object.keys(value);
+  if (actual.length !== expected.length || expected.some((key) => !actual.includes(key))) {
+    invalid(`top level must contain exactly: ${expected.join(', ')}`);
+  }
 }
 
 export function validateDeploymentManifest(value) {
@@ -47,10 +60,12 @@ export function validateDeploymentManifest(value) {
 
   const contractKeys = Object.keys(value.contracts);
   if (value.status === 'pre-deployment') {
+    exactKeys(value, PRE_DEPLOYMENT_KEYS);
     if (contractKeys.length !== 0) invalid('pre-deployment contracts must be empty');
     return value;
   }
   if (value.status !== 'active') invalid('status must be active or pre-deployment');
+  exactKeys(value, ACTIVE_KEYS);
   if (!TRANSACTION.test(value.deploymentTransaction || '')) {
     invalid('deploymentTransaction must be a 32-byte hex value');
   }

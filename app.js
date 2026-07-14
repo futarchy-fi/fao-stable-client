@@ -1,3 +1,5 @@
+import { validateDeploymentManifest } from './deployment-manifest.mjs';
+
 const elements = {
   status: document.querySelector('#deployment-status'),
   network: document.querySelector('#network'),
@@ -24,7 +26,6 @@ function renderContracts(contracts, explorer) {
   elements.contractsEmpty.hidden = entries.length !== 0;
 
   for (const [name, address] of entries) {
-    if (!/^0x[0-9a-fA-F]{40}$/.test(address)) continue;
     const item = document.createElement('li');
     const label = document.createElement('strong');
     const link = document.createElement('a');
@@ -42,10 +43,7 @@ function renderContracts(contracts, explorer) {
 async function loadManifest() {
   const response = await fetch('/deployment.json', { cache: 'no-store' });
   if (!response.ok) throw new Error(`manifest HTTP ${response.status}`);
-  const value = await response.json();
-  if (value.schemaVersion !== 1 || !Number.isInteger(value.chainId)) {
-    throw new Error('invalid deployment manifest');
-  }
+  const value = validateDeploymentManifest(await response.json());
   manifest = value;
   elements.status.textContent = value.status;
   elements.network.textContent = value.network;
